@@ -1,0 +1,5299 @@
+# -*- coding: utf-8 -*-
+"""
+一键日常启动器
+------------------------------------------------
+打开即自动启动：MaaEnd（终末地）先跑 -> 两个 MuMu 实例 -> MAA（明日方舟）-> MaaFgo（FGO，等游戏起来再开始）-> ok-ww（鸣潮每日任务）
+启动过程中可以随时点「取消启动」中止后续步骤。
+跑完之后在后台盯日志：MAA + MaaFgo 都完成就关模拟器、ok-ww 完成就关鸣潮，四个程序本身都不退出。
+
+依赖：只用 Python 标准库 + Windows GDI/USER32（ctypes 自绘界面），无需 tkinter / 第三方包。
+配置：同目录 config.json（界面里点「设置」可以改各程序的路径）
+"""
+
+import ctypes
+import ctypes.wintypes as wt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import traceback
+
+# ----------------------------------------------------------------------------
+# 基础
+# ----------------------------------------------------------------------------
+APP_NAME = "一键日常启动器"
+APP_VERSION = "v2.7.1"
+APP_TITLE = APP_NAME
+CREATE_NO_WINDOW = 0x08000000
+DETACHED_PROCESS = 0x00000008
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+comdlg32 = ctypes.WinDLL("comdlg32", use_last_error=True)
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+# 兼容不同 Python 版本 wintypes 里缺失的类型别名
+for _n, _t in (
+    ("UINT_PTR", ctypes.c_size_t),
+    ("LONG_PTR", ctypes.c_ssize_t),
+    ("HGDIOBJ", wt.HANDLE),
+    ("HBITMAP", wt.HANDLE),
+    ("HFONT", wt.HANDLE),
+    ("HICON", wt.HANDLE),
+    ("HBRUSH", wt.HANDLE),
+    ("HPEN", wt.HANDLE),
+    ("HINSTANCE", wt.HANDLE),
+    ("HMENU", wt.HANDLE),
+    ("HDC", wt.HANDLE),
+    ("HWND", wt.HANDLE),
+):
+    if not hasattr(wt, _n):
+        setattr(wt, _n, _t)
+
+
+def app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = app_dir()
+
+
+def _pick_config(base):
+    """配置文件位置：本目录优先；跑源码调试时退回上一级（项目根）
+
+    否则「跑源码」和「跑 exe」会各读写一份 config.json，勾选状态对不上，
+    排查起来非常迷惑（踩过一次）。
+    """
+    here = os.path.join(base, "config.json")
+    if os.path.isfile(here):
+        return here
+    up = os.path.join(os.path.dirname(os.path.abspath(base)), "config.json")
+    if os.path.isfile(up):
+        return up
+    return here
+
+
+CONFIG_PATH = _pick_config(APP_DIR)
+LOG_PATH = os.path.join(APP_DIR, "launcher.log")
+
+# 旁边有没有 config.json —— 只用于记日志；"要不要走设置向导"看 config_ready()，
+# 因为用户可能第一次打开、看一眼就关掉，留下一个"全空但存在"的配置。
+CONFIG_EXISTED = os.path.isfile(CONFIG_PATH)
+
+# FGO 版本 → 安卓包名。设置页可以循环切换；不在表里的服直接改 config.json
+# 的 maafgo.game_package（MaaFgo 只认包名，不认服名）。
+FGO_PACKAGES = [
+    ("B服", "com.bilibili.fatego"),
+    ("日服", "com.aniplex.fategrandorder"),
+]
+
+# MuMu 新建实例时的默认名字（只影响界面显示，认不出的就用「实例N」）
+INSTANCE_DEFAULT_NAMES = {0: "明日方舟", 1: "命运-冠位指定"}
+
+# 开机询问「要只跑手游日常吗」的倒计时秒数（到点自动按默认开跑）
+PROMPT_SECONDS = 5
+
+# 自定义实例最多加几个（设置页行高有限，多了会挤掉日志区）
+MAX_CUSTOM = 4
+
+
+# ----------------------------------------------------------------------------
+# 配置
+# ----------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    # 首次运行时是空的：靠「首次使用向导」让用户点设置页选目录。
+    # 这里绝不能写死作者机器上的路径——把程序发给别人时，那些路径根本不存在，
+    # 打开就是满屏「找不到 xxx.exe」，看起来像程序坏了。
+    "mumu_root": "",
+    # 只是占位：真正启动时 sync_instances() 会按 MuMu 里实际存在的实例重建这份列表，
+    # 免得新用户只建了 1 个实例、却在这里干等实例1 超时。
+    "instances": [
+        {"index": 0, "name": "模拟器", "enabled": True, "package": ""},
+    ],
+    "maa": {
+        "enabled": True,
+        "path": "",
+        "auto_run": True,
+        "fix_connect": True,
+        "instance_index": 0,          # MAA 连哪台 MuMu（设置页可改）
+    },
+    # MaaEnd（终末地）：最优先跑，等它的任务链跑完、终末地关掉，
+    # 再启动两个 MuMu 实例 + MAA + MaaFgo（FGO，取代原来的独立 BBchannel）。
+    "maaend": {
+        "enabled": True,
+        "path": "",
+        "instance": "全套日常",       # config/mxu-MaaEnd.json 里的实例名
+        "autostart": True,            # 加 --autostart，开起来就直接开跑
+        "quit_after_run": False,      # 加 --quit-after-run：跑完自动退出 MaaEnd
+        "wait_game_close": True,      # 等终末地窗口消失再继续
+        "game_window_class": "UnityWndClass",
+        "game_window_title": "Endfield",
+        "log_dir": "debug",
+        "timeout": 7200,              # 等任务完成的总上限（秒）· 实测全套日常约 85 分钟
+        "game_close_timeout": 300,    # 任务完成后等游戏退出的上限（秒）
+        "start_next_if_timeout": True,
+    },
+    # MaaFgo（FGO 助手，取代原来的独立 BBchannel）：
+    # 实例 1 就绪 → 没开游戏就先用 MuMu 打开 → 等游戏进程起来 → 再带 --autostart 启动它
+    "maafgo": {
+        "enabled": True,
+        "path": "",
+        "instance": "默认设置",        # config/mxu-MaaFgo.json 里的实例名
+        "autostart": True,             # 加 --autostart，起来就开跑任务
+        "quit_after_run": False,       # 加 --quit-after-run：任务跑完自动退出
+        "emulator_index": 1,           # FGO 在哪台 MuMu 实例上
+        "game_package": "com.bilibili.fatego",
+        "launch_game": True,           # 游戏没开就用 MuMu 自己打开
+        "game_wait": 240,              # 等游戏进程起来的上限（秒）
+        "settle": 10,                  # 起来后再等几秒过启动画面
+        "sync_device_address": True,   # 把 MaaFgo 里记的 adb 地址改成实际端口
+    },
+    "okww": {
+        "enabled": True,
+        "path": "",                    # 只用来显示/定位，实际不启动它
+        # ok-ww.exe 是 pyappify 壳，不一定把参数转给 python；直接用它自带的解释器
+        "python": "",
+        "workdir": "",
+        "task": "DailyTask",           # 每日任务（一条龙：开游戏/登录/月卡/声骸/领奖/邮件）
+        "headless": False,             # True=加 --headless 不显示界面
+        "exit_after": False,           # True=加 -e 跑完退出游戏和应用
+        "wait_start": 60,              # 等界面出来的上限（秒）
+        "debug_log": True,             # 用自带入口开 debug 日志（否则看不到"任务完成"标记）
+        "entry": "_launcher_auto.py",  # 上面那个入口的文件名（启动器每次重写）
+        "close_game_when_done": True,  # 每日任务完成后只关游戏，ok-ww 自己留着
+        "game_window_class": "UnrealWindow",
+        "game_exe": "Client-Win64-Shipping.exe",
+    },
+    # 等 MAA + MaaFgo 的任务跑完，就把模拟器关掉省资源（程序进程都不动）
+    "shutdown_emulator_when_done": True,
+    "monitor_poll": 20,                # 多久看一次日志（秒）
+    "monitor_max_hours": 10,           # 监视最长等多久
+    "timeouts": {"boot": 300, "adb": 180},
+    "close_tools_with_emulator": False,
+    "auto_start_on_launch": True,
+    # 打开就自动启动之前，先问一句"要不要只跑手游日常"（5 秒不回答按默认全跑）。
+    # 嫌烦就设 false：变成直接开跑，不弹询问卡。
+    "night_prompt": True,
+    "disable_updater": True,
+    "require_admin": True,
+    # 实例都起来之后怎么处理「MuMu模拟器」那个主窗口：
+    #   hide     隐藏（默认，进程还在，任务栏也看不到，模拟器照常跑）
+    #   minimize 最小化到任务栏
+    #   keep     不动它
+    "mumu_main_window": "hide",
+    # 用户自定义的主界面项目（给自己想加的游戏用）：
+    #   {"id": "c1712...", "name": "显示名", "script": "脚本.exe", "game": "游戏启动.exe", "enabled": true}
+    # 这些项目**没有适配**：启动器只负责把游戏和脚本打开，
+    # 不自动点任务、不检测任务完成、也不关它们。
+    "custom_items": [],
+    # 被用户从主界面删掉的项，键是 maaend / maa / maafgo / okww / vm0 / custom:<id>
+    "hidden_items": [],
+}
+
+
+def config_ready(cfg):
+    """路径是不是指得像样了：至少有一个脚本 exe 设好了
+
+    不能只看 config.json 存不存在——用户可能第一次打开、看了一眼就关掉，
+    于是留下一个"全空但存在"的配置，下次打开就会带着空路径自动开跑，
+    满屏「找不到 xxx.exe」。所以按内容判断。
+    """
+    for k in ("maaend", "maa", "maafgo", "okww"):
+        if ((cfg.get(k, {}) or {}).get("path") or "").strip():
+            return True
+    return False
+
+
+def load_config():
+    """读配置：主文件坏了自动退到 .bak，两边都读不了才用默认值
+
+    勾选记忆就存在这个文件里，所以读失败等于"用户的选择全丢"，
+    必须留一条后路。
+    """
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    merged = False
+    for path in (CONFIG_PATH, CONFIG_PATH + ".bak"):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except Exception as e:
+            log_line("配置读取失败（%s）：%s" % (os.path.basename(path), e))
+            continue
+        for k, v in data.items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+        merged = True
+        if path != CONFIG_PATH:
+            log_line("主配置读不了，已用 config.json.bak 恢复勾选和路径")
+            save_config(cfg)                 # 顺手把主文件修回来
+        break
+    if not merged:
+        save_config(cfg)
+    return cfg
+
+
+def save_config(cfg):
+    """原子写 + 留一份 .bak
+
+    原来是 open(path,"w") 直接覆盖：写到一半断电/崩溃会留下半个 JSON，
+    下次启动读失败就用回默认配置——用户勾了半天的选项全没了。
+    这里先写 .tmp、fsync 落盘，再把旧的备份成 .bak，最后 os.replace 原子替换。
+    """
+    tmp = CONFIG_PATH + ".tmp"
+    bak = CONFIG_PATH + ".bak"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)          # 原子替换，不会出现半个文件
+        try:
+            shutil.copy2(CONFIG_PATH, bak)    # 成功之后才更新副本 = 永远是最新的一份
+        except Exception:
+            pass
+    except Exception as e:
+        log_line("配置保存失败: %s" % e)
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+_log_lock = threading.Lock()
+
+
+def log_line(msg):
+    line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
+    try:
+        with _log_lock:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# 进程 / 环境工具
+# ----------------------------------------------------------------------------
+def run_hidden(args, timeout=90):
+    """静默执行命令，返回 (returncode, stdout+stderr)"""
+    try:
+        p = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        out = p.stdout.decode("utf-8", "replace") if p.stdout else ""
+        return p.returncode, out
+    except subprocess.TimeoutExpired:
+        return -1, "timeout"
+    except Exception as e:
+        return -1, str(e)
+
+
+def mumu_manager(mumu_root):
+    return os.path.join(mumu_root, "nx_main", "MuMuManager.exe")
+
+
+def detect_adb(mumu_root):
+    base = os.path.join(mumu_root, "nx_device")
+    best, best_ver = None, None
+    if os.path.isdir(base):
+        for name in os.listdir(base):
+            exe = os.path.join(base, name, "shell", "adb.exe")
+            if os.path.isfile(exe):
+                try:
+                    ver = tuple(int(x) for x in name.split("."))
+                except Exception:
+                    ver = (0,)
+                if best_ver is None or ver > best_ver:
+                    best, best_ver = exe, ver
+    return best or os.path.join(base, "12.0", "shell", "adb.exe")
+
+
+def read_adb_port(mumu_root, index):
+    cfg = os.path.join(
+        mumu_root, "vms", "MuMuPlayer-12.0-%d" % index, "configs", "vm_config.json"
+    )
+    try:
+        with open(cfg, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        return int(data["vm"]["nat"]["port_forward"]["adb"]["host_port"])
+    except Exception:
+        return 16384 + 32 * index
+
+
+def list_vm_info(mgr, timeout=30):
+    rc, out = run_hidden([mgr, "info", "-v", "all"], timeout)
+    if rc != 0:
+        return {}
+    out = out.strip()
+    i = out.find("{")
+    if i > 0:
+        out = out[i:]
+    try:
+        data = json.loads(out)
+    except Exception:
+        return {}
+    res = {}
+    for k, v in data.items():
+        try:
+            res[int(k)] = v
+        except Exception:
+            pass
+    return res
+
+
+def proc_running(exe_name):
+    """用 Toolhelp 枚举进程，判断某个 exe 是否在跑"""
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wt.DWORD),
+            ("cntUsage", wt.DWORD),
+            ("th32ProcessID", wt.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wt.DWORD),
+            ("cntThreads", wt.DWORD),
+            ("th32ParentProcessID", wt.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wt.DWORD),
+            ("szExeFile", wt.WCHAR * 260),
+        ]
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap in (0, -1):
+        return False
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        target = exe_name.lower()
+        while ok:
+            if entry.szExeFile.lower() == target:
+                return True
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        return False
+    finally:
+        kernel32.CloseHandle(snap)
+
+
+def spawn(exe, workdir, args=None):
+    return subprocess.Popen(
+        [exe] + list(args or []),
+        cwd=workdir,
+        creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+        close_fds=True,
+    )
+
+
+def list_processes():
+    """返回 [(pid, ppid, exe_name)]"""
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wt.DWORD),
+            ("cntUsage", wt.DWORD),
+            ("th32ProcessID", wt.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wt.DWORD),
+            ("cntThreads", wt.DWORD),
+            ("th32ParentProcessID", wt.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wt.DWORD),
+            ("szExeFile", wt.WCHAR * 260),
+        ]
+
+    res = []
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap in (0, -1):
+        return res
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            res.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID),
+                        entry.szExeFile))
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return res
+
+
+def mumu_main(mumu_root):
+    return os.path.join(mumu_root, "nx_main", "MuMuNxMain.exe")
+
+
+def proc_elevated(pid):
+    """目标进程是否处于提权状态（True/False/None=取不到）
+
+    这是排查 UAC 的关键：MuMu 的设备进程由 MuMuNxMain 拉起，
+    父进程没提权的话，设备进程就会自己弹一次 UAC。
+    """
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    TOKEN_QUERY = 0x0008
+    TokenElevation = 20
+    if not hasattr(kernel32, "OpenProcess") or kernel32.OpenProcess.restype is not wt.HANDLE:
+        kernel32.OpenProcess.restype = wt.HANDLE
+        kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    advapi32.OpenProcessToken.restype = wt.BOOL
+    advapi32.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE)]
+    advapi32.GetTokenInformation.restype = wt.BOOL
+
+    class TOKEN_ELEVATION(ctypes.Structure):
+        _fields_ = [("TokenIsElevated", wt.DWORD)]
+
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h:
+        return None
+    try:
+        tok = wt.HANDLE()
+        if not advapi32.OpenProcessToken(h, TOKEN_QUERY, ctypes.byref(tok)):
+            return None
+        try:
+            te = TOKEN_ELEVATION()
+            sz = wt.DWORD(0)
+            if not advapi32.GetTokenInformation(tok, TokenElevation,
+                                                ctypes.byref(te),
+                                                ctypes.sizeof(te),
+                                                ctypes.byref(sz)):
+                return None
+            return bool(te.TokenIsElevated)
+        finally:
+            kernel32.CloseHandle(tok)
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def proc_pids(exe_name):
+    """返回同名进程的 pid 列表"""
+    tgt = exe_name.lower()
+    return [pid for pid, _ppid, name in list_processes()
+            if name.lower() == tgt]
+
+
+def kill_pids(pids, log=None):
+    """结束给定 pid（先 taskkill /f，失败再由调用方处理）"""
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/f", "/pid", str(pid)],
+                           creationflags=CREATE_NO_WINDOW,
+                           capture_output=True, timeout=20)
+        except Exception as e:
+            if log:
+                log("  结束进程 %d 失败：%s" % (pid, e))
+
+
+MAIN_EXE = "MuMuNxMain.exe"
+_hidden_main_hwnds = []          # 本次进程隐藏过的主程序窗口，用于"显示"时还原
+
+
+# 这些类名不是 MuMu 的界面窗口（Qt 内部消息窗、CEF 离屏窗、输入法窗…），一律跳过
+_WINDOW_CLASS_BLOCK = (
+    "chrome_", "ime", "msctfime", "static", "base_power", "shellwindow",
+    "nvopengl", "temp_d3d", "vbox", "virtualbox", "hiddenwindow",
+    "pyinstaller", "toolbar", "tooltips", "#32768", "progman",
+)
+
+
+def find_main_windows(visible_only=True, min_w=300, min_h=200):
+    """找 MuMu 主程序的界面窗口，返回 [(hwnd, title, class)]
+
+    MuMu 是 Qt 程序，进程里塞了一堆消息窗口和离屏窗口：
+      Qt5156QWindowToolSaveBits  "MuMu模拟器"  可见   <- 真正看见的那个
+      Qt5156QWindowIcon          "MuMu模拟器"  隐藏   <- Qt 的属主工具窗
+      Chrome_WidgetWin_0         （CEF 离屏）  隐藏
+    所以按"类名不在黑名单 + 尺寸够大"（+ 需要时"可见"）来筛。
+    注意不能按 GW_OWNER 过滤——真正看得见的那个窗恰恰是有属主的。
+    """
+    pids = set(proc_pids(MAIN_EXE))
+    if not pids:
+        return []
+    res = []
+
+    def cb(h, l):
+        try:
+            pid = wt.DWORD(0)
+            user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            if pid.value not in pids:
+                return True
+            cls = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(h, cls, 256)
+            if cls.value.lower().startswith(_WINDOW_CLASS_BLOCK):
+                return True
+            if visible_only and not user32.IsWindowVisible(h):
+                return True
+            r = wt.RECT()
+            user32.GetWindowRect(h, ctypes.byref(r))
+            if (r.right - r.left) < min_w or (r.bottom - r.top) < min_h:
+                return True
+            n = user32.GetWindowTextLengthW(h)
+            buf = ctypes.create_unicode_buffer(n + 2)
+            user32.GetWindowTextW(h, buf, n + 2)
+            res.append((h, buf.value, cls.value))
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)(cb), 0)
+    except Exception:
+        return []
+    return res
+
+
+def main_window_visible():
+    return bool(find_main_windows(visible_only=True))
+
+
+def _show_hwnds(hwnds, log=None, tag=""):
+    for h in hwnds:
+        user32.ShowWindow(h, 9 if user32.IsIconic(h) else 1)   # SW_RESTORE / SW_SHOWNORMAL
+        try:
+            user32.SetForegroundWindow(h)
+        except Exception:
+            pass
+    time.sleep(0.4)
+    ok = [h for h in hwnds if user32.IsWindowVisible(h)]
+    if log:
+        if ok:
+            log("已显示 MuMu 主程序窗口%s（%d 个）" % (tag, len(ok)))
+        else:
+            log("✗ 窗口没能显示出来%s（可能被 UIPI 挡住：请用提权后的启动器操作）" % tag)
+    return bool(ok)
+
+
+def set_main_window(show, log=None):
+    """显示 / 隐藏 MuMu 主程序窗口（进程不动，模拟器照常运行）
+
+    show=False -> SW_HIDE：任务栏里也消失，进程还在，MuMu 的 IPC 照常可用。
+    show=True  -> 优先还原本次隐藏过的窗口；没有记录就按类名挑内容窗口显示。
+
+    注意：必须和 MuMu 同权限等级才改得动。MuMu 是提权进程时，
+    低权限进程调 ShowWindow 会被 UIPI 静默拦掉（返回 0、看起来没效果），
+    所以这些操作都只在提权后的启动器里做。
+    """
+    if show:
+        known = [h for h in _hidden_main_hwnds if user32.IsWindow(h)]
+        if known:
+            out = _show_hwnds(known, log)
+            _hidden_main_hwnds[:] = []
+            return out
+        # 没有记录（比如换了个新进程）：只放内容窗口，别把 Qt 的属主工具窗也弹出来
+        cand = find_main_windows(visible_only=False)
+        pick = [(h, t, c) for h, t, c in cand if "qwindowicon" not in c.lower()]
+        targets = [h for h, _t, _c in (pick or cand)]
+        if not targets:
+            if log:
+                log("没有找到 MuMu 主程序窗口（进程可能没开）")
+            return False
+        return _show_hwnds(targets, log, "（按类名推断）")
+
+    targets = find_main_windows(visible_only=True)
+    if not targets:
+        if log:
+            log("MuMu 主程序窗口已经不在了")
+        return False
+    for h, _title, _cls in targets:
+        user32.ShowWindow(h, 0)                # SW_HIDE
+        if h not in _hidden_main_hwnds:
+            _hidden_main_hwnds.append(h)
+    time.sleep(0.4)
+    left = [h for h, _t, _c in find_main_windows(visible_only=True)]
+    if log:
+        if left:
+            log("✗ 窗口没能隐藏（%d 个还可见）" % len(left))
+        else:
+            log("已隐藏 MuMu 主程序窗口（%s）· 模拟器照常运行"
+                % "、".join(t or "无标题" for _h, t, _c in targets))
+    return not left
+
+
+def minimize_main_window(log=None):
+    targets = find_main_windows(visible_only=True)
+    if not targets:
+        return False
+    for h, _t, _c in targets:
+        user32.ShowWindow(h, 6)                # SW_MINIMIZE
+        if h not in _hidden_main_hwnds:
+            _hidden_main_hwnds.append(h)
+    time.sleep(0.4)
+    left = find_main_windows(visible_only=True)
+    if log:
+        log("已最小化 MuMu 主程序窗口" if not left
+            else "✗ 窗口没能最小化")
+    return not left
+
+
+def _main_window_worker(mode, log, wait=120):
+    """后台等主程序窗口冒头再收起来
+
+    MuMu 的窗口是异步弹的（启动后可能几十秒才出现，也可能这次压根不弹），
+    所以不能直接上手就藏——先盯着，看见了再收，收完再补看几秒防止它二次弹出。
+    """
+    deadline = time.time() + wait
+    hid = False
+    act = minimize_main_window if mode == "minimize" else (
+        lambda lg=None: set_main_window(False, lg))
+    while time.time() < deadline:
+        if find_main_windows(visible_only=True):
+            act(log)
+            hid = True
+            for _ in range(8):          # 补刀：Qt 分两步建窗，可能刚藏完又弹一个
+                time.sleep(1.0)
+                if find_main_windows(visible_only=True):
+                    act(log)
+            break
+        time.sleep(1.0)
+    if not hid and log:
+        log("主程序窗口 %d 秒内没弹出，本次没动它（想收起点「隐藏 MuMu」）" % wait)
+
+
+# ----------------------------------------------------------------------------
+# MaaEnd（终末地助手）：启动 + 读它的日志判断"任务链跑完了没"
+# ----------------------------------------------------------------------------
+# MaaEnd 是 MXU 壳的 MaaFramework 应用，命令行支持（从 exe 里扒出来的）：
+#     MaaEnd.exe --autostart [-i/--instance "实例名"] [-q/--quit-after-run]
+# 运行日志写在 <MaaEnd目录>/debug/<YYYY-MM-DD>-<N>.log，关键事件：
+#     开始：INFO  [Task] 实例 XXX: 开始执行任务, 数量: N
+#     完成：DEBUG [App] 收到 state-changed，已刷新运行时状态, kind: tasks-completed
+# 任务链最后一项是 CloseGamePC（MaaEnd 里勾了"任务完成后关闭游戏"），
+# 所以"任务完成 + 终末地窗口消失"就是可以接着开 MuMu 的信号。
+MAAEND_LOG_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d+\.log$")
+MAAEND_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+MAAEND_MARK_DONE = "kind: tasks-completed"
+MAAEND_MARK_START = "开始执行任务"
+
+
+def maaend_log_files(root, sub="debug"):
+    """返回 debug 目录下的日志文件，按修改时间从旧到新排"""
+    d = os.path.join(root, sub)
+    if not os.path.isdir(d):
+        return []
+    files = [os.path.join(d, f) for f in os.listdir(d)
+             if MAAEND_LOG_RE.match(f)]
+    files.sort(key=lambda p: os.path.getmtime(p))
+    return files
+
+
+def maaend_scan(files, bytes_each=1048576):
+    """扫日志尾部，返回 (last_start_ts, last_done_ts, 备注)
+
+    每次只看文件末尾一段，避免几十 MB 的日志把轮询拖慢。
+    """
+    last_start = last_done = None
+    note = ""
+    for path in files[-3:]:                      # 只看最近 3 个（跨天/滚动）
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                f.seek(max(0, size - bytes_each))
+                tail = f.read().decode("utf-8", "replace")
+        except Exception as e:
+            note = "%s 读取失败：%s" % (os.path.basename(path), e)
+            continue
+        for line in tail.splitlines():
+            m = MAAEND_TS_RE.match(line)
+            if not m:
+                continue
+            ts = m.group(1)
+            if MAAEND_MARK_DONE in line:
+                last_done = ts
+            elif MAAEND_MARK_START in line:
+                last_start = ts
+                note = line.split("]")[-1].strip()[:60]
+    return last_start, last_done, note
+
+
+def find_windows_by(class_regex=None, title_regex=None, min_w=0, min_h=0):
+    """按类名/标题正则找顶层可见窗口，返回 [(hwnd, title, class)]"""
+    cres = re.compile(class_regex, re.I) if class_regex else None
+    tres = re.compile(title_regex, re.I) if title_regex else None
+    res = []
+
+    def cb(h, l):
+        try:
+            if not user32.IsWindowVisible(h):
+                return True
+            cls = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(h, cls, 256)
+            if cres and not cres.search(cls.value):
+                return True
+            r = wt.RECT()
+            user32.GetWindowRect(h, ctypes.byref(r))
+            if min_w and (r.right - r.left) < min_w:
+                return True
+            if min_h and (r.bottom - r.top) < min_h:
+                return True
+            n = user32.GetWindowTextLengthW(h)
+            buf = ctypes.create_unicode_buffer(n + 2)
+            user32.GetWindowTextW(h, buf, n + 2)
+            title = buf.value
+            if tres and not tres.search(title):
+                return True
+            res.append((h, title, cls.value))
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)(cb), 0)
+    except Exception:
+        return []
+    return res
+
+
+def maaend_game_running(cfg):
+    """终末地游戏窗口在不在（MaaEnd 用 UnityWndClass / Endfield 匹配它）"""
+    m = cfg.get("maaend", {})
+    return bool(find_windows_by(m.get("game_window_class", "UnityWndClass"),
+                                m.get("game_window_title", "Endfield"),
+                                min_w=200, min_h=150))
+
+
+def maafgo_sync_device(exe, instance_name, port, log=None):
+    """把 MaaFgo 配置里记的目标设备地址改成当前实际端口
+
+    MaaFgo（MXU 壳）把上次连的设备记在 config/mxu-MaaFgo.json 的
+    instances[].savedDevice.adbDeviceAddress（形如 127.0.0.1:16416）。
+    MuMu 每次启动都会重写端口，不改这里就会连到上一个实例或者连不上。
+    只在 MaaFgo 没运行时改，否则它退出时会用自己的内存值覆盖回去。
+    """
+    cfg_path = os.path.join(os.path.dirname(exe), "config", "mxu-MaaFgo.json")
+    if not os.path.isfile(cfg_path):
+        if log:
+            log("提示：没找到 MaaFgo 配置 %s，跳过设备地址对齐" % cfg_path)
+        return False
+    if proc_running(os.path.basename(exe)):
+        return False
+    try:
+        with open(cfg_path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception as e:
+        if log:
+            log("MaaFgo 配置读取失败：%s" % e)
+        return False
+
+    addr = "127.0.0.1:%d" % int(port)
+    changed = []
+    for inst in data.get("instances", []):
+        if instance_name and inst.get("name") != instance_name:
+            continue
+        dev = inst.setdefault("savedDevice", {})
+        if dev.get("adbDeviceAddress") != addr:
+            dev["adbDeviceAddress"] = addr
+            changed.append(inst.get("name") or inst.get("id"))
+    if not changed:
+        return False
+    try:
+        tmp = cfg_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, cfg_path)
+    except Exception as e:
+        if log:
+            log("MaaFgo 配置写入失败：%s" % e)
+        return False
+    if log:
+        log("已把 MaaFgo 设备地址对齐到 %s（%s）" % (addr, "、".join(changed)))
+    return True
+
+
+# -- ok-ww（鸣潮）------------------------------------------------------------
+OKWW_TITLE = "OK-WW"
+
+
+def okww_windows():
+    """找 ok-ww 的主窗口，返回 [(hwnd, title)]
+
+    ok-ww 是 Qt 程序，主窗口标题取自 config.py 的 gui_title（"OK-WW"）。
+    用它判断"是否已经开着一个实例"最简单——比去查 pythonw 命令行可靠。
+    """
+    res = []
+
+    def cb(h, l):
+        try:
+            if not user32.IsWindowVisible(h):
+                return True
+            n = user32.GetWindowTextLengthW(h)
+            if n <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 4)
+            user32.GetWindowTextW(h, buf, n + 4)
+            t = buf.value or ""
+            if OKWW_TITLE.lower() in t.lower():
+                res.append((h, t))
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)(cb), 0)
+    except Exception:
+        return []
+    return res
+
+
+def okww_running():
+    return bool(okww_windows())
+
+
+# -- 选目录（设置页用）--------------------------------------------------------
+ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+
+
+class BROWSEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("hwndOwner", wt.HWND),
+        ("pidlRoot", ctypes.c_void_p),
+        ("pszDisplayName", wt.LPWSTR),
+        ("lpszTitle", wt.LPCWSTR),
+        ("ulFlags", wt.UINT),
+        ("lpfn", ctypes.c_void_p),
+        ("lParam", wt.LPARAM),
+        ("iImage", ctypes.c_int),
+    ]
+
+
+shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFOW)]
+shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wt.LPWSTR]
+shell32.SHGetPathFromIDListW.restype = wt.BOOL
+ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+
+
+def pick_folder(owner, title="选择文件夹"):
+    """弹系统文件夹选择框；返回选中的路径，取消返回 ""
+
+    用 SHBrowseForFolderW 而不是 IFileDialog：后者要写一堆 COM 接口声明，
+    前者在 ctypes 下三个 API 就够。BIF_NEWDIALOGSTYLE 让它是可调整大小的新式框，
+    但必须先 CoInitialize，否则对话框可能不显示。
+    """
+    BIF_RETURNONLYFSDIRS = 0x0001
+    BIF_EDITBOX = 0x0010
+    BIF_NEWDIALOGSTYLE = 0x0040
+    try:
+        ole32.CoInitialize(None)
+    except Exception:
+        pass
+    name_buf = ctypes.create_unicode_buffer(1024)
+    bi = BROWSEINFOW()
+    bi.hwndOwner = owner
+    bi.pidlRoot = None
+    bi.pszDisplayName = ctypes.cast(name_buf, wt.LPWSTR)
+    bi.lpszTitle = title
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_EDITBOX | BIF_NEWDIALOGSTYLE
+    bi.lpfn = None
+    bi.lParam = 0
+    bi.iImage = 0
+    pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+    if not pidl:
+        return ""
+    try:
+        out = ctypes.create_unicode_buffer(1024)
+        if shell32.SHGetPathFromIDListW(pidl, out) and out.value:
+            return out.value
+        return name_buf.value
+    finally:
+        ole32.CoTaskMemFree(pidl)
+
+
+# ============ 选 exe 的两段式流程 ======================================
+# 为什么不用系统的"打开文件"框：
+# - `GetOpenFileNameW`（comdlg32）：实测这台机器上直接返回错误 87，框都弹不出来；
+# - `IFileDialog`（Vista+ COM）：能创建、Show 也确实弹出了可见的「打开」框，
+#   但整条链路（选完 → GetResult → GetDisplayName）在自动化环境里很难验证，
+#   风险不值得赌。
+# 唯一实测 100% 可靠的是 `SHBrowseForFolder`（选文件夹）——设置页里 5 个路径
+# 全靠它，从来没出过问题。
+#
+# 所以改成两段式：**先选文件夹 → 再从该目录的 exe 里挑一个**。
+# 交互和其它 5 项「选路径」完全一致，用户不用学新东西。
+
+
+def list_exes_in(folder):
+    """列出目录下的 exe（排除卸载器），按"最像主程序"排序"""
+    out = []
+    try:
+        for f in os.listdir(folder):
+            low = f.lower()
+            if low.endswith(".exe") and not low.startswith("unins"):
+                out.append(os.path.join(folder, f))
+    except Exception:
+        return []
+    base = os.path.basename(folder).lower()
+
+    def rank(p):
+        n = os.path.basename(p).lower()
+        same = 0 if n.startswith(base) else 1
+        return (same, len(n), n)
+
+    out.sort(key=rank)
+    return out
+
+
+
+def pick_exe_folder(owner, title="选一个程序"):
+    """选文件夹，返回路径；用户取消返回 ""
+
+    只用 SHBrowseForFolder —— 实测这台机器上只有它能稳定弹出可见的对话框。
+    """
+    return pick_folder(owner, title)
+
+
+
+def find_exe(folder, name, depth=3):
+    """在 folder 及往下 depth 层里找可执行文件；找不到返回 ""
+
+    MAA 这类解压包常常多套一层（MAA-v6.16.3-win-x64\\MAA.exe），
+    用户挑目录时往往挑的是外层，所以不能只看第一层。
+    """
+    if not folder or not os.path.isdir(folder):
+        return ""
+    direct = os.path.join(folder, name)
+    if os.path.isfile(direct):
+        return direct
+    want = name.lower()
+    try:
+        for root, dirs, files in os.walk(folder):
+            rel = os.path.relpath(root, folder)
+            if rel != "." and len(rel.split(os.sep)) > depth:
+                dirs[:] = []
+                continue
+            for f in files:
+                if f.lower() == want:
+                    return os.path.join(root, f)
+    except Exception:
+        pass
+    return ""
+
+
+def apply_path_choice(kind, cfg, folder):
+    """把设置页选的目录写进配置，返回要显示的一句话"""
+    folder = os.path.normpath(folder)
+
+    if kind == "mumu":
+        mgr = find_exe(folder, "MuMuManager.exe", depth=2)
+        if not mgr:
+            return "这个目录里没找到 MuMuManager.exe（应该在 nx_main 下），没改"
+        root = os.path.dirname(os.path.dirname(mgr))
+        cfg["mumu_root"] = root
+        idxs = discover_instance_indexes(root)
+        if idxs:
+            sync_instances(cfg, None)
+            return "MuMu 目录已设为 %s（发现 %d 个实例：%s）" % (
+                root, len(idxs), "、".join("实例%d" % i for i in idxs))
+        return ("MuMu 目录已设为 %s，但 vms 里没看到实例 —— "
+                "先打开 MuMu 新建一个实例，再回来点启动" % root)
+
+    if kind == "okww":
+        exe = find_exe(folder, "ok-ww.exe", depth=1)
+        if not exe:
+            return "这个目录里没找到 ok-ww.exe，没改"
+        base = os.path.dirname(exe)
+        py = os.path.join(base, "data", "apps", "ok-ww", "python", "pythonw.exe")
+        wd = os.path.join(base, "data", "apps", "ok-ww", "working")
+        if not os.path.isfile(py):
+            return "ok-ww.exe 找到了，但没看到自带的 pythonw.exe（先启动一次 ok-ww 让它自己装），没改"
+        if not os.path.isdir(wd):
+            return "ok-ww.exe 找到了，但 working 目录还没生成（先启动一次 ok-ww），没改"
+        cfg["okww"]["path"] = exe
+        cfg["okww"]["python"] = py
+        cfg["okww"]["workdir"] = wd
+        return "ok-ww 已设为 %s" % base
+
+    names = {"maaend": "MaaEnd.exe", "maa": "MAA.exe", "maafgo": "MaaFgo.exe"}
+    label = {"maaend": "MaaEnd", "maa": "MAA", "maafgo": "MaaFgo"}
+    want = names.get(kind)
+    if not want:
+        return "不认识的类型：%s" % kind
+    exe = find_exe(folder, want)
+    if not exe:
+        return "这个目录及下面三层里都没找到 %s，没改" % want
+    cfg.setdefault(kind, {})["path"] = exe
+    tip = _init_tip(kind, exe)
+    return "%s 已设为 %s%s" % (label[kind], exe, tip)
+
+
+def _init_tip(kind, exe):
+    """选了 exe 之后，顺手看一眼它有没有初始化过
+
+    MAA 解压后从没启动 → 没有 config\\gui.json；MaaEnd/MaaFgo 同理。
+    这种情况下启动器只能把它拉起来，没法让它"自动开始任务"，
+    不如当场说清楚，别等跑完了才发现脚本在界面里干等。
+    """
+    base = os.path.dirname(exe)
+    if kind == "maa":
+        d = os.path.join(base, "config")
+        if not (os.path.isfile(os.path.join(d, "gui.new.json"))
+                or os.path.isfile(os.path.join(d, "gui.json"))):
+            return "；⚠ 这个 MAA 还没初始化过，先手动打开一次、配好连接和任务"
+        return ""
+    if kind in ("maaend", "maafgo"):
+        j = os.path.join(base, "config",
+                         "mxu-%s.json" % ("MaaEnd" if kind == "maaend" else "MaaFgo"))
+        if not os.path.isfile(j):
+            return "；⚠ 还没初始化过，先手动打开一次、配好要跑的实例"
+    if kind == "okww":
+        wd = os.path.join(base, "data", "apps", "ok-ww", "working")
+        if not os.path.isfile(os.path.join(wd, "main.py")):
+            return "；⚠ 还没初始化过，先手动启动一次 ok-ww 让它释放环境"
+    return ""
+
+
+# ----------------------------------------------------------------------------
+# 环境自检 / 实例自动发现
+#
+# 换一台机器跑，最容易出问题的不是路径本身，而是"路径对了但里面没东西"：
+# MuMu 只建了 1 个实例、MAA 解压后从没启动过（没有 config\gui.json）、
+# ok-ww 没先跑过一次（没有自带 python）、实例里没装对应游戏。
+# 这些都不会报错，只会安静地卡住或跳过，所以点启动前先体检一遍。
+# ----------------------------------------------------------------------------
+def discover_instance_indexes(mumu_root):
+    """列出 MuMu 里实际存在的实例号
+
+    直接看 vms\\MuMuPlayer-12.0-N 目录，不依赖 MuMu 主程序在跑
+    （MuMuManager info 在没开主程序时经常读不到东西）。
+    """
+    base = os.path.join(mumu_root or "", "vms")
+    out = []
+    try:
+        if os.path.isdir(base):
+            for name in os.listdir(base):
+                m = re.match(r"^MuMuPlayer-12\.0-(\d+)$", name, re.I)
+                if m and os.path.isdir(os.path.join(base, name)):
+                    out.append(int(m.group(1)))
+    except Exception:
+        pass
+    return sorted(set(out))
+
+
+def sync_instances(cfg, log=None):
+    """按 MuMu 实际有的实例重建 cfg["instances"]
+
+    返回 True = 有改动，调用方要刷新界面。
+    读不到实例（路径没设 / 目录不存在）时原样返回，绝不清空用户的列表。
+    已有条目的名字和勾选状态按实例号继承，所以"记住上次勾选"不会被冲掉。
+    """
+    idxs = discover_instance_indexes(cfg.get("mumu_root", ""))
+    if not idxs:
+        return False
+    old = {}
+    for i in cfg.get("instances", []) or []:
+        try:
+            old[int(i.get("index"))] = i
+        except Exception:
+            pass
+    new = []
+    for i in idxs:
+        prev = old.get(i) or {}
+        new.append({
+            "index": i,
+            "name": prev.get("name") or INSTANCE_DEFAULT_NAMES.get(i) or ("实例%d" % i),
+            "enabled": bool(prev.get("enabled", True)),
+            "package": prev.get("package", ""),
+        })
+    same = ([int(i.get("index", -1)) for i in cfg.get("instances", []) or []]
+            == idxs)
+    cfg["instances"] = new
+    if not same and log:
+        log("MuMu 里实际有 %d 个实例：%s（已按实际情况更新界面）"
+            % (len(idxs), "、".join("实例%d" % i for i in idxs)))
+
+    # 实例号越界（典型：只建了 1 台，默认配置里 MaaFgo 写的是实例 1）
+    # → 回落到现有实例，否则自检会一直报"实例1 不存在"，新手根本不知道该改哪
+    for sec, field, label in (("maa", "instance_index", "MAA"),
+                              ("maafgo", "emulator_index", "MaaFgo")):
+        cur = (cfg.get(sec, {}) or {}).get(field)
+        try:
+            cur_i = int(cur)
+        except Exception:
+            cur_i = None
+        if cur_i is not None and cur_i not in idxs:
+            cfg.setdefault(sec, {})[field] = idxs[0]
+            same = False
+            if log:
+                log("%s 原来连的实例%d 不存在，先改成实例%d（设置页可以再换）"
+                    % (label, cur_i, idxs[0]))
+    return not same
+
+
+def _mxu_names(path):
+    """读 MXU 壳（MaaEnd / MaaFgo）配置里的实例名列表"""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        return [i.get("name") for i in data.get("instances", []) if i.get("name")]
+    except Exception:
+        return []
+
+
+def preflight(cfg):
+    """启动前自检
+
+    返回 (issues, skip)：
+      issues = [(level, text)]，level ∈ err / warn / ok，直接往日志里打
+      skip   = 这次要跳过的项，键是 vm0 / vm1 / maa / maafgo / maaend / okww
+
+    原则：能救的就跳过该项、把其它项照跑（比如 MaaEnd 路径错，不该连累模拟器）；
+    救不了又必须的（MuMu 目录没设）就让整轮停下来。
+    """
+    issues = []
+    skip = set()
+
+    def add(level, text, *keys):
+        issues.append((level, text))
+        for k in keys:
+            skip.add(k)
+
+    # ---- MuMu ----
+    root = (cfg.get("mumu_root") or "").strip()
+    mgr = mumu_manager(root) if root else ""
+    if not root:
+        add("err", "还没设置 MuMu 模拟器目录：点「设置」→「MuMu 模拟器目录」→「选择」",
+            *["vm%d" % i for i in _cfg_indexes(cfg)], "maa", "maafgo")
+    elif not os.path.isfile(mgr):
+        add("err", "MuMu 目录里找不到 nx_main\\MuMuManager.exe（选的可能是旧版本或外层目录）：%s"
+            % root, *["vm%d" % i for i in _cfg_indexes(cfg)], "maa", "maafgo")
+    else:
+        idxs = discover_instance_indexes(root)
+        if not idxs:
+            add("err", "MuMu 里一个实例都没找到（%s\\vms 是空的）：先在 MuMu 里新建实例"
+                % root, "maa", "maafgo")
+        else:
+            for inst in cfg.get("instances", []) or []:
+                idx = int(inst.get("index", -1))
+                if idx not in idxs:
+                    add("err", "实例%d 在 MuMu 里不存在（实际只有 %s），这一项跳过"
+                        % (idx, "、".join(str(i) for i in idxs)), "vm%d" % idx)
+
+    # ---- MaaEnd（PC 端游戏，不需要模拟器）----
+    m = cfg.get("maaend", {}) or {}
+    if m.get("enabled", False):
+        p = (m.get("path") or "").strip()
+        if not p or not os.path.isfile(p):
+            add("err", "找不到 MaaEnd.exe：%s（点「设置」→ MaaEnd →「选择」）"
+                % (p or "未设置"), "maaend")
+        else:
+            j = os.path.join(os.path.dirname(p), "config", "mxu-MaaEnd.json")
+            if not os.path.isfile(j):
+                add("warn", "MaaEnd 还没初始化过（缺 config\\mxu-MaaEnd.json）："
+                            "建议先手动打开一次 MaaEnd 配好「全套日常」再交给启动器", "maaend")
+            else:
+                names = _mxu_names(j)
+                want = (m.get("instance") or "").strip()
+                if want and names and want not in names:
+                    add("warn", "MaaEnd 里没有叫「%s」的实例（现有：%s），"
+                                "请在 config.json 改 maaend.instance" % (want, "、".join(names)))
+
+    # ---- MAA ----
+    a = cfg.get("maa", {}) or {}
+    if a.get("enabled", True):
+        p = (a.get("path") or "").strip()
+        if not p or not os.path.isfile(p):
+            add("err", "找不到 MAA.exe：%s（点「设置」→ MAA →「选择」）"
+                % (p or "未设置"), "maa")
+        else:
+            d = os.path.join(os.path.dirname(p), "config")
+            if not (os.path.isfile(os.path.join(d, "gui.new.json"))
+                    or os.path.isfile(os.path.join(d, "gui.json"))):
+                add("warn", "MAA 还没初始化过（config 里没有 gui.json）："
+                            "先手动打开一次 MAA，配好连接与任务，否则它不会自动开跑", "maa")
+            idx = int(a.get("instance_index", 0))
+            # 只有 MuMu 目录确认可用时，实例号越界才是真问题
+            # （目录都没设时已经报过 MuMu 那条了，再报一遍只会让人更迷）
+            if mgr and os.path.isfile(mgr) and idx not in _cfg_indexes(cfg):
+                add("err", "MAA 设的连接实例 %d 不在实例列表里（现有 %s）"
+                    % (idx, "、".join(str(i) for i in _cfg_indexes(cfg)) or "无"), "maa")
+
+    # ---- MaaFgo ----
+    f = cfg.get("maafgo", {}) or {}
+    if f.get("enabled", True):
+        p = (f.get("path") or "").strip()
+        if not p or not os.path.isfile(p):
+            add("err", "找不到 MaaFgo.exe：%s（点「设置」→ MaaFgo →「选择」）"
+                % (p or "未设置"), "maafgo")
+        else:
+            j = os.path.join(os.path.dirname(p), "config", "mxu-MaaFgo.json")
+            if not os.path.isfile(j):
+                add("warn", "MaaFgo 还没初始化过（缺 config\\mxu-MaaFgo.json）："
+                            "先手动打开一次，勾好要跑的任务", "maafgo")
+            else:
+                names = _mxu_names(j)
+                want = (f.get("instance") or "").strip()
+                if want and names and want not in names:
+                    add("warn", "MaaFgo 里没有叫「%s」的实例（现有：%s），"
+                                "请在 config.json 改 maafgo.instance" % (want, "、".join(names)))
+        idx = int(f.get("emulator_index", 1))
+        if mgr and os.path.isfile(mgr) and idx not in _cfg_indexes(cfg):
+            add("err", "MaaFgo 设的连接实例 %d 不在实例列表里（现有 %s）"
+                % (idx, "、".join(str(i) for i in _cfg_indexes(cfg)) or "无"), "maafgo")
+        pkg = (f.get("game_package") or "").strip()
+        if not pkg:
+            add("warn", "MaaFgo 没设游戏包名（maafgo.game_package），"
+                        "启动器不会帮你开游戏，请手动在实例里开好 FGO")
+
+    # ---- ok-ww（PC 端游戏，不需要模拟器）----
+    w = cfg.get("okww", {}) or {}
+    if w.get("enabled", True):
+        py = (w.get("python") or "").strip()
+        wd = (w.get("workdir") or "").strip()
+        if not wd or not os.path.isdir(wd):
+            add("err", "ok-ww 的 working 目录不存在：%s（先手动启动一次 ok-ww.exe 让它释放环境）"
+                % (wd or "未设置"), "okww")
+        elif not os.path.isfile(os.path.join(wd, "main.py")):
+            add("err", "ok-ww 的 working 目录里没有 main.py：%s" % wd, "okww")
+        elif not py or not os.path.isfile(py):
+            add("err", "找不到 ok-ww 自带的 pythonw.exe：%s（先手动启动一次 ok-ww.exe）"
+                % (py or "未设置"), "okww")
+
+    # ---- 权限 / 全局 ----
+    if not is_admin():
+        issues.append(("warn", "当前不是管理员权限：MuMu 设备进程可能自己弹 UAC，"
+                               "模拟器有启动失败风险"))
+    return issues, skip
+
+
+def _cfg_indexes(cfg):
+    out = []
+    for i in cfg.get("instances", []) or []:
+        try:
+            out.append(int(i.get("index")))
+        except Exception:
+            pass
+    return out
+
+
+# -- 任务完成检测（MAA / MaaFgo / ok-ww）--------------------------------------
+LOG_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+MAA_DONE_MARK = "任务已全部完成"          # MAA GUI: TaskQueueViewModel
+MAACORE_DONE_MARK = "AllTasksCompleted"  # MaaCore 兜底
+MXU_DONE_MARK = "tasks-completed"        # MXU 壳（MaaEnd / MaaFgo 共用）
+MXU_START_MARK = "开始执行任务"           # MXU 每开一段任务都会打一条
+OKWW_DONE_MARK = "end running onetime_task"   # ok-ww（需 debug=True 才写）
+
+MUMU_DATE_LOG_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d+\.log$")
+
+
+def parse_log_ts(line):
+    """从日志行里抠 'YYYY-MM-DD HH:MM:SS'，返回 epoch 秒；抠不到返回 None
+
+    三种日志的时间格式各不相同，但都能被同一正则命中：
+      [2026-10-29 10:42:10.475][INF][...]   MAA
+      2026-10-29 15:36:12 DEBUG [App] ...   MaaFgo / MaaEnd
+      2026-10-29 16:04:21,582 INFO ...      ok-ww
+    """
+    m = LOG_TS_RE.search(line)
+    if not m:
+        return None
+    try:
+        return time.mktime(time.strptime(m.group(1) + " " + m.group(2),
+                                         "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+
+
+def scan_logs(files, marker, since, bytes_each=786432):
+    """在日志尾部找 marker，只认时间戳 >= since 的行；返回最新的命中时间
+
+    只看文件末尾一段，几十 MB 的 asst.log 也不会把轮询拖死。
+    since 用"该程序本次启动的时刻"，这样上一轮留下的旧标记不会被当成这一轮。
+    """
+    hit = None
+    for path in files:
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                f.seek(max(0, size - bytes_each))
+                tail = f.read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        for line in tail.splitlines():
+            if marker not in line:
+                continue
+            ts = parse_log_ts(line)
+            if ts is None or ts < since:
+                continue
+            if hit is None or ts > hit:
+                hit = ts
+    return hit
+
+
+def scan_logs_multi(files, markers, since, bytes_each=786432):
+    """一次扫完日志尾部，返回 {marker: 最新命中时间}（没命中是 None）
+
+    MaaFgo 的任务链是**分段**跑的：一段跑完打 tasks-completed，
+    十几秒后又打一条「开始执行任务」开下一段。只看 tasks-completed
+    会把中间那段的结束当成全部结束（实测 17:39:27 与 17:41:50 差 2 分 23 秒）。
+    所以要把"最后一次开始"的时间也一起取出来做比较。
+    """
+    hits = {m: None for m in markers}
+    for path in files:
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                f.seek(max(0, size - bytes_each))
+                tail = f.read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        for line in tail.splitlines():
+            ts = parse_log_ts(line)
+            if ts is None or ts < since:
+                continue
+            for m in markers:
+                if m in line:
+                    if hits[m] is None or ts > hits[m]:
+                        hits[m] = ts
+                    break
+    return hits
+
+
+def _recent_files(folder, pattern, limit=4):
+    """某个目录下匹配 pattern 的日志，按修改时间从新到旧取前 limit 个"""
+    if not os.path.isdir(folder):
+        return []
+    out = []
+    try:
+        for name in os.listdir(folder):
+            if not pattern.match(name):
+                continue
+            p = os.path.join(folder, name)
+            if os.path.isfile(p):
+                out.append((os.path.getmtime(p), p))
+    except Exception:
+        return []
+    out.sort(reverse=True)
+    return [p for _m, p in out[:limit]]
+
+
+def maa_log_files(cfg):
+    """MAA 的 GUI 日志：<MAA 目录>\\debug\\gui.log（轮转后是 gui.bak.log）"""
+    exe = cfg.get("maa", {}).get("path", "")
+    folder = os.path.join(os.path.dirname(exe), "debug")
+    return _recent_files(folder, re.compile(r"^gui.*\.log$"))
+
+
+def maa_core_log_files(cfg):
+    """MaaCore 的流水日志（几十 MB，只在 GUI 那句没命中时才扫兜底标记）"""
+    exe = cfg.get("maa", {}).get("path", "")
+    folder = os.path.join(os.path.dirname(exe), "debug")
+    return _recent_files(folder, re.compile(r"^asst.*\.log$"), limit=2)
+
+
+def maafgo_log_files(cfg):
+    """MaaFgo 的 MXU 日志：<目录>\\debug\\2026-10-29-4.log"""
+    exe = cfg.get("maafgo", {}).get("path", "")
+    folder = os.path.join(os.path.dirname(exe), "debug")
+    return _recent_files(folder, MUMU_DATE_LOG_RE)
+
+
+def okww_log_files(cfg):
+    """ok-ww 的日志：<working>\\logs\\ok-script.log"""
+    wd = cfg.get("okww", {}).get("workdir", "")
+    folder = os.path.join(wd, "logs")
+    return _recent_files(folder, re.compile(r"^ok-script.*\.log$"))
+
+
+def find_unreal_windows(cfg, min_w=400, min_h=300):
+    """找鸣潮（ok-ww 控制的那个 PC 游戏）的主窗口"""
+    w = cfg.get("okww", {})
+    cls = w.get("game_window_class", "UnrealWindow")
+    return find_windows_by(cls, None, min_w=min_w, min_h=min_h)
+
+
+def close_game_window(cfg, log=None, wait=12):
+    """给游戏主窗口发 WM_CLOSE，让它自己正常退出（不是强杀）
+
+    ok-ww 侧只要 Basic Options 的 "Exit App when Game Exits" 是关着的，
+    游戏退出后它只弹一条 "Game Exited" 通知，界面留着，正是我们要的效果。
+    """
+    wins = find_unreal_windows(cfg)
+    if not wins:
+        if log:
+            log("没找到鸣潮的游戏窗口（可能已经关了）")
+        return False
+    for h, title, cls in wins:
+        user32.PostMessageW(h, WM_CLOSE, 0, 0)
+        if log:
+            log("已向游戏窗口发关闭消息：%s（%s）" % (title or "无标题", cls))
+    # 等它真的退；还在就等下一轮或强杀
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        if not find_unreal_windows(cfg):
+            if log:
+                log("鸣潮已退出")
+            return True
+        time.sleep(1.0)
+    if log:
+        log("⚠ 游戏窗口还开着，直接结束进程")
+    run_hidden(["taskkill", "/F", "/IM",
+                cfg.get("okww", {}).get("game_exe", "Client-Win64-Shipping.exe")], 30)
+    return not find_unreal_windows(cfg)
+
+
+def shutdown_instance(cfg, idx, log=None):
+    """只关某一个 MuMu 实例（比如 FGO 那个），别的实例和四个程序都不动
+
+    MAA / MaaFgo 是 ADB 控制器，实例关掉后它们会显示"设备断开"，
+    但进程、窗口、日志全都还在——正好留着查结果。
+    """
+    mgr = mumu_manager(cfg.get("mumu_root", ""))
+    if not os.path.isfile(mgr):
+        if log:
+            log("✗ 找不到 MuMuManager.exe，无法关闭实例 %s" % idx)
+        return False
+    if log:
+        log("关闭 MuMu 实例 %s（模拟器以外的进程都保留）…" % idx)
+    rc, out = run_hidden([mgr, "control", "-v", str(idx), "shutdown"], 120)
+    if rc != 0 and log:
+        log("  MuMuManager 返回 %s：%s" % (rc, (out or "").strip()[:120]))
+    # 等它真的退干净，别让后面的判断看到还是"在跑"
+    for _ in range(20):
+        if not instance_running(cfg, idx):
+            break
+        time.sleep(1.0)
+    alive = instance_running(cfg, idx)
+    if alive:
+        if log:
+            log("  实例 %s 还没退干净，再等一轮" % idx)
+        time.sleep(5.0)
+        alive = instance_running(cfg, idx)
+    if log:
+        log("实例 %s 已关闭" % idx if not alive else "⚠ 实例 %s 仍在运行" % idx)
+    return not alive
+
+
+def instance_running(cfg, idx):
+    """实例是否还在跑：读它的 adb 端口配置，能连上并 boot_completed=1 就算在跑"""
+    root = cfg.get("mumu_root", "")
+    adb = detect_adb(root)
+    port = read_adb_port(root, idx)
+    if not adb or not port:
+        return False
+    s = "127.0.0.1:%d" % port
+    rc, out = run_hidden([adb, "-s", s, "shell", "getprop", "sys.boot_completed"], 8)
+    return rc == 0 and (out or "").strip() == "1"
+
+
+def shutdown_emulators(cfg, log=None):
+    """只关 MuMu 模拟器实例，不动 MAA / MaaFgo / MaaEnd / ok-ww 进程
+
+    MAA、MaaFgo 是 ADB 控制器，实例关掉后它们会显示"设备断开"，
+    但进程和窗口都还在，日志也都留着——正是要用来看结果的状态。
+    """
+    mgr = mumu_manager(cfg.get("mumu_root", ""))
+    if not os.path.isfile(mgr):
+        if log:
+            log("✗ 找不到 MuMuManager.exe，无法关闭实例")
+        return False
+    if log:
+        log("关闭 MuMu 模拟器实例（进程保留）…")
+    rc, out = run_hidden([mgr, "control", "-v", "all", "shutdown"], 120)
+    if rc != 0 and log:
+        log("  MuMuManager 返回异常：%s" % (out or "").strip()[:120])
+    time.sleep(3.0)
+    if proc_pids("MuMuNxDevice.exe") and log:
+        log("  仍有设备进程残留，强制结束模拟器进程")
+        run_hidden(["taskkill", "/F", "/IM", "MuMuNxDevice.exe"], 30)
+    if log:
+        log("模拟器已关闭")
+    return True
+
+
+
+# -- 界面图标 ---------------------------------------------------------------
+# 图标都是 96px 单帧 ico，放在 源码/assets/icons/ 下：
+#   maaend/maa/maafgo/okww  ——  从各自 exe 的 RT_GROUP_ICON 里扒的（build/extract_icons.py）
+#   arknights/fgo           ——  App Store 官方 512 图标，切圆角（build/make_game_icons.py）
+#   mumu                    ——  MuMuNxMain.exe 的图标
+#   launcher                ——  本程序自己的图标
+LR_LOADFROMFILE = 0x0010
+IMAGE_ICON = 1
+DI_NORMAL = 0x0003
+
+_ICON_CACHE = {}
+
+
+def assets_dir(*parts):
+    """优先 PyInstaller 的解包目录（onefile 时是 sys._MEIPASS），其次源码目录"""
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        p = os.path.join(base, "assets", *parts)
+        if os.path.exists(p):
+            return p
+    return os.path.join(APP_DIR, "assets", *parts)
+
+
+def load_icon(name, px=96):
+    """加载 assets/icons/<name>.ico，返 HICON；缺失返回 None（有缓存）"""
+    if not name:
+        return None
+    key = (name, px)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    h = None
+    p = assets_dir("icons", name + ".ico")
+    if os.path.isfile(p):
+        try:
+            h = user32.LoadImageW(None, p, IMAGE_ICON, px, px, LR_LOADFROMFILE)
+        except Exception:
+            h = None
+    _ICON_CACHE[key] = h
+    return h
+
+
+def draw_icon(hdc, name, x, y, size):
+    """把图标画到 (x, y)，边长 size（都是物理像素）
+
+    96px 的 ico 缩到 40 左右一定会有点糊，用 HALFTONE 让 GDI 做平滑降采样，
+    比默认的 COLORONCOLOR（直接丢像素）好看不少。画完恢复原模式，
+    免得影响后面别的位图操作。
+    """
+    h = load_icon(name)
+    if not h:
+        return False
+    try:
+        old = gdi32.SetStretchBltMode(hdc, 4)      # HALFTONE
+        ok = user32.DrawIconEx(hdc, int(round(x)), int(round(y)), h,
+                               int(round(size)), int(round(size)),
+                               0, None, DI_NORMAL)
+        if old:
+            gdi32.SetStretchBltMode(hdc, old)
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def handle_main_window_after_boot(cfg, log):
+    """实例就绪后按 config.json 的 mumu_main_window 处理主程序窗口
+
+    hide（默认）/ minimize / keep。等待时长用 mumu_main_window_wait（默认 120 秒）。
+    放在后台线程里，不拖慢启动流程的收尾。
+    """
+    mode = str(cfg.get("mumu_main_window", "hide")).lower()
+    if mode in ("keep", "none", "off", "false"):
+        return
+    try:
+        wait = int(cfg.get("mumu_main_window_wait", 120))
+    except Exception:
+        wait = 120
+    mode = "minimize" if mode in ("min", "minimize") else "hide"
+    threading.Thread(target=_main_window_worker,
+                     args=(mode, log, wait), daemon=True).start()
+
+
+def proc_start_time(pid):
+    """取进程创建时间（100ns 单位）；取不到返回 0"""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return 0
+    try:
+        c = wt.FILETIME()
+        e = wt.FILETIME()
+        k = wt.FILETIME()
+        u = wt.FILETIME()
+        if kernel32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e),
+                                    ctypes.byref(k), ctypes.byref(u)):
+            return (c.dwHighDateTime << 32) | c.dwLowDateTime
+        return 0
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def cleanup_orphan_vmm(log):
+    """清理多余的 MuMuVMMSVC 进程，只保留最新那个。
+
+    MuMuVMMSVC 是 MuMu 用 PsExec 以 SYSTEM 身份拉起的（不是注册服务），
+    它崩过一次（事件日志：MuMuVMMDDU.dll 访问违例）就会留下孤儿进程。
+    之后 MuMu 按进程名找 VMM 时找到的是那个死掉的，OpenProcess 拿
+    ACCESS_DENIED，虚拟机就再也起不来：
+        vm_vboxmanager.log: VERR_POCO_ACCESS_DENIED
+                            VERR_NEED_ADMIN_ERROR (-30109)
+    """
+    procs = list_processes()
+    vmm = [(pid, ppid, name) for pid, ppid, name in procs
+           if name.lower() == "mumuvmmsvc.exe"]
+    if len(vmm) < 2:
+        return 0
+
+    vmm.sort(key=lambda x: (proc_start_time(x[0]), x[0]))
+    keep = vmm[-1]
+    killed = 0
+    failed = 0
+    for pid, ppid, _ in vmm[:-1]:
+        rc, out = run_hidden(["taskkill", "/F", "/PID", str(pid)], 20)
+        if rc == 0:
+            killed += 1
+            log("已清理多余的 MuMuVMMSVC（PID %d），保留最新的 PID %d"
+                % (pid, keep[0]))
+        else:
+            failed += 1
+    if failed and not killed:
+        log("有 %d 个旧的 MuMuVMMSVC 在跑，清理失败（权限不足），已跳过" % failed)
+    return killed
+
+
+def mumu_vm_error(mumu_root, index, lines=120):
+    """从 MuMu 自己的日志里取最后一条错误，用于失败时给可读原因"""
+    p = os.path.join(mumu_root, "vms", "MuMuPlayer-12.0-%d" % index,
+                     "data", "exportLogs", "vm_vboxmanager.log")
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-lines:]
+    except Exception:
+        return ""
+    hits = [x.strip() for x in tail if "[Error]" in x]
+    return hits[-1][:280] if hits else ""
+
+
+def kill_updater(log):
+    """结束卡住的更新器进程（它的弹窗崩掉会在主界面留下灰色蒙版，全界面点不动）"""
+    killed = 0
+    for pid, ppid, name in list_processes():
+        if name.lower() == "mumunxupdater.exe":
+            rc, _ = run_hidden(["taskkill", "/F", "/PID", str(pid)], 20)
+            if rc == 0:
+                killed += 1
+    if killed:
+        log("已结束卡住的 MuMu 更新器（%d 个）" % killed)
+    return killed
+
+
+def disable_updater(mumu_root, log):
+    """把 MuMuNxUpdater.exe 改名，彻底不再弹更新框。
+
+    原因：nx_updater_config.json 里写了强制更新版本 6.8.8.0，本机是 6.6.1.0，
+    每次开 MuMu 都会弹更新提示；这个弹窗程序一崩（ucrtbase 0xc0000409），
+    主界面就被灰色蒙版盖住、完全点不动。
+    """
+    exe = os.path.join(mumu_root, "nx_main", "MuMuNxUpdater.exe")
+    off = exe + ".disabled"
+    if not os.path.isfile(exe):
+        return False
+    try:
+        if os.path.exists(off):
+            os.remove(off)
+        os.rename(exe, off)
+        log("已禁用 MuMu 自动更新（MuMuNxUpdater.exe -> .disabled），不会再弹更新框")
+        return True
+    except Exception as e:
+        log("禁用更新器失败（%s），将只结束残留进程" % e)
+        return False
+
+
+def manager_launch(mgr, index, timeout=180):
+    """用 MuMuManager 的 IPC 启动实例（主程序在跑时才有效）"""
+    rc, out = run_hidden([mgr, "control", "-v", str(index), "launch"], timeout)
+    ok = False
+    try:
+        i = out.find("{")
+        data = json.loads(out[i:]) if i >= 0 else {}
+        ok = int(data.get("errcode", -1)) == 0
+    except Exception:
+        ok = rc == 0 and "-503" not in out
+    return ok, out
+
+def is_admin():
+    """当前进程是否已提权"""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def elevate_self():
+    """用 runas 重新启动自己；成功拉起返回 True（调用方应立刻退出）"""
+    exe = sys.executable
+    if getattr(sys, "frozen", False):
+        args = subprocess.list2cmdline(sys.argv[1:])
+    else:
+        args = subprocess.list2cmdline([os.path.abspath(__file__)] + sys.argv[1:])
+    try:
+        rc = shell32.ShellExecuteW(None, "runas", exe, args, APP_DIR, 1)
+        return int(rc or 0) > 32
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------------
+# MAA 配置：启动后直接运行任务 + 连接地址对齐实例 0
+# ----------------------------------------------------------------------------
+
+TASK_NAME = "DailyLauncher"
+
+# 一次调用完成「查询 + 触发」：任务存在就以最高权限启动它并返回 0，
+# 否则返回 1。这样双击 exe 时也不会弹 UAC。
+_PS_TASK_CMD = (
+    "$ErrorActionPreference='Stop'; "
+    "$t = Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue; "
+    "if ($t) { Start-ScheduledTask -TaskName '%s' | Out-Null; exit 0 } "
+    "else { exit 1 }"
+)
+
+
+_PS_ENSURE_TASK = (
+    "$ErrorActionPreference='Stop'; "
+    "$exe='%s'; $dir='%s'; $name='%s'; "
+    "$t=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; "
+    "$need=$true; "
+    "if ($t -and $t.Actions.Count -gt 0 -and $t.Actions[0].Execute -eq $exe) { $need=$false }; "
+    "if ($need) { "
+    "  $a=New-ScheduledTaskAction -Execute $exe -WorkingDirectory $dir; "
+    "  $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
+    "-StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero); "
+    "  $p=New-ScheduledTaskPrincipal -UserId (\"$env:USERDOMAIN\\$env:USERNAME\") "
+    "-LogonType Interactive -RunLevel Highest; "
+    "  Register-ScheduledTask -TaskName $name -Action $a -Principal $p -Settings $s -Force | Out-Null; "
+    "  Write-Output 'CREATED' "
+    "} else { Write-Output 'OK' }; "
+    "Get-ScheduledTask -TaskName 'MuMuLauncher' -ErrorAction SilentlyContinue | ForEach-Object { "
+    "Unregister-ScheduledTask -TaskName 'MuMuLauncher' -Confirm:$false; Write-Output 'REMOVED-OLD' }"
+)
+
+
+def ensure_task(name=TASK_NAME):
+    """管理员身份下，把计划任务对齐到"当前这个 exe"
+
+    免 UAC 全靠这条计划任务，但版本/目录一换（比如从 MuMu一键启动
+    改名成 一键日常启动器），任务还指着旧 exe，就会静默失效。
+    所以每次以管理员身份跑起来时顺手校正一次；不是管理员直接跳过。
+    """
+    if not is_admin():
+        return False
+    try:
+        cmd = _PS_ENSURE_TASK % (sys.executable, APP_DIR, name)
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            creationflags=CREATE_NO_WINDOW, capture_output=True, timeout=90)
+        out = (r.stdout or b"").decode("utf-8", "replace").strip()
+        err = (r.stderr or b"").decode("gbk", "replace").strip()
+        log_line("ensure_task: rc=%s out=%s err=%s" % (r.returncode, out[:120], err[:200]))
+        return r.returncode == 0
+    except Exception as e:
+        log_line("ensure_task 异常：%s: %s" % (type(e).__name__, e))
+        return False
+
+
+def trigger_task(name=TASK_NAME):
+    """存在同名计划任务 -> 用它把自己以最高权限拉起来（不弹 UAC）。
+
+    用 PowerShell cmdlet 而不是 schtasks.exe：后者在受限制的运行环境里
+    会被安全策略直接拦截。失败原因会写进 launcher.log，方便排查。
+    """
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             _PS_TASK_CMD % (name, name)],
+            creationflags=CREATE_NO_WINDOW,
+            capture_output=True, timeout=60,
+        )
+        ok = r.returncode == 0
+        log_line("trigger: task=%s rc=%s ok=%s out=%r err=%r"
+                 % (name, r.returncode, ok,
+                    (r.stdout or b"")[:160], (r.stderr or b"")[:300]))
+        return ok
+    except Exception as e:
+        log_line("trigger: 调用 PowerShell 异常 %s: %s" % (type(e).__name__, e))
+        return False
+
+def maa_apply_config(maa_exe, port, instance_index, auto_run, fix_connect, note):
+    cfg_dir = os.path.join(os.path.dirname(maa_exe), "config")
+    new_cfg = os.path.join(cfg_dir, "gui.new.json")
+    old_cfg = os.path.join(cfg_dir, "gui.json")
+    path = new_cfg if os.path.isfile(new_cfg) else (old_cfg if os.path.isfile(old_cfg) else None)
+    if not path:
+        note.append("找不到 MAA 配置文件（config/gui.new.json），跳过自动运行设置")
+        return False
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception as e:
+        note.append("MAA 配置解析失败：%s" % e)
+        return False
+
+    changed = []
+    try:
+        cur = data.get("Current") or "Default"
+        conf = data.get("Configurations", {}).get(cur)
+        if conf is None:
+            note.append("MAA 配置里没有 %s 这一套设置" % cur)
+            return False
+        gui = conf.setdefault("Gui", {})
+
+        if auto_run:
+            startup = gui.setdefault("StartUpSettings", {})
+            if startup.get("RunDirectly") is not True:
+                startup["RunDirectly"] = True
+                changed.append("启动后直接运行任务")
+
+        if fix_connect:
+            conn = gui.setdefault("ConnectSettings", {})
+            addr = "127.0.0.1:%d" % port
+            if conn.get("Address") != addr:
+                conn["Address"] = addr
+                changed.append("连接地址 → %s" % addr)
+            extras = conn.setdefault("Extras", {}).setdefault("MuMuEmulator12", {})
+            if extras.get("InstanceIndex") != instance_index:
+                extras["InstanceIndex"] = instance_index
+                changed.append("MuMu 实例索引 → %d" % instance_index)
+
+        if changed:
+            bak = path + ".launcher-bak"
+            if not os.path.isfile(bak):
+                try:
+                    with open(path, "rb") as src, open(bak, "wb") as dst:
+                        dst.write(src.read())
+                except Exception:
+                    pass
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            note.append("MAA 配置已更新：" + "、".join(changed))
+        else:
+            note.append("MAA 配置已就绪（自动运行已开启）")
+        return True
+    except Exception as e:
+        note.append("写 MAA 配置失败：%s" % e)
+        return False
+
+
+# ----------------------------------------------------------------------------
+# 启动流程（后台线程）
+# ----------------------------------------------------------------------------
+class Runner:
+    def __init__(self, cfg, emit):
+        self.cfg = cfg
+        self.emit = emit  # emit(kind, *args)
+        self.stop_flag = False
+        self._spawned = None      # 随主程序一起拉起的实例号
+        self.baseline = {}        # 各程序"本次启动"时刻，用于区分上一轮日志
+        self.done = {}            # 各程序的任务完成检测结果
+        self.monitor_on = False   # 后台完成监视是否已启动
+        self.skip = set()         # 自检认为"这次跑不了"的项（vm0/maa/maafgo/maaend/okww）
+        self.only = None          # 本次只跑这些项（开机点「是」时由 App 设置）
+
+    def cancel(self):
+        if not self.stop_flag:
+            self.stop_flag = True
+            self.log("收到取消，正在停止后续步骤…")
+
+    def log(self, msg):
+        log_line(msg)
+        self.emit("log", msg)
+
+    def step(self, key, state, detail=""):
+        self.emit("step", key, state, detail)
+
+    def cancel_steps(self, keys, detail="已取消"):
+        for k in keys:
+            self.step(k, "idle", detail)
+
+    # -- MaaEnd（终末地）---------------------------------------------------
+    def start_maaend(self):
+        """启动 MaaEnd 并自动开始任务
+
+        MaaEnd 走 Win32 控制器（抓的是 PC 上的终末地窗口），和模拟器抢鼠标键盘，
+        所以必须让它先跑完，再开 MuMu。它自己要求管理员权限，我们的启动器已经
+        提权，子进程直接继承，不会再弹一次 UAC。
+        """
+        m = self.cfg.get("maaend", {})
+        if not m.get("enabled", False):
+            self.step("maaend", "idle", "已关闭")
+            self.log("MaaEnd 已关闭（config.json 里 maaend.enabled 打开它）")
+            return True
+
+        exe = m.get("path", "")
+        if not os.path.isfile(exe):
+            self.step("maaend", "err", "路径不对")
+            self.log("✗ 找不到 MaaEnd.exe：%s" % exe)
+            return False
+
+        if proc_running(os.path.basename(exe)):
+            self.step("maaend", "run", "已在运行")
+            self.log("MaaEnd 已在运行，直接监视它的任务进度")
+            return True
+
+        args = []
+        if m.get("autostart", True):
+            args.append("--autostart")
+        inst = (m.get("instance") or "").strip()
+        if inst:
+            args += ["--instance", inst]
+        if m.get("quit_after_run", False):
+            args.append("--quit-after-run")
+
+        self.emit("status", "启动 MaaEnd…")
+        try:
+            spawn(exe, os.path.dirname(exe), args)
+        except Exception as e:
+            self.step("maaend", "err", "启动失败")
+            self.log("✗ MaaEnd 启动失败：%s" % e)
+            return False
+        self.step("maaend", "run", "任务进行中…")
+        self.log("MaaEnd 已启动：%s %s" % (os.path.basename(exe), " ".join(args)))
+        return True
+
+    def wait_maaend_done(self):
+        """读 MaaEnd 日志等「任务链跑完」，再等终末地窗口关掉
+
+        判据两条都要满足：
+          1) 日志里出现 kind: tasks-completed（MaaEnd 自己认为本轮任务结束了）
+          2) 终末地游戏窗口消失（任务链末项是 CloseGamePC，勾了才会关）
+        第 2 条给一个上限时间，超时就放行并记一行日志，免得卡死后面的流程。
+        """
+        m = self.cfg.get("maaend", {})
+        exe = m.get("path", "")
+        root = os.path.dirname(exe or ".")
+        logdir = m.get("log_dir", "debug")
+        total = int(m.get("timeout", 5400))
+        game_wait = int(m.get("game_close_timeout", 300))
+        need_game = bool(m.get("wait_game_close", True))
+
+        t0 = time.time()
+        files = maaend_log_files(root, logdir)
+        known_done = None
+        last_start = None
+        if files:                       # 记录启动前已有的"完成"标记，别误判旧进度
+            _, known_done, _ = maaend_scan(files)
+        self.log("监视 MaaEnd 日志：%s" % os.path.join(root, logdir))
+
+        done_ts = None
+        while time.time() - t0 < total:
+            if self.stop_flag:
+                self.step("maaend", "idle", "已取消")
+                return False
+            files = maaend_log_files(root, logdir)
+            if files:
+                st, dn, note = maaend_scan(files)
+                if st:
+                    last_start = st
+                if dn and dn != known_done:
+                    done_ts = dn
+                    break
+                if last_start:
+                    el = int(time.time() - t0)
+                    self.step("maaend", "run", "已跑 %d 分 %02d 秒"
+                              % (el // 60, el % 60))
+            time.sleep(5.0)
+
+        if not done_ts:
+            self.step("maaend", "err", "等待超时")
+            self.log("✗ %d 分钟内没等到 MaaEnd 任务完成（config.json 里调 maaend.timeout）"
+                     % (total // 60))
+            if not m.get("start_next_if_timeout", True):
+                return False
+            self.log("  按配置继续启动后面的 MuMu / MAA / MaaFgo")
+            return True
+
+        self.log("MaaEnd 任务已完成（%s）" % done_ts)
+        self.step("maaend", "ok", "任务完成")
+
+        if not need_game:
+            return True
+        self.emit("status", "等终末地关闭…")
+        gt0 = time.time()
+        seen = False
+        while time.time() - gt0 < game_wait:
+            if self.stop_flag:
+                self.step("maaend", "idle", "已取消")
+                return False
+            alive = maaend_game_running(self.cfg)
+            if alive:
+                seen = True
+                el = int(time.time() - gt0)
+                self.step("maaend", "ok", "任务完成 · 等游戏退出 %ds" % el)
+                time.sleep(3.0)
+                continue
+            if seen:
+                self.log("终末地已关闭，可以开始启动模拟器了")
+                return True
+            if time.time() - gt0 > 45:      # 一直没见着游戏窗口，多半压根没开
+                self.log("提示：没检测到终末地窗口（可能是这轮没开游戏），继续下一步")
+                return True
+            time.sleep(3.0)
+        self.log("⚠ 等了 %d 秒终末地还没关，先继续后面的流程" % game_wait)
+        return True
+
+    # -- 单实例 -------------------------------------------------------------
+    def ensure_main(self, first_idx):
+        """确保 MuMu 主程序（mainnx）在跑。
+
+        MuMuManager 的 control launch 必须先连上 mainnx 的 IPC，主程序没开时
+        它自己拉不起来（返回 -503 mainnx connect failed）。而 MuMu 主程序必须
+        带实例号才常驻：MuMuNxMain.exe -v <实例号>（MuMu 自己的桌面快捷方式就是
+        这么写的），不带参数会立刻退出。
+        """
+        admin = is_admin()
+        pids = proc_pids("MuMuNxMain.exe")
+        if pids:
+            elev = [proc_elevated(p) for p in pids]
+            if admin and any(e is False for e in elev):
+                # 主程序没提权 => 它拉起的 MuMuNxDevice 会自己弹一次 UAC。
+                # 这是"启动器明明提权了却还在弹 UAC"的唯一来源。
+                if proc_pids("MuMuNxDevice.exe"):
+                    self.log("MuMu 主程序未提权，但已有实例在跑，先不动它")
+                    self.log("  提示：关掉所有实例后再启动一次，就不会再弹 UAC 了")
+                    self._spawned = None
+                    return True
+                self.log("MuMu 主程序不是提权状态（它拉起的设备进程会弹 UAC），重启为提权版本…")
+                kill_pids(pids + proc_pids("MuMuNxService.exe"), self.log)
+                for _ in range(24):
+                    if not proc_pids("MuMuNxMain.exe"):
+                        break
+                    time.sleep(0.5)
+                time.sleep(1.0)
+            else:
+                tag = "已提权" if admin else "启动器未提权（设备进程可能弹 UAC）"
+                self.log("MuMu 主程序已在运行（%s）" % tag)
+                self._spawned = None
+                return True
+            if proc_pids("MuMuNxMain.exe"):
+                # 没杀掉，只能沿用：别让后面误以为实例是自己拉起来的
+                self.log("MuMu 主程序没能重启为提权版本，沿用现有进程（实例启动时可能弹 UAC）")
+                self._spawned = None
+                return True
+
+        main = mumu_main(self.cfg["mumu_root"])
+        if not os.path.isfile(main):
+            self.log("✗ 找不到 MuMuNxMain.exe：%s" % main)
+            return False
+
+        self.emit("status", "启动 MuMu 主程序…")
+        try:
+            spawn(main, os.path.dirname(main), ["-v", str(first_idx)])
+        except Exception as e:
+            self.log("✗ MuMuNxMain.exe 启动失败：%s" % e)
+            return False
+
+        t0 = time.time()
+        while time.time() - t0 < 25 and not proc_running("MuMuNxMain.exe"):
+            time.sleep(0.5)
+        if not proc_running("MuMuNxMain.exe"):
+            self.log("✗ MuMu 主程序没能起来（MuMuNxMain.exe 不在进程里）")
+            self.log("  先手动双击一次 MuMu 图标看看能不能打开；打不开就把 launcher.log 发出来")
+            return False
+
+        self._spawned = first_idx
+        self.log("MuMu 主程序已启动（同时拉起实例%d）" % first_idx)
+        time.sleep(3.0)          # 给 mainnx 一点时间把 IPC 准备好
+        return True
+
+    # -- 单实例 -------------------------------------------------------------
+    def launch_instance(self, inst, mgr, info):
+        idx = int(inst["index"])
+        key = "vm%d" % idx
+        port = read_adb_port(self.cfg["mumu_root"], idx)
+        name = inst.get("name") or ("实例%d" % idx)
+        self.emit("port", idx, port)
+
+        st = info.get(idx, {})
+        if st.get("is_android_started"):
+            self.log("实例%d（%s）已在运行，跳过启动" % (idx, name))
+            return port
+
+        if idx == self._spawned:
+            # 这台是随主程序一起拉起来的，不用再发一次启动
+            self.step(key, "run", "开机中…")
+            self.log("实例%d（%s）随主程序一起启动中…" % (idx, name))
+        elif st.get("is_process_started"):
+            self.step(key, "run", "开机中…")
+            self.log("实例%d（%s）已在启动中，等它开机" % (idx, name))
+        else:
+            self.step(key, "run", "启动中")
+            self.log("启动 MuMu 实例%d（%s）…" % (idx, name))
+            # 主程序已在跑，走 MuMuManager 的 IPC（MuMu 自己的正常方式）
+            ok, out = manager_launch(mgr, idx)
+            if not ok:
+                self.log("  IPC 启动失败：%s" % out.strip()[:160])
+                main = mumu_main(self.cfg["mumu_root"])
+                if os.path.isfile(main):
+                    self.log("  改用 MuMuNxMain.exe -v %d 直接拉起" % idx)
+                    try:
+                        spawn(main, os.path.dirname(main), ["-v", str(idx)])
+                    except Exception as e:
+                        self.log("  ✗ 兜底启动也失败：%s" % e)
+
+        time.sleep(1.5)
+        return port
+
+    def wait_ready(self, ports, mgr):
+        """以 ADB 能否执行命令为最终判据（比 is_android_started 可靠）
+
+        MuMu 每次启动都会重新分配 NAT 端口转发并重写 vm_config.json，
+        所以等待期间必须持续跟随端口，否则会盯着一个已作废的号等到超时
+        （实测：配置写 16384，启动后变 16385，界面就一直卡在"启动中"）。
+        ports 会被就地更新成实际连通的端口，MAA 用这个值才不会连错。
+        """
+        adb = detect_adb(self.cfg["mumu_root"])
+        limit = int(self.cfg.get("timeouts", {}).get("boot", 300))
+        deadline = time.time() + limit
+        pending = dict(ports)
+        last_info = 0.0
+        while pending and time.time() < deadline and not self.stop_flag:
+            for idx in list(pending):
+                real = read_adb_port(self.cfg["mumu_root"], idx)
+                if real and real != pending[idx]:
+                    self.log("实例%d 端口由 %d 变为 %d，改连新端口"
+                             % (idx, pending[idx], real))
+                    pending[idx] = real
+                    ports[idx] = real
+                    self.emit("port", idx, real)
+                serial = "127.0.0.1:%d" % pending[idx]
+                run_hidden([adb, "connect", serial], 20)
+                rc, out = run_hidden(
+                    [adb, "-s", serial, "shell", "getprop", "sys.boot_completed"], 20
+                )
+                if out.strip() == "1":
+                    port_ok = pending.pop(idx)
+                    ports[idx] = port_ok
+                    self.log("实例%d 已就绪（%s）" % (idx, serial))
+                    self.step("vm%d" % idx, "ok", "已就绪 · %d" % port_ok)
+            if pending and time.time() - last_info > 5:
+                last_info = time.time()
+                info = list_vm_info(mgr)
+                for idx in pending:
+                    booting = info.get(idx, {}).get("is_android_started")
+                    self.step("vm%d" % idx, "run", "安卓开机中…" if booting else "启动中…")
+            if pending:
+                time.sleep(2.0)
+        return pending
+
+    # -- 主流程 -------------------------------------------------------------
+    def run(self):
+        cfg = self.cfg
+        try:
+            self.stop_flag = False
+            self.emit("busy", True)
+
+            # 1) 先按 MuMu 里"实际存在"的实例对齐列表。
+            #    新用户通常只建了 1 个实例，配置里却写着 0 和 1，
+            #    结果实例1 白等 5 分钟超时、MaaFgo 直接跳过，看着莫名其妙。
+            if sync_instances(cfg, self.log):
+                self.emit("sync")
+
+            # 2) 体检：把"路径对了却跑不起来"的原因提前说清楚
+            self.emit("status", "启动前自检…")
+            issues, self.skip = preflight(cfg)
+            for lv, text in issues:
+                self.log(("✗ " if lv == "err" else "⚠ ") + text)
+            for k in sorted(self.skip):
+                self.step(k, "err", "自检未通过")
+            nerr = sum(1 for lv, _ in issues if lv == "err")
+            if nerr:
+                self.log("自检有 %d 个问题：标出来的项这次跳过，其余照常跑" % nerr)
+
+            # 本次限定范围：开机时点了「否」就只跑《今晚的手游日常》（only 非空）。
+            # 只影响这一轮，不改勾选、不写 config.json。
+            only = self.only
+            # 用户从主界面删掉的行：这次也不参与
+            hidden = set(cfg.get("hidden_items", []) or [])
+            if only:
+                self.log("本次只跑：%s；其余项本次跳过（勾选未改动）"
+                         % "、".join(sorted(only)))
+
+            # 没勾的项 / 不在本次范围内的项 / 被删掉的行，
+            # 在界面上标成「本次跳过」，不然看起来像卡在那儿没动
+            for inst in cfg.get("instances", []):
+                key = "vm%d" % int(inst["index"])
+                if (not inst.get("enabled", True) or key in hidden
+                        or (only is not None and key not in only)):
+                    self.step(key, "idle", "本次跳过")
+            for key in ("maaend", "maa", "maafgo", "okww"):
+                if (not cfg.get(key, {}).get("enabled", True) or key in hidden
+                        or (only is not None and key not in only)):
+                    self.step(key, "idle", "本次跳过")
+
+            def want(key, default=True):
+                """这一项这次要不要跑：勾了 + 在本次范围内 + 没被删 + 自检没否掉"""
+                if only is not None:
+                    return key in only and key not in self.skip
+                if key in hidden:
+                    return False
+                return (bool(cfg.get(key, {}).get("enabled", default))
+                        and key not in self.skip)
+
+            def vm_on(inst):
+                key = "vm%d" % int(inst["index"])
+                if only is not None:
+                    return key in only and key not in self.skip
+                if key in hidden:
+                    return False
+                return inst.get("enabled", True) and key not in self.skip
+
+            picked = []
+            if want("maaend", False):
+                picked.append("MaaEnd")
+            for inst in cfg.get("instances", []):
+                if vm_on(inst):
+                    picked.append("实例%d(%s)" % (int(inst["index"]),
+                                                 inst.get("name") or "模拟器"))
+            for key, label in (("maa", "MAA"), ("maafgo", "MaaFgo"),
+                               ("okww", "ok-ww")):
+                if want(key):
+                    picked.append(label)
+            for it in cfg.get("custom_items", []) or []:
+                ckey = "custom:%s" % it.get("id")
+                if ckey in hidden:
+                    continue
+                if only is not None and ckey not in only:
+                    continue
+                if it.get("enabled", True):
+                    picked.append("自定义:%s" % (it.get("name") or "项目"))
+
+            if not picked:
+                self.log("这一轮没有可执行的项（都没勾，或自检没过），不做任何操作")
+                self.emit("status", "就绪（没有可执行的项）")
+                self.emit("busy", False)
+                return
+
+            self.log(("本次范围（%d 项）：%s" if only else "按上次的勾选启动（%d 项）：%s")
+                     % (len(picked), "、".join(picked)))
+
+            # ---- 第一优先：MaaEnd（终末地）跑完再动模拟器 ----
+            # 它用 Win32 控制器直接抓 PC 上的游戏窗口，会把鼠标键盘占住，
+            # 和 MuMu 同时跑必然互相打断，所以这里串行等它收工。
+            if want("maaend", False):
+                self.emit("status", "MaaEnd（终末地）优先…")
+                if self.start_maaend():
+                    if not self.wait_maaend_done():
+                        self.emit("status", "已取消")
+                        return
+                if self.stop_flag:
+                    self.cancel_steps(["vm%d" % int(i["index"])
+                                       for i in cfg.get("instances", [])]
+                                      + ["maa", "maafgo", "okww"])
+                    self.emit("status", "已取消")
+                    return
+
+            self.emit("status", "正在检查环境…")
+            mumu_root = cfg.get("mumu_root", "")
+            mgr = mumu_manager(mumu_root)
+            mumu_ok = bool(mumu_root) and os.path.isfile(mgr)
+            if not mumu_ok:
+                self.log("跳过所有模拟器相关步骤（MuMu 目录没设对，先在「设置」里选）")
+            else:
+                self.emit("status", "检查 MuMu 状态…")
+                kill_updater(self.log)                  # 卡住的更新器会留灰色蒙版
+                if cleanup_orphan_vmm(self.log):
+                    time.sleep(1.0)
+                if cfg.get("disable_updater", True):
+                    disable_updater(mumu_root, self.log)
+
+            ports, left, info = {}, {}, {}
+            insts = ([i for i in cfg.get("instances", []) if vm_on(i)]
+                     if mumu_ok else [])
+            self._spawned = None
+            if insts:
+                info = list_vm_info(mgr)
+                if not info:
+                    self.log("提示：读取不到实例列表，按配置继续")
+
+                first = int(insts[0]["index"])
+                if not self.ensure_main(first):
+                    for inst in insts:
+                        self.step("vm%d" % int(inst["index"]), "err", "主程序未启动")
+                    self.emit("status", "MuMu 主程序没能启动")
+                    return
+                info = list_vm_info(mgr) or info
+
+                for inst in insts:
+                    ports[int(inst["index"])] = self.launch_instance(inst, mgr, info)
+
+                self.emit("status", "等待安卓开机…")
+                left = self.wait_ready(ports, mgr)
+                if self.stop_flag:
+                    self.cancel_steps(["vm%d" % i for i in sorted(left)])
+                    self.log("已取消：不再等待剩余实例，也不再启动 MAA / MaaFgo")
+                    self.emit("status", "已取消")
+                    return
+                for idx in sorted(left):
+                    self.step("vm%d" % idx, "err", "启动超时")
+                    self.log("✗ 实例%d 没等到就绪（可在 config.json 调大 timeouts.boot）" % idx)
+                    err = mumu_vm_error(mumu_root, idx)
+                    if err:
+                        self.log("  MuMu 日志：%s" % err)
+
+                for inst in insts:
+                    idx = int(inst["index"])
+                    if idx in left:
+                        continue
+                    pkg = (inst.get("package") or "").strip()
+                    if pkg:
+                        self.log("实例%d 打开应用 %s" % (idx, pkg))
+                        run_hidden(
+                            [mgr, "control", "-v", str(idx), "app", "launch", "-pkg", pkg],
+                            60,
+                        )
+                    time.sleep(0.3)
+
+            if self.stop_flag:
+                self.cancel_steps(["maa", "maafgo", "okww"])
+                self.emit("status", "已取消")
+                return
+
+            # ---- MAA：连哪台实例由 maa.instance_index 决定（设置页可改）----
+            maa = cfg.get("maa", {})
+            if want("maa"):
+                mi = int(maa.get("instance_index", 0))
+                self.step("maa", "run", "准备中")
+                maa_exe = maa.get("path", "")
+                if not os.path.isfile(maa_exe):
+                    self.step("maa", "err", "路径不对")
+                    self.log("✗ 找不到 MAA.exe：%s" % maa_exe)
+                elif proc_running(os.path.basename(maa_exe)):
+                    self.step("maa", "ok", "已在运行")
+                    self.log("MAA 已在运行，跳过")
+                elif mi in left:
+                    self.step("maa", "err", "实例%d未就绪" % mi)
+                    self.log("✗ 实例%d 没起来，跳过 MAA" % mi)
+                else:
+                    self.emit("status", "启动 MAA…")
+                    note = []
+                    port_m = ports.get(mi) or read_adb_port(mumu_root, mi)
+                    maa_apply_config(
+                        maa_exe,
+                        port_m,
+                        mi,
+                        bool(maa.get("auto_run", True)),
+                        bool(maa.get("fix_connect", True)),
+                        note,
+                    )
+                    for n in note:
+                        self.log(n)
+                    try:
+                        self.baseline["maa"] = time.time()
+                        spawn(maa_exe, os.path.dirname(maa_exe))
+                        self.step("maa", "ok", "已启动 · 自动开始任务")
+                        self.log("MAA 已启动（等待模拟器完成后自动开始任务）")
+                    except Exception as e:
+                        self.step("maa", "err", "启动失败")
+                        self.log("✗ MAA 启动失败：%s" % e)
+
+            # ---- MaaFgo（FGO）：要等实例就绪、游戏开起来才能开跑 ----
+            if not self.stop_flag and want("maafgo"):
+                self.emit("status", "MaaFgo（FGO）…")
+                self.start_maafgo(ports, left)
+
+            # ---- ok-ww（鸣潮）：PC 前台独占，排在最后 ----
+            if not self.stop_flag and want("okww"):
+                self.emit("status", "ok-ww（鸣潮每日任务）…")
+                self.start_okww()
+
+            # ---- 用户自己加的项目（未适配）：只负责把游戏和脚本打开 ----
+            self.start_custom_items(only, hidden)
+
+            # 实例就绪后按配置处理「MuMu模拟器」主窗口（隐藏 / 最小化 / 不动）
+            if insts and len(left) < len(insts) and not self.stop_flag:
+                handle_main_window_after_boot(cfg, self.log)
+
+            if self.stop_flag:
+                self.emit("status", "已取消")
+                self.log("已取消")
+            else:
+                self.log("—— 全部完成 ——")
+                if self.start_monitor():
+                    self.emit("status", "就绪 · 后台等任务完成")
+                else:
+                    self.emit("status", "就绪")
+        except Exception:
+            self.log("✗ 异常：\n" + traceback.format_exc())
+            self.emit("status", "出错了，看日志")
+        finally:
+            self.emit("busy", False)
+
+    # -- MaaFgo（FGO）-------------------------------------------------------
+    def emu_game_pid(self, idx, pkg, port=None):
+        """查模拟器里这个包在不在跑，返回 pid 字符串（空=没跑）"""
+        root = self.cfg.get("mumu_root", "")
+        adb = detect_adb(root)
+        p = port or getattr(self, "ports", {}).get(idx) or read_adb_port(root, idx)
+        if not p:
+            return ""
+        serial = "127.0.0.1:%d" % p
+        run_hidden([adb, "connect", serial], 15)
+        for cmd in ("pidof %s" % pkg, "ps -A | grep %s" % pkg):
+            rc, out = run_hidden([adb, "-s", serial, "shell", cmd], 20)
+            txt = (out or "").strip()
+            if txt and "not found" not in txt and "no such" not in txt.lower():
+                return txt.splitlines()[0][:80]
+        return ""
+
+    def start_custom_items(self, only=None, hidden=None):
+        """用户自己加的项目：启动器只负责把游戏和脚本打开
+
+        这些项目**没有适配**，所以：
+          - 不会自动点"开始任务"，任务要在脚本自己的界面里点；
+          - 不检测任务完成，行状态不会变成"完成"；
+          - 跑完也不会帮你关游戏或关脚本。
+        界面和 README 里都写明了这一点，免得以为坏了。
+        """
+        hidden = hidden or set()
+        for it in self.cfg.get("custom_items", []) or []:
+            cid = it.get("id")
+            key = "custom:%s" % cid
+            name = it.get("name") or "自定义"
+            if key in hidden:
+                self.step(key, "idle", "已从主界面删除")
+                continue
+            if only is not None and key not in only:
+                self.step(key, "idle", "本次跳过")
+                continue
+            if not it.get("enabled", True):
+                self.step(key, "idle", "本次跳过")
+                continue
+            game = (it.get("game") or "").strip()
+            script = (it.get("script") or "").strip()
+            if not game and not script:
+                self.step(key, "err", "没设路径")
+                self.log("✗ 自定义「%s」既没设脚本路径也没设游戏路径，跳过" % name)
+                continue
+            self.step(key, "run", "打开中")
+            try:
+                if game:
+                    if os.path.isfile(game):
+                        spawn(game, os.path.dirname(game))
+                        self.log("自定义「%s」：已打开游戏 %s"
+                                 % (name, os.path.basename(game)))
+                        time.sleep(6)          # 给游戏一点启动时间
+                    else:
+                        self.log("✗ 自定义「%s」的游戏文件不存在：%s" % (name, game))
+                if script:
+                    if os.path.isfile(script):
+                        spawn(script, os.path.dirname(script))
+                        self.log("自定义「%s」：已打开脚本 %s"
+                                 % (name, os.path.basename(script)))
+                    else:
+                        self.log("✗ 自定义「%s」的脚本不存在：%s" % (name, script))
+                self.step(key, "ok", "已打开")
+                self.log("自定义「%s」是未适配项：启动器只帮你打开，"
+                         "不会自动点任务、也不检测完成 —— "
+                         "任务请在脚本自己的界面里点开始。" % name)
+            except Exception as e:
+                self.step(key, "err", "打开失败")
+                self.log("✗ 自定义「%s」打开失败：%s" % (name, e))
+
+    def start_maafgo(self, ports, left=None):
+        """启动 MaaFgo（FGO 助手），并且等游戏真起来了才让它开始任务
+
+        顺序：实例就绪 -> 没开游戏就用 MuMu 自己打开 -> 轮询 pidof 等游戏进程 ->
+        把 MaaFgo 里记的 adb 地址改成实际端口（会漂移）-> 带 --autostart 启动。
+        这样 MaaFgo 一上来看到的就是已经开着游戏，不会对着黑屏瞎点。
+        """
+        m = self.cfg.get("maafgo", {})
+        if not m.get("enabled", True):
+            self.step("maafgo", "idle", "已关闭")
+            self.log("MaaFgo 已关闭（config.json 里 maafgo.enabled 打开它）")
+            return
+        if self.stop_flag:
+            self.cancel_steps(["maafgo"])
+            return
+
+        exe = m.get("path", "")
+        if not os.path.isfile(exe):
+            self.step("maafgo", "err", "路径不对")
+            self.log("✗ 找不到 MaaFgo.exe：%s" % exe)
+            return
+
+        idx = int(m.get("emulator_index", 1))
+        pkg = (m.get("game_package") or "").strip()
+        if left and idx in left:
+            self.step("maafgo", "err", "实例%d 未就绪" % idx)
+            self.log("✗ 实例%d 没起来，跳过 MaaFgo" % idx)
+            return
+
+        port = ports.get(idx) or read_adb_port(self.cfg.get("mumu_root", ""), idx)
+
+        # 1) 游戏没开就先开（MuMu 自己的 app launch，比自己拼 am start 稳）
+        if pkg and m.get("launch_game", True):
+            pid = self.emu_game_pid(idx, pkg, port)
+            if pid:
+                self.log("实例%d 里 %s 已在运行（pid %s）" % (idx, pkg, pid))
+            else:
+                self.step("maafgo", "run", "打开游戏…")
+                mgr = mumu_manager(self.cfg.get("mumu_root", ""))
+                self.log("实例%d 里没看到 %s，用 MuMu 打开游戏" % (idx, pkg))
+                rc, out = run_hidden(
+                    [mgr, "control", "-v", str(idx), "app", "launch", "-pkg", pkg], 90)
+                if rc != 0:
+                    self.log("  打开游戏返回异常：%s" % (out or "").strip()[:120])
+
+        # 2) 等游戏进程真起来
+        if pkg:
+            limit = int(m.get("game_wait", 240))
+            settle = int(m.get("settle", 10))
+            t0 = time.time()
+            ok = False
+            while time.time() - t0 < limit and not self.stop_flag:
+                pid = self.emu_game_pid(idx, pkg, port)
+                if pid:
+                    ok = True
+                    break
+                el = int(time.time() - t0)
+                self.step("maafgo", "run", "等游戏启动 %ds" % el)
+                if el and el % 20 < 4:
+                    self.log("  等待 %s 在实例%d 启动… %ds" % (pkg, idx, el))
+                time.sleep(4.0)
+            if ok:
+                self.log("游戏已启动（pid %s），再等 %d 秒过启动画面" % (pid, settle))
+                self.step("maafgo", "run", "游戏已启动，稳定中…")
+                for _ in range(max(0, settle)):
+                    if self.stop_flag:
+                        break
+                    time.sleep(1.0)
+            else:
+                self.log("⚠ 等了 %d 秒没检测到 %s，仍然启动 MaaFgo（它自己会尝试拉起）"
+                         % (limit, pkg))
+
+        if self.stop_flag:
+            self.cancel_steps(["maafgo"])
+            return
+
+        # 3) 对齐 MaaFgo 配置里记的设备地址（端口会漂移，否则连错实例）
+        if m.get("sync_device_address", True) and port:
+            maafgo_sync_device(exe, m.get("instance", ""), port, self.log)
+
+        # 4) 启动
+        if proc_running(os.path.basename(exe)):
+            self.step("maafgo", "ok", "已在运行")
+            self.log("MaaFgo 已在运行，跳过启动")
+            return
+
+        args = []
+        if m.get("autostart", True):
+            args.append("--autostart")
+        inst = (m.get("instance") or "").strip()
+        if inst:
+            args += ["--instance", inst]
+        if m.get("quit_after_run", False):
+            args.append("--quit-after-run")
+
+        self.step("maafgo", "run", "启动中")
+        try:
+            self.baseline["maafgo"] = time.time()
+            spawn(exe, os.path.dirname(exe), args)
+            self.step("maafgo", "ok", "已启动 · 自动开始任务")
+            self.log("MaaFgo 已启动：%s %s" % (os.path.basename(exe), " ".join(args)))
+        except Exception as e:
+            self.step("maafgo", "err", "启动失败")
+            self.log("✗ MaaFgo 启动失败：%s" % e)
+
+    # -- ok-ww（鸣潮）-------------------------------------------------------
+    def start_okww(self):
+        """启动 ok-ww，并让它一上来就自动开始「每日任务」
+
+        ok-ww.exe 是 pyappify 的壳（Rust），它启动的是
+        data\\apps\\ok-ww\\working\\main.py；命令行参数不一定被转发，所以这里
+        直接用 ok-ww 自带的 pythonw.exe 跑 main.py，参数确定可达：
+
+            main.py -t DailyTask      启动后立刻开始「每日任务」
+                     -h               无界面（headless）
+                     -e               跑完退出游戏和应用
+
+        每日任务本身是一条龙：启动游戏 → 登录 → 领月卡 → 刷声骸 →
+        领日常任务奖励 → 领邮件（DailyTask 内部串起了这些子任务）。
+
+        它操作的是 PC 上的鸣潮窗口（Client-Win64-Shipping.exe / UnrealWindow），
+        和 MaaEnd 一样抢前台，所以排在整条流程的最后。
+        """
+        m = self.cfg.get("okww", {})
+        if not m.get("enabled", True):
+            self.step("okww", "idle", "已关闭")
+            self.log("ok-ww 已关闭（config.json 里 okww.enabled 打开它）")
+            return
+        if self.stop_flag:
+            self.cancel_steps(["okww"])
+            return
+
+        workdir = m.get("workdir", "")
+        py = m.get("python", "")
+        if not os.path.isdir(workdir):
+            self.step("okww", "err", "目录不对")
+            self.log("✗ 找不到 ok-ww 的 working 目录：%s" % workdir)
+            return
+        if not os.path.isfile(py):
+            self.step("okww", "err", "python 路径不对")
+            self.log("✗ 找不到 ok-ww 自带的 pythonw.exe：%s" % py)
+            return
+        if not os.path.isfile(os.path.join(workdir, "main.py")):
+            self.step("okww", "err", "main.py 缺失")
+            self.log("✗ %s 下没有 main.py" % workdir)
+            return
+
+        # 已经有实例开着就别再起——ok-ww 有单实例互斥量，硬起会等 5 秒后报错退出
+        if okww_running():
+            self.step("okww", "ok", "已在运行")
+            self.log("ok-ww 已在运行，跳过启动（要自动开始请先关掉它）")
+            return
+
+        task = (m.get("task") or "DailyTask").strip()
+        entry = (m.get("entry") or "").strip()
+        if m.get("debug_log", True):
+            # 想看"任务完成"就必须有 debug 日志：ok-ww 只在
+            # logger.debug('end running onetime_task …') 里留这个痕迹，
+            # INFO 级别下任务跑完日志直接静默，没有任何标记。
+            # 用一个自己的入口写 debug=True，不去动它的 config.py。
+            entry = entry or "_launcher_auto.py"
+            try:
+                with open(os.path.join(workdir, entry), "w", encoding="utf-8") as f:
+                    f.write(
+                        "# 由「一键日常启动器」生成，每次启动重写，勿手改\n"
+                        "import logging\n"
+                        "\n"
+                        "\n"
+                        "class _KeepTaskFlow(logging.Filter):\n"
+                        "    \"\"\"只留\"任务开始/结束\"两行 debug，其余 debug 全丢\n"
+                        "\n"
+                        "    ok-ww 正常是 INFO 级别；为了拿到 end running onetime_task\n"
+                        "    必须开 DEBUG，但不加过滤的话识别日志会涨到几十万行。\n"
+                        "    \"\"\"\n"
+                        "\n"
+                        "    def filter(self, record):\n"
+                        "        if record.levelno >= logging.INFO:\n"
+                        "            return True\n"
+                        "        return 'onetime_task' in record.getMessage()\n"
+                        "\n"
+                        "\n"
+                        "if __name__ == '__main__':\n"
+                        "    from config import config\n"
+                        "    from ok import OK\n"
+                        "\n"
+                        "    # 先挂过滤器再构造，构造期间那一堆 Config:init 的 debug 也一起挡掉\n"
+                        "    logging.getLogger('ok').addFilter(_KeepTaskFlow())\n"
+                        "    config['debug'] = True\n"
+                        "    OK(config).start()\n"
+                    )
+            except Exception as e:
+                self.log("⚠ 写 %s 失败（%s），退回 main.py" % (entry, e))
+                entry = ""
+        script = entry or "main.py"
+        args = [script, "-t", task]
+        if m.get("headless", False):
+            # 必须用 --headless：ok 的 logger 里另有一个 argparse 也在读 -h，
+            # 传 -h 会先被它当成 help，直接打印用法并退出
+            args.append("--headless")
+        if m.get("exit_after", False):
+            args.append("-e")
+
+        self.step("okww", "run", "启动中")
+        try:
+            self.baseline["okww"] = time.time()
+            spawn(py, workdir, args)
+        except Exception as e:
+            self.step("okww", "err", "启动失败")
+            self.log("✗ ok-ww 启动失败：%s" % e)
+            return
+        self.log("ok-ww 已启动：%s %s（工作目录 %s）"
+                 % (os.path.basename(py), " ".join(args), workdir))
+
+        # 等界面出来再确认一次，顺便把"任务已在跑"这件事落到日志里
+        limit = int(m.get("wait_start", 60))
+        t0 = time.time()
+        seen = False
+        while time.time() - t0 < limit and not self.stop_flag:
+            if okww_windows():
+                seen = True
+                break
+            el = int(time.time() - t0)
+            if el and el % 10 < 3:
+                self.step("okww", "run", "等界面出现 %ds" % el)
+            time.sleep(1.5)
+        if seen:
+            self.step("okww", "ok", "已启动 · 自动开始每日任务")
+            self.log("ok-ww 界面已出现，「%s」应已开始（约 %ds）"
+                     % (task, int(time.time() - t0)))
+        else:
+            self.step("okww", "ok", "已拉起（界面未确认）")
+            self.log("⚠ 等了 %d 秒没看到 ok-ww 窗口，进程可能还在初始化；"
+                     "直接看它的 logs\\ok-script.log" % limit)
+
+    # -- 后台完成监视 -------------------------------------------------------
+    def start_monitor(self):
+        """启动流程结束后接着盯日志，等任务跑完再做收尾动作
+
+        要做的两件事：
+          ① MAA + MaaFgo 都完成 -> 关 MuMu 模拟器省资源（进程一律不杀）
+          ② ok-ww 完成 -> 关鸣潮游戏（ok-ww 自己留着，方便看日志）
+        """
+        if self.monitor_on:
+            return False
+        want_emu = bool(self.cfg.get("shutdown_emulator_when_done", True))
+        want_game = bool(self.cfg.get("okww", {}).get("close_game_when_done", True))
+        if not want_emu and not want_game:
+            self.log("后台监视已关闭（config.json 里 shutdown_emulator_when_done / "
+                     "okww.close_game_when_done 都是 false）")
+            return False
+        self.monitor_on = True
+        threading.Thread(target=self.monitor_loop, daemon=True).start()
+        return True
+
+    def release_instance(self, key, idx, label):
+        """某个程序跑完了，就把它用的那个实例关掉；其他实例、四个程序都不动"""
+        if idx is None:
+            return
+        started = [int(i["index"]) for i in self.cfg.get("instances", [])]
+        if idx not in started:
+            self.log("  %s 对应实例 %s 不在本次启动列表里，跳过关闭" % (label, idx))
+            return
+        self.emit("status", "%s 完成，关闭实例 %d…" % (label, idx))
+        if shutdown_instance(self.cfg, idx, self.log):
+            self.step("vm%d" % idx, "idle", "已关闭")
+            self.log("✓ 实例 %d 已关闭（%s 跑完了）· 其余程序和终端都保留"
+                     % (idx, label))
+        else:
+            self.step("vm%d" % idx, "err", "关闭失败")
+
+    def monitor_loop(self):
+        cfg = self.cfg
+        poll = max(5, int(cfg.get("monitor_poll", 20)))
+        max_hours = float(cfg.get("monitor_max_hours", 10))
+        want_emu = bool(cfg.get("shutdown_emulator_when_done", True))
+        want_game = bool(cfg.get("okww", {}).get("close_game_when_done", True))
+
+        # 只有"这次启动过"的程序才参与判定：跳过启动的（已在运行）没有基线，
+        # 硬看日志会把上一轮的完成标记当成本轮结果
+        need_maa = [k for k in ("maa", "maafgo")
+                    if k in self.baseline and cfg.get(k, {}).get("enabled", True)]
+        need_game = "okww" in self.baseline and cfg.get("okww", {}).get("enabled", True)
+
+        # 每个程序负责关掉自己用的那个实例：谁先跑完谁先释放，不用等另一个
+        inst_of = {}
+        if "maa" in need_maa:
+            inst_of["maa"] = int(cfg.get("maa", {}).get("instance_index", 0))
+        if "maafgo" in need_maa:
+            inst_of["maafgo"] = int(cfg.get("maafgo", {}).get("emulator_index", 1))
+        started_insts = [int(i["index"]) for i in cfg.get("instances", [])]
+
+        if need_maa:
+            plan = "、".join(
+                "%s→实例%d" % ("MAA" if k == "maa" else "MaaFgo", inst_of[k])
+                for k in need_maa if inst_of.get(k) in started_insts)
+            self.log("后台监视已开：%s 跑完就关各自的实例（进程全保留）" % plan)
+        if need_game:
+            self.log("后台监视已开：等 ok-ww 的每日任务完成就关鸣潮（ok-ww 保留）")
+
+        emu_closed = game_closed = False
+        if not need_maa:
+            emu_closed = True
+        if not need_game:
+            game_closed = True
+
+        t0 = time.time()
+        while time.time() - t0 < max_hours * 3600:
+            time.sleep(poll)
+
+            # ① MAA
+            if not emu_closed and not self.done.get("maa") and "maa" in need_maa:
+                ts = scan_logs(maa_log_files(cfg), MAA_DONE_MARK, self.baseline["maa"])
+                if ts is None:
+                    ts = scan_logs(maa_core_log_files(cfg), MAACORE_DONE_MARK,
+                                   self.baseline["maa"])
+                if ts:
+                    self.done["maa"] = True
+                    self.log("✓ MAA 任务已完成（%s）" % time.strftime(
+                        "%H:%M:%S", time.localtime(ts)))
+                    self.step("maa", "ok", "任务已完成")
+                    if want_emu:
+                        self.release_instance("maa", inst_of.get("maa"), "MAA")
+
+            # ② MaaFgo：MXU 的任务链会分段跑（实测 17:39:02 / 17:39:27 / 17:41:50
+            #    三段，段间只隔二十来秒），所以判据是：
+            #      最后一次 tasks-completed 之后，没有再出现「开始执行任务」，
+            #      并且已经静默 quiet 秒 —— 才算真的收工
+            if not emu_closed and not self.done.get("maafgo") and "maafgo" in need_maa:
+                quiet = float(cfg.get("maafgo", {}).get("quiet", 60))
+                hits = scan_logs_multi(maafgo_log_files(cfg),
+                                       (MXU_START_MARK, MXU_DONE_MARK),
+                                       self.baseline["maafgo"])
+                st, ts = hits.get(MXU_START_MARK), hits.get(MXU_DONE_MARK)
+                if ts and (st is None or ts >= st) and time.time() - ts >= quiet:
+                    self.done["maafgo"] = True
+                    self.log("✓ MaaFgo 任务已完成（%s，之后 %d 秒没再开新一段）"
+                             % (time.strftime("%H:%M:%S", time.localtime(ts)),
+                                int(quiet)))
+                    self.step("maafgo", "ok", "任务已完成")
+                    if want_emu:
+                        self.release_instance("maafgo", inst_of.get("maafgo"), "MaaFgo")
+
+            # 兜底：所有程序都完事了，还有实例在跑就一起关掉
+            # （比如某个程序没勾选，它那个实例就没人负责）
+            if not emu_closed and need_maa and all(self.done.get(k) for k in need_maa):
+                if any(instance_running(cfg, i) for i in started_insts):
+                    self.emit("status", "任务完成，正在关闭剩余模拟器…")
+                    self.shutdown_emulators_for_monitor()
+                for inst in cfg.get("instances", []):
+                    self.step("vm%d" % int(inst["index"]), "idle", "已关闭")
+                emu_closed = True
+                self.emit("status", "就绪（模拟器已关闭）")
+
+            # ③ ok-ww
+            if not game_closed and not self.done.get("okww") and need_game:
+                ts = scan_logs(okww_log_files(cfg), OKWW_DONE_MARK, self.baseline["okww"])
+                if ts:
+                    self.done["okww"] = True
+                    self.log("✓ ok-ww 每日任务已完成（%s）" % time.strftime(
+                        "%H:%M:%S", time.localtime(ts)))
+                    self.step("okww", "ok", "任务已完成")
+
+            if not game_closed and need_game and self.done.get("okww"):
+                self.emit("status", "ok-ww 完成，正在关闭鸣潮…")
+                close_game_window(cfg, self.log)
+                game_closed = True
+                self.step("okww", "ok", "已完成 · 游戏已关")
+                self.emit("status", "就绪")
+
+            if emu_closed and game_closed:
+                self.log("—— 后台监视结束 ——")
+                return
+
+        self.log("后台监视已超时退出（%.0f 小时），没等到全部完成标记" % max_hours)
+
+    def shutdown_emulators_for_monitor(self):
+        """关实例但保留所有程序进程——MAA / MaaFgo 留着看日志"""
+        ok = shutdown_emulators(self.cfg, self.log)
+        if ok:
+            self.log("注意：MAA / MaaFgo / MaaEnd / ok-ww 都没动，日志照旧可查")
+
+    # -- 关闭全部 -----------------------------------------------------------
+    def shutdown_all(self):
+        try:
+            self.stop_flag = False
+            self.emit("busy", True)
+            self.emit("status", "正在关闭…")
+            mgr = mumu_manager(self.cfg.get("mumu_root", ""))
+            if os.path.isfile(mgr):
+                self.log("关闭所有 MuMu 实例…")
+                rc, _ = run_hidden([mgr, "control", "-v", "all", "shutdown"], 120)
+                if rc != 0:
+                    self.log("MuMuManager 关闭失败，直接结束设备进程")
+                    run_hidden(["taskkill", "/F", "/IM", "MuMuNxDevice.exe"], 30)
+            if self.cfg.get("close_tools_with_emulator"):
+                for key in ("maa", "maafgo", "maaend"):
+                    exe = self.cfg.get(key, {}).get("path", "")
+                    if exe and proc_running(os.path.basename(exe)):
+                        run_hidden(["taskkill", "/IM", os.path.basename(exe), "/F"], 30)
+                        self.log("已结束 %s" % os.path.basename(exe))
+            for inst in self.cfg.get("instances", []):
+                self.step("vm%d" % int(inst["index"]), "idle", "未启动")
+            self.step("maa", "idle", "")
+            self.step("maafgo", "idle", "")
+            self.log("已关闭")
+            self.emit("status", "已关闭")
+        except Exception:
+            self.log("✗ 关闭异常：\n" + traceback.format_exc())
+        finally:
+            self.emit("busy", False)
+
+
+# ----------------------------------------------------------------------------
+# GDI 小工具
+# ----------------------------------------------------------------------------
+def rgb(hexcolor):
+    h = hexcolor.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b << 16) | (g << 8) | r
+
+
+class PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("hdc", wt.HDC),
+        ("fErase", wt.BOOL),
+        ("rcPaint", wt.RECT),
+        ("fRestore", wt.BOOL),
+        ("fIncUpdate", wt.BOOL),
+        ("rgbReserved", ctypes.c_byte * 32),
+    ]
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wt.DWORD),
+        ("biWidth", ctypes.c_long),
+        ("biHeight", ctypes.c_long),
+        ("biPlanes", wt.WORD),
+        ("biBitCount", wt.WORD),
+        ("biCompression", wt.DWORD),
+        ("biSizeImage", wt.DWORD),
+        ("biXPelsPerMeter", ctypes.c_long),
+        ("biYPelsPerMeter", ctypes.c_long),
+        ("biClrUsed", wt.DWORD),
+        ("biClrImportant", wt.DWORD),
+    ]
+
+
+RAINBOW = {
+    "bg": "#F4F6F9",
+    "card": "#FFFFFF",
+    "border": "#E4E8EE",
+    "line": "#F0F2F6",
+    "text": "#1B1F26",
+    "text2": "#5A6373",
+    "muted": "#98A1B0",
+    "accent": "#2F6BFF",
+    "accent_d": "#245BE0",
+    "accent_l": "#EAF0FF",
+    "ok": "#17B26A",
+    "err": "#F04438",
+    "run": "#F79009",
+    "idle": "#C6CCD6",
+    "ghost_bg": "#FFFFFF",
+    "ghost_bg_h": "#F2F4F8",
+    "err_bg": "#FFF4F3",
+    "err_bg_h": "#FFE6E4",
+    "err_border": "#F6C9C4",
+    "disabled": "#B7BEC9",
+    "logbg": "#FBFCFD",
+    "iconbg": "#EEF2F8",     # 行图标背后的圆角底板
+}
+C = {k: rgb(v) for k, v in RAINBOW.items()}
+
+# ----------------------------------------------------------------------------
+# Win32 声明
+# ----------------------------------------------------------------------------
+WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM
+)
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", ctypes.c_uint),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wt.HINSTANCE),
+        ("hIcon", wt.HICON),
+        ("hCursor", wt.HANDLE),
+        ("hbrBackground", wt.HBRUSH),
+        ("lpszMenuName", wt.LPCWSTR),
+        ("lpszClassName", wt.LPCWSTR),
+    ]
+
+
+user32.DefWindowProcW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+user32.DefWindowProcW.restype = ctypes.c_ssize_t
+user32.CreateWindowExW.argtypes = [
+    wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID,
+]
+user32.CreateWindowExW.restype = wt.HWND
+user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+user32.RegisterClassW.restype = wt.WORD
+user32.GetDC.argtypes = [wt.HWND]
+user32.GetDC.restype = wt.HDC
+user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
+user32.LoadCursorW.argtypes = [wt.HINSTANCE, wt.LPCWSTR]
+user32.LoadCursorW.restype = wt.HANDLE
+user32.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int,
+                              ctypes.c_int, wt.UINT]
+user32.LoadImageW.restype = wt.HANDLE
+user32.DrawIconEx.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, wt.HANDLE,
+                              ctypes.c_int, ctypes.c_int, wt.UINT, wt.HBRUSH, wt.UINT]
+user32.DrawIconEx.restype = wt.BOOL
+user32.DestroyIcon.argtypes = [wt.HANDLE]
+user32.DestroyIcon.restype = wt.BOOL
+user32.SetCursor.argtypes = [wt.HANDLE]
+user32.SetCursor.restype = wt.HANDLE
+user32.AdjustWindowRectEx.argtypes = [ctypes.POINTER(wt.RECT), wt.DWORD, wt.BOOL, wt.DWORD]
+user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wt.BOOL
+user32.UpdateWindow.argtypes = [wt.HWND]
+user32.UpdateWindow.restype = wt.BOOL
+user32.DestroyWindow.argtypes = [wt.HWND]
+user32.DestroyWindow.restype = wt.BOOL
+user32.PostQuitMessage.argtypes = [ctypes.c_int]
+user32.PostMessageW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+user32.PostMessageW.restype = wt.BOOL
+user32.SendMessageW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+user32.SendMessageW.restype = ctypes.c_ssize_t
+user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+user32.GetMessageW.restype = ctypes.c_int
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+user32.DispatchMessageW.restype = ctypes.c_ssize_t
+user32.FindWindowW.argtypes = [wt.LPCWSTR, wt.LPCWSTR]
+user32.FindWindowW.restype = wt.HWND
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.SetForegroundWindow.restype = wt.BOOL
+user32.IsWindowVisible.argtypes = [wt.HWND]
+user32.IsWindowVisible.restype = wt.BOOL
+user32.IsWindow.argtypes = [wt.HWND]
+user32.IsWindow.restype = wt.BOOL
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+user32.GetWindow.restype = wt.HWND
+try:
+    user32.EnumWindows.argtypes = [
+        ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM), wt.LPARAM]
+    user32.EnumWindows.restype = wt.BOOL
+except Exception:
+    pass
+user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wt.UINT]
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+user32.InvalidateRect.argtypes = [wt.HWND, wt.LPVOID, wt.BOOL]
+user32.InvalidateRect.restype = wt.BOOL
+user32.SetTimer.argtypes = [wt.HWND, wt.UINT_PTR, wt.UINT, wt.LPVOID]
+user32.SetTimer.restype = wt.UINT_PTR
+try:                                    # Win10+ 才有 GetDpiForSystem
+    user32.GetDpiForSystem.argtypes = []
+    user32.GetDpiForSystem.restype = wt.UINT
+except AttributeError:
+    pass
+gdi32.GetDeviceCaps.argtypes = [wt.HDC, ctypes.c_int]
+gdi32.GetDeviceCaps.restype = ctypes.c_int
+user32.BeginPaint.argtypes = [wt.HWND, ctypes.POINTER(PAINTSTRUCT)]
+user32.BeginPaint.restype = wt.HDC
+user32.EndPaint.argtypes = [wt.HWND, ctypes.POINTER(PAINTSTRUCT)]
+user32.EndPaint.restype = wt.BOOL
+user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+user32.GetClientRect.restype = wt.BOOL
+user32.FillRect.argtypes = [wt.HDC, ctypes.POINTER(wt.RECT), wt.HBRUSH]
+user32.FillRect.restype = ctypes.c_int
+user32.DrawTextW.argtypes = [wt.HDC, wt.LPCWSTR, ctypes.c_int,
+                             ctypes.POINTER(wt.RECT), ctypes.c_uint]
+user32.DrawTextW.restype = ctypes.c_int
+
+gdi32.CreateSolidBrush.argtypes = [wt.DWORD]
+gdi32.CreateSolidBrush.restype = wt.HBRUSH
+gdi32.CreatePen.argtypes = [ctypes.c_int, ctypes.c_int, wt.DWORD]
+gdi32.CreatePen.restype = wt.HPEN
+gdi32.GetStockObject.argtypes = [ctypes.c_int]
+gdi32.GetStockObject.restype = wt.HGDIOBJ
+gdi32.CreateFontW.argtypes = [ctypes.c_int] * 5 + [wt.DWORD] * 8 + [wt.LPCWSTR]
+gdi32.CreateFontW.restype = wt.HFONT
+gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
+gdi32.DeleteObject.restype = wt.BOOL
+gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+gdi32.SelectObject.restype = wt.HGDIOBJ
+gdi32.SetTextColor.argtypes = [wt.HDC, wt.DWORD]
+gdi32.SetTextColor.restype = wt.DWORD
+gdi32.SetBkMode.argtypes = [wt.HDC, ctypes.c_int]
+gdi32.SetBkMode.restype = ctypes.c_int
+gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
+gdi32.CreateCompatibleDC.restype = wt.HDC
+gdi32.DeleteDC.argtypes = [wt.HDC]
+gdi32.DeleteDC.restype = wt.BOOL
+gdi32.CreateCompatibleBitmap.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int]
+gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
+gdi32.BitBlt.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                         wt.HDC, ctypes.c_int, ctypes.c_int, wt.DWORD]
+gdi32.BitBlt.restype = wt.BOOL
+gdi32.SetStretchBltMode.argtypes = [wt.HDC, ctypes.c_int]
+gdi32.SetStretchBltMode.restype = ctypes.c_int
+gdi32.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT, wt.LPVOID,
+                            ctypes.POINTER(BITMAPINFOHEADER), wt.UINT]
+gdi32.GetDIBits.restype = ctypes.c_int
+gdi32.RoundRect.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                            ctypes.c_int, ctypes.c_int, ctypes.c_int]
+gdi32.RoundRect.restype = wt.BOOL
+gdi32.Ellipse.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+gdi32.Ellipse.restype = wt.BOOL
+gdi32.MoveToEx.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, wt.LPVOID]
+gdi32.MoveToEx.restype = wt.BOOL
+gdi32.LineTo.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int]
+gdi32.LineTo.restype = wt.BOOL
+gdi32.SaveDC.argtypes = [wt.HDC]
+gdi32.SaveDC.restype = ctypes.c_int
+gdi32.RestoreDC.argtypes = [wt.HDC, ctypes.c_int]
+gdi32.RestoreDC.restype = wt.BOOL
+gdi32.IntersectClipRect.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int]
+gdi32.IntersectClipRect.restype = ctypes.c_int
+
+kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wt.HINSTANCE
+user32.MessageBoxW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.UINT]
+user32.MessageBoxW.restype = ctypes.c_int
+kernel32.CreateMutexW.argtypes = [wt.LPVOID, wt.BOOL, wt.LPCWSTR]
+kernel32.CreateMutexW.restype = wt.HANDLE
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+kernel32.CloseHandle.restype = wt.BOOL
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE          # 必须声明，否则句柄被截断
+kernel32.GetProcessTimes.argtypes = [wt.HANDLE, ctypes.POINTER(wt.FILETIME),
+                                     ctypes.POINTER(wt.FILETIME),
+                                     ctypes.POINTER(wt.FILETIME),
+                                     ctypes.POINTER(wt.FILETIME)]
+kernel32.GetProcessTimes.restype = wt.BOOL
+
+shell32.ShellExecuteW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR,
+                                  wt.LPCWSTR, ctypes.c_int]
+shell32.ShellExecuteW.restype = wt.HINSTANCE
+shell32.ExtractIconExW.argtypes = [wt.LPCWSTR, ctypes.c_int, ctypes.POINTER(wt.HICON),
+                                   ctypes.POINTER(wt.HICON), wt.UINT]
+shell32.ExtractIconExW.restype = wt.UINT
+
+
+def load_cursor(cid):
+    """MAKEINTRESOURCE"""
+    return user32.LoadCursorW(None, ctypes.cast(cid, wt.LPCWSTR))
+
+
+WM_DESTROY = 0x0002
+WM_CLOSE = 0x0010
+WM_PAINT = 0x000F
+WM_ERASEBKGND = 0x0014
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+WM_LBUTTONDBLCLK = 0x0203
+WM_MOUSEWHEEL = 0x020A
+WM_SETCURSOR = 0x0020
+WM_TIMER = 0x0113
+WM_KEYDOWN = 0x0100
+WM_SETICON = 0x0080
+ICON_SMALL = 0
+ICON_BIG = 1
+
+DT_LEFT, DT_CENTER, DT_RIGHT = 0x0000, 0x0001, 0x0002
+DT_VCENTER, DT_SINGLELINE = 0x0004, 0x0020
+DT_WORDBREAK, DT_END_ELLIPSIS, DT_NOPREFIX = 0x0010, 0x00008000, 0x00000800
+
+STEP_KEYS = ["maaend", "vm0", "vm1", "maa", "maafgo", "okww"]
+
+
+class App:
+    def __init__(self):
+        self.cfg = load_config()
+        self.hwnd = None
+        self.dpi = 96.0
+        self.hover = None
+        self.pressed = None
+        self.busy = False
+        self.steps = {k: ("idle", "") for k in STEP_KEYS}
+        for _i in _cfg_indexes(self.cfg):        # 实例数量是动态的，补齐状态槽
+            self.steps.setdefault("vm%d" % _i, ("idle", ""))
+        self.ports = {}
+        self.logs = []          # list of (text, color_key)
+        self.status = "就绪"
+        self.q = []             # worker -> ui 消息队列
+        self.qlock = threading.Lock()
+        self.runner = Runner(self.cfg, self.emit)
+        self._fonts = {}
+        self.rects = {}
+        self.no_auto = False        # 调试/截图时关掉自动启动
+        self._auto_pending = False
+        self._auto_at = 0.0
+        self.chk = {}
+        for inst in self.cfg.get("instances", []):
+            self.chk[int(inst["index"])] = bool(inst.get("enabled", True))
+        # 自定义项的勾选（键是 custom_items[].id）
+        self.chk_custom = {}
+        for it in self.cfg.get("custom_items", []) or []:
+            self.chk_custom[it.get("id")] = bool(it.get("enabled", True))
+        self.maa_on = bool(self.cfg.get("maa", {}).get("enabled", True))
+        self.maafgo_on = bool(self.cfg.get("maafgo", {}).get("enabled", True))
+        self.okww_on = bool(self.cfg.get("okww", {}).get("enabled", True))
+        self.maaend_on = bool(self.cfg.get("maaend", {}).get("enabled", False))
+        self.page = "main"          # main | settings | custom | night
+        self.sub_page = False       # 是否处于子页面（子页面只有「返回」可点）
+        # 页面栈：记录从哪儿来，返回时按栈回退
+        #   main → settings → custom/night
+        self.page_stack = []
+        # 「选 exe」卡片：{"items": [...], "sel": 选中下标, "title": 标题, "on_ok": 回调}
+        self.exepick = None
+        # 开机的「只跑手游日常吗」询问：{"until": 到点时间戳, "left": 剩余秒}
+        self.prompt = None
+        # 本次只跑这些 key（点「是」时设；只影响这一轮，不改勾选、不写 config.json）
+        self.run_only = None
+        # 路径还没指过（或中途被清空）：直接进设置页，绝不自动开跑。
+        # 默认配置里没有任何真实路径，自动跑只会满屏「找不到 xxx.exe」。
+        self.first_run = not config_ready(self.cfg)
+        if self.first_run:
+            self.page_stack.append("main")
+            self.page = "settings"
+            self.no_auto = True
+            self.status = "还没配置：请在「① 选择各实例的路径」里逐行点「选择」"
+
+    # ---------- 消息 ----------
+    def ui_log(self, msg):
+        """界面日志 + 文件日志（按钮直接触发的动作用这个）"""
+        log_line(msg)
+        self.emit("log", msg)
+
+    def emit(self, kind, *args):
+        with self.qlock:
+            self.q.append((kind, args))
+
+    def drain(self):
+        with self.qlock:
+            items = self.q[:]
+            del self.q[:]
+        if not items:
+            return
+        for kind, args in items:
+            if kind == "log":
+                text = args[0]
+                color = "text2"
+                if text.startswith("✗"):
+                    color = "err"
+                elif ("已就绪" in text) or ("已启动" in text) or ("完成" in text):
+                    color = "ok"
+                self.logs.append((text, color))
+                if len(self.logs) > 400:
+                    del self.logs[:100]
+            elif kind == "step":
+                key, state, detail = args
+                self.steps[key] = (state, detail)
+            elif kind == "busy":
+                self.busy = bool(args[0])
+            elif kind == "status":
+                self.status = args[0]
+            elif kind == "port":
+                self.ports[int(args[0])] = int(args[1])
+            elif kind == "sync":
+                # 后台按 MuMu 实际情况重排过实例列表，重建一下勾选缓存
+                self.reload_instances()
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def reload_instances(self):
+        """实例列表被增删后，按 cfg 里最新的 enabled 重建勾选缓存"""
+        self.chk = {int(inst["index"]): bool(inst.get("enabled", True))
+                    for inst in self.cfg.get("instances", [])}
+        for i in self.chk:
+            self.steps.setdefault("vm%d" % i, ("idle", ""))
+
+    # ---------- GDI 封装 ----------
+    def S(self, v):
+        return int(round(v * self.dpi / 96.0))
+
+    def font(self, px, bold=False, face="Microsoft YaHei UI"):
+        key = (px, bold, face)
+        f = self._fonts.get(key)
+        if f:
+            return f
+        h = -max(8, self.S(px))
+        weight = 700 if bold else 400
+        f = gdi32.CreateFontW(h, 0, 0, 0, weight, False, False, False,
+                              134, 0, 0, 5, 0, face)
+        if not f:
+            f = gdi32.CreateFontW(h, 0, 0, 0, weight, False, False, False,
+                                  134, 0, 0, 5, 0, "Microsoft YaHei")
+        self._fonts[key] = f
+        return f
+
+    def text(self, hdc, s, rect, color, fnt,
+             flags=DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX):
+        gdi32.SelectObject(hdc, fnt)
+        gdi32.SetTextColor(hdc, color)
+        gdi32.SetBkMode(hdc, 1)
+        r = wt.RECT(*rect)
+        user32.DrawTextW(hdc, s, -1, ctypes.byref(r), flags)
+
+    def fill_round(self, hdc, rect, radius, fill, border=None, bwidth=1):
+        """rect 已是物理像素；radius 是逻辑值"""
+        br = gdi32.CreateSolidBrush(fill)
+        pen = gdi32.CreatePen(0, max(1, self.S(bwidth)), border) if border else gdi32.GetStockObject(8)
+        ob = gdi32.SelectObject(hdc, br)
+        op = gdi32.SelectObject(hdc, pen)
+        gdi32.RoundRect(hdc, int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]),
+                        self.S(radius * 2), self.S(radius * 2))
+        gdi32.SelectObject(hdc, ob)
+        gdi32.SelectObject(hdc, op)
+        if br:
+            gdi32.DeleteObject(br)
+        if border and pen:
+            gdi32.DeleteObject(pen)
+
+    def dot(self, hdc, cx, cy, r, color):
+        rr = self.S(r)
+        br = gdi32.CreateSolidBrush(color)
+        ob = gdi32.SelectObject(hdc, br)
+        op = gdi32.SelectObject(hdc, gdi32.GetStockObject(8))
+        gdi32.Ellipse(hdc, int(cx - rr), int(cy - rr), int(cx + rr), int(cy + rr))
+        gdi32.SelectObject(hdc, ob)
+        gdi32.SelectObject(hdc, op)
+        gdi32.DeleteObject(br)
+
+    def hline(self, hdc, x1, x2, y, color):
+        pen = gdi32.CreatePen(0, 1, color)
+        op = gdi32.SelectObject(hdc, pen)
+        gdi32.MoveToEx(hdc, int(x1), int(y), None)
+        gdi32.LineTo(hdc, int(x2), int(y))
+        gdi32.SelectObject(hdc, op)
+        gdi32.DeleteObject(pen)
+
+    def check_mark(self, hdc, x, y, color):
+        pen = gdi32.CreatePen(0, max(1, self.S(1.6)), color)
+        op = gdi32.SelectObject(hdc, pen)
+        gdi32.MoveToEx(hdc, int(x), int(y), None)
+        gdi32.LineTo(hdc, int(x + self.S(3)), int(y + self.S(3)))
+        gdi32.LineTo(hdc, int(x + self.S(8)), int(y - self.S(3)))
+        gdi32.SelectObject(hdc, op)
+        gdi32.DeleteObject(pen)
+
+    # ---------- 布局 ----------
+    def layout(self, w, h):
+        """w,h 是客户区物理像素；内部先排逻辑坐标，最后统一乘 DPI 系数"""
+        kk = self.dpi / 96.0
+        pad = 26
+        W = int(round(w / kk))
+        H = int(round(h / kk))
+        card_t = 82
+        # 子页面（设置 / 自定义 / 夜间）行数多，用矮一点的行高，日志区才不会被挤没。
+        # 三个子页面统一行高，各分组内部密度才一致（之前 ①组 38、②③组 32，看着参差）。
+        row_h = {"settings": 34, "custom": 34, "night": 34}.get(self.page, 58)
+        self.row_h_logical = row_h
+        self.sub_page = self.page in ("settings", "custom", "night")
+        items = self.current_rows()
+
+        # 行高可变：分组标题行矮一点，且和上一组拉开距离
+        rows = []
+        y = card_t + 6
+        for it in items:
+            if it.get("key", "").startswith("sec:"):
+                y += 7              # 分组标题前面留一点空隙，视觉上分组清楚
+                rh = int(it.get("h") or 26)
+            else:
+                rh = int(it.get("h") or row_h)
+            rows.append((it, y, rh))
+            y += rh
+        card_b = y + 6
+
+        by = card_b + 14
+        b_h = 46
+        # 按钮从左到右排：宽 200 / 118 / 118 / 104 / 110，间距 12 或 10
+        x = pad
+        log_top = by + b_h + 14
+        log_bot = max(log_top, H - 40)      # 子页面行多，日志区可能被压成 0 高
+        rects = {
+            "title": (pad, 16, W - pad, 46),
+            "sub": (pad, 46, W - pad, 68),
+            "card": (pad, card_t, W - pad, card_b),
+            "logcard": (pad, log_top, W - pad, log_bot),
+            "statusbar": (pad, H - 34, W - pad, H - 12),
+        }
+        for i, (key, bw) in enumerate(
+                (("start", 200), ("cancel", 118), ("shutdown", 118),
+                 ("edit", 104), ("mainwin", 110))):
+            rects[key] = (x, by, x + bw, by + b_h)
+            x += bw + (12 if i == 0 else 10)
+
+        # 标题右侧的「全选」（只占标题行右边，不加高窗口）
+        chip_t, chip_b = 18, 44
+        all_w = 96
+        xr = W - pad
+        rects["all"] = (xr - all_w, chip_t, xr, chip_b)
+
+        # 「夜间启动」询问卡片：模态盖住整个客户区，居中一块卡片 + 两个按钮
+        if self.prompt:
+            cw, chh = 480, 216
+            cx = (W - cw) // 2
+            cy = max(card_t + 10, (H - chh) // 2)
+            rects["prompt"] = (cx, cy, cx + cw, cy + chh)
+            bw, bh, gap = 132, 42, 26
+            bx = cx + (cw - (bw * 2 + gap)) // 2
+            by = cy + chh - 76
+            rects["prompt_night"] = (bx, by, bx + bw, by + bh)
+            rects["prompt_cancel"] = (bx + bw + gap, by, bx + bw + gap + bw, by + bh)
+
+        # 「选 exe」卡片：同样盖在主界面之上
+        if self.exepick:
+            cw, chh = 460, 400
+            cx = (W - cw) // 2
+            cy = max(card_t + 6, (H - chh) // 2)
+            rects["expick"] = (cx, cy, cx + cw, cy + chh)
+            bw, bh, gap = 96, 34, 12
+            bx = cx + cw - 26 - bw * 2 - gap
+            by = cy + chh - 50
+            rects["expick_ok"] = (bx, by, bx + bw, by + bh)
+            rects["expick_cancel"] = (bx + bw + gap, by, bx + bw + gap + bw, by + bh)
+            # 候选列表每一行的矩形（点击/双击用）
+            top = cy + 72
+            bot = cy + chh - 66
+            lh = 26
+            n = len(self.exepick.get("items", []))
+            maxn = max(1, int((bot - top - 8) // lh))
+            first = max(0, min(self.exepick.get("sel", 0) - maxn // 2, n - maxn))
+            if n <= maxn:
+                first = 0
+            erows = []
+            for k in range(min(maxn, n)):
+                iy = top + 4 + k * lh
+                erows.append((first + k, iy, iy + lh - 2))
+            rects["expick_rows"] = erows
+        R = self.rects
+        for key, r in rects.items():
+            if key == "expick_rows":
+                continue                       # 列表，单独处理
+            R[key] = tuple(int(round(v * kk)) for v in r)
+        if "expick_rows" in rects:
+            R["expick_rows"] = [(idx, int(round(a * kk)), int(round(b * kk)))
+                                for idx, a, b in rects["expick_rows"]]
+        R["rows"] = [(item, int(round(y * kk)), int(round(h * kk)))
+                     for item, y, h in rows]
+        R["row_h"] = int(round(row_h * kk))
+
+    def current_rows(self):
+        if self.page == "custom":
+            return self.custom_rows()
+        if self.page == "night":
+            return self.night_rows()
+        if self.page == "settings":
+            return self.settings_rows()
+        return self.instance_rows()
+
+    def settings_rows(self):
+        """设置页：三大块 —— ① 各脚本/模拟器路径 ② 模拟器实例与版本 ③ 其它
+
+        每块前面插一行分组标题（key 以 "sec:" 开头，绘制时特殊处理），
+        这样用户一眼能看出"这块是干什么的"，不用对着 11 行平铺猜。
+        """
+        cfg = self.cfg
+        out = [{
+            "key": "sec:path",
+            "h": 26,
+            "title": "① 选择各实例的路径",
+            "sub": "选各个模拟器 / 脚本所在的文件夹（点右侧「选择」）",
+        }]
+        out.append({
+            "key": "mumu",
+            "icon": "mumu",
+            "h": 34,
+            "title": "MuMu 模拟器目录",
+            "sub": cfg.get("mumu_root") or "未设置（点右侧「选择」）",
+        })
+        for key, name, game in (("maaend", "MaaEnd", "终末地"),
+                                ("maa", "MAA", "明日方舟"),
+                                ("maafgo", "MaaFgo", "FGO"),
+                                ("okww", "ok-ww", "鸣潮")):
+            p = (cfg.get(key, {}) or {}).get("path") or ""
+            out.append({
+                "key": key,
+                "icon": key,
+                "h": 34,
+                "title": "%s · %s" % (name, game),
+                "sub": p or "未设置（点右侧「选择」）",
+            })
+
+        out.append({
+            "key": "sec:inst",
+            "h": 26,
+            "title": "② 模拟器实例与游戏版本",
+            "sub": "决定脚本连哪台模拟器、用哪个服（点右侧按钮切换）",
+        })
+        names = {int(i["index"]): (i.get("name") or "模拟器")
+                 for i in cfg.get("instances", []) or []}
+        mi = int(cfg.get("maa", {}).get("instance_index", 0))
+        fi = int(cfg.get("maafgo", {}).get("emulator_index", 1))
+        out.append({
+            "key": "maa_instance",
+            "icon": "maa",
+            "title": "MAA 连哪台实例",
+            "sub": ("实例%d · %s" % (mi, names.get(mi, "不存在"))) if names
+                   else "还没有实例（先选 MuMu 目录）",
+            "chip": "实例%d" % mi,
+        })
+        out.append({
+            "key": "fgo_instance",
+            "icon": "fgo",
+            "title": "MaaFgo 连哪台实例",
+            "sub": ("实例%d · %s" % (fi, names.get(fi, "不存在"))) if names
+                   else "还没有实例（先选 MuMu 目录）",
+            "chip": "实例%d" % fi,
+        })
+        pkg = (cfg.get("maafgo", {}) or {}).get("game_package") or ""
+        label = next((n for n, p in FGO_PACKAGES if p == pkg), "自定义")
+        out.append({
+            "key": "fgo_ver",
+            "icon": "fgo",
+            "title": "FGO 版本（包名）",
+            "sub": "%s · %s" % (label, pkg or "未设置"),
+            "chip": label,
+        })
+
+        out.append({
+            "key": "sec:more",
+            "h": 26,
+            "title": "③ 其它",
+            "sub": "主界面项目、每日手游清单、原始配置文件",
+        })
+        n_cus = len(cfg.get("custom_items", []) or [])
+        n_hid = len(cfg.get("hidden_items", []) or [])
+        out.append({
+            "key": "custom_page",
+            "icon": "cfg",
+            "title": "主界面项目（自定义 / 删除）",
+            "sub": "加自己想跑的游戏 · 删掉不用的行 · 恢复默认%s"
+                   % (("（已加 %d 个、隐藏 %d 行）" % (n_cus, n_hid))
+                      if (n_cus or n_hid) else ""),
+            "chip": "管理",
+        })
+        out.append({
+            "key": "night_page",
+            "icon": "cfg",
+            "title": "《今晚的手游日常》包含哪些",
+            "sub": "一天要清两次日常的手游 · 现在是 %s" % self.night_desc(),
+            "chip": "设置",
+        })
+        out.append({
+            "key": "config",
+            "icon": "cfg",
+            "h": 34,
+            "title": "config.json",
+            "sub": "点这一行用记事本打开（超时、实例名、开关都在这）",
+        })
+        return out
+
+    def instance_rows(self):
+        out = []
+        hid = self.hidden()
+        # MaaEnd 排第一：它就是最优先跑的那个
+        m = self.cfg.get("maaend", {})
+        inst_name = (m.get("instance") or "").strip()
+        if "maaend" not in hid:
+            out.append({
+                "key": "maaend",
+                "icon": "maaend",
+                "title": "MaaEnd · 终末地",
+                "sub": ("%s · 自动开始任务，跑完关游戏" % inst_name) if inst_name
+                       else "自动开始任务，跑完关游戏",
+            })
+        for inst in self.cfg.get("instances", []):
+            idx = int(inst["index"])
+            if ("vm%d" % idx) in hid:
+                continue
+            port = self.ports.get(idx) or read_adb_port(self.cfg.get("mumu_root", ""), idx)
+            out.append({
+                "key": "vm%d" % idx,
+                "index": idx,
+                "icon": self._vm_icon(idx, inst.get("name")),
+                "title": "MuMu 实例 %d · %s" % (idx, inst.get("name") or "模拟器"),
+                "sub": "ADB 127.0.0.1:%d" % port,
+            })
+        if "maa" not in hid:
+            out.append({
+                "key": "maa",
+                "icon": "maa",
+                "title": "MAA",
+                "sub": "明日方舟 · 启动后自动开始任务"
+                       if self.cfg.get("maa", {}).get("auto_run", True)
+                       else "明日方舟 · 只启动界面",
+            })
+        if "maafgo" not in hid:
+            out.append({
+                "key": "maafgo",
+                "icon": "maafgo",
+                "title": "MaaFgo · FGO",
+                "sub": self._maafgo_sub(),
+            })
+        if "okww" not in hid:
+            out.append({
+                "key": "okww",
+                "icon": "okww",
+                "title": "ok-ww · 鸣潮",
+                "sub": self._okww_sub(),
+            })
+        # 用户自己加的（没适配：只打开，不自动跑）
+        for it in self.cfg.get("custom_items", []) or []:
+            cid = it.get("id")
+            if ("custom:%s" % cid) in hid:
+                continue
+            out.append({
+                "key": "custom:%s" % cid,
+                "icon": None,
+                "title": it.get("name") or "自定义",
+                "sub": self._custom_sub(it),
+                "custom": True,
+            })
+        return out
+
+    @staticmethod
+    def _custom_sub(it):
+        """自定义行的一句话说明：强调"只打开，不自动跑" """
+        sc = os.path.basename(it.get("script") or "") or "未设脚本"
+        gm = os.path.basename(it.get("game") or "")
+        tail = gm if gm else "只开脚本"
+        return "未适配 · 只打开不自动跑 · %s + %s" % (sc, tail)
+
+    def hidden(self):
+        return set(self.cfg.get("hidden_items", []) or [])
+
+    def custom_rows(self):
+        """自定义页：加新实例 / 逐个删除·恢复 / 恢复默认"""
+        out = [{
+            "key": "c_add",
+            "icon": None,
+            "title": "+ 增加自定义实例",
+            "sub": "选一个脚本 exe，再选一个游戏启动 exe（最多 %d 个）" % MAX_CUSTOM,
+            "chip": "添加",
+        }]
+        hid = self.hidden()
+        for label, key, ico in (("MaaEnd · 终末地", "maaend", "maaend"),
+                                ("MAA · 明日方舟", "maa", "maa"),
+                                ("MaaFgo · FGO", "maafgo", "maafgo"),
+                                ("ok-ww · 鸣潮", "okww", "okww")):
+            out.append(self._manage_row(label, key, key in hid, icon=ico))
+        for inst in self.cfg.get("instances", []):
+            idx = int(inst["index"])
+            key = "vm%d" % idx
+            out.append(self._manage_row(
+                "MuMu 实例 %d · %s" % (idx, inst.get("name") or "模拟器"),
+                key, key in hid, icon="mumu"))
+        for it in self.cfg.get("custom_items", []) or []:
+            cid = it.get("id")
+            key = "custom:%s" % cid
+            out.append(self._manage_row(it.get("name") or "自定义", key,
+                                        key in hid, custom=it))
+        out.append({
+            "key": "c_restore",
+            "icon": "cfg",
+            "title": "恢复默认主界面",
+            "sub": "清掉自定义项、把删掉的行都放回来（4 个脚本 + 所有实例）",
+            "chip": "恢复",
+        })
+        return out
+
+    @staticmethod
+    def _manage_row(label, key, hidden, custom=None, icon=None):
+        if hidden:
+            sub = "已经在主界面隐藏 —— 点「恢复」放回来"
+            chip = "恢复"
+        elif custom:
+            sc = os.path.basename(custom.get("script") or "") or "未设脚本"
+            gm = os.path.basename(custom.get("game") or "") or "只开脚本"
+            sub = "%s + %s" % (sc, gm)
+            chip = "删除"
+        else:
+            sub = "主界面上正显示这一项 —— 点「删除」隐藏它"
+            chip = "删除"
+        return {"key": "c_del:" + key, "icon": icon, "title": label,
+                "sub": sub, "chip": chip}
+
+    # ---------- 《今晚的手游日常》 ----------
+    NIGHT_SCRIPTS = (("maa", "MAA · 明日方舟"), ("maafgo", "MaaFgo · FGO"),
+                     ("maaend", "MaaEnd · 终末地"), ("okww", "ok-ww · 鸣潮"))
+
+    def night_items(self):
+        """用户勾定的《今晚的手游日常》项目键（不含自动带上的实例）"""
+        items = self.cfg.get("night_items")
+        if items is None:
+            items = ["maa", "maafgo"]
+        return list(items)
+
+    def night_keep(self):
+        """《今晚的手游日常》实际会启动哪些键
+
+        勾了脚本就自动带上它用的模拟器实例 —— 不带的话脚本起来也连不上，
+        等于白开。实例号跟着设置页里 MAA / MaaFgo 配的那台走。
+        """
+        items = set(self.night_items())
+        keys = set(k for k in items if not k.startswith("custom:"))
+        if "maa" in keys:
+            keys.add("vm%d" % int(self.cfg.get("maa", {}).get("instance_index", 0)))
+        if "maafgo" in keys:
+            keys.add("vm%d" % int(self.cfg.get("maafgo", {}).get("emulator_index", 1)))
+        for k in list(keys):
+            if k.startswith("vm") and int(k[2:]) not in self._inst_indexes():
+                keys.discard(k)
+        return sorted(keys)
+
+    def night_desc(self):
+        """《今晚的手游日常》包含哪些 —— 弹窗里那一行短描述"""
+        names = []
+        for k in self.night_items():
+            if k.startswith("vm"):
+                continue
+            if k.startswith("custom:"):
+                names.append(self._night_label(k))
+            else:
+                names.append(self._night_short(k))
+        return "、".join(names) or "（还没设置，去设置里选）"
+
+    @staticmethod
+    def _night_short(key):
+        return {"maa": "明日方舟（MAA）", "maafgo": "FGO（MaaFgo）",
+                "maaend": "终末地（MaaEnd）", "okww": "鸣潮（ok-ww）"}.get(key, key)
+
+    def _night_label(self, key):
+        for k, label in self.NIGHT_SCRIPTS:
+            if k == key:
+                return label
+        if key.startswith("vm"):
+            return "MuMu 实例 %s" % key[2:]
+        if key.startswith("custom:"):
+            for it in self.cfg.get("custom_items", []) or []:
+                if it.get("id") == key[7:]:
+                    return it.get("name") or "自定义"
+        return key
+
+    def night_rows(self):
+        """《今晚的手游日常》设置页：勾哪些项目算"""
+        items = set(self.night_items())
+        out = [{
+            "key": "n_hint",
+            "icon": "cfg",
+            "title": "一天要清两次日常的手游",
+            "sub": "勾上的算《今晚的手游日常》—— 开机弹窗里点「否」就只启动它们",
+            "chip": "说明",
+        }]
+        for k, label in self.NIGHT_SCRIPTS:
+            on = k in items
+            out.append({
+                "key": "n_toggle:" + k,
+                "icon": k,
+                "title": label,
+                "sub": ("属于《今晚的手游日常》" if on else "不属于"),
+                "chip": "算" if on else "不算",
+            })
+        for it in self.cfg.get("custom_items", []) or []:
+            cid = it.get("id")
+            k = "custom:%s" % cid
+            on = k in items
+            out.append({
+                "key": "n_toggle:" + k,
+                "icon": None,
+                "title": it.get("name") or "自定义",
+                "sub": "自定义项目（未适配，只帮你打开，不自动跑任务）",
+                "chip": "算" if on else "不算",
+            })
+        out.append({
+            "key": "n_restore",
+            "icon": "cfg",
+            "title": "恢复默认",
+            "sub": "回到「明日方舟（MAA）+ FGO（MaaFgo）」",
+            "chip": "恢复",
+        })
+        return out
+
+    @staticmethod
+    def _vm_icon(idx, name):
+        """实例行用游戏官方图标：先认名字，认不出再按实例号兜底"""
+        n = (name or "").lower()
+        if "舟" in n or "ark" in n:
+            return "arknights"
+        if "fgo" in n or "冠位" in n:
+            return "fgo"
+        if idx == 0:
+            return "arknights"
+        if idx == 1:
+            return "fgo"
+        return "mumu"
+
+    def _okww_sub(self):
+        m = self.cfg.get("okww", {})
+        task = (m.get("task") or "DailyTask").strip()
+        name = "每日任务" if task.lower() == "dailytask" else task
+        tail = "无界面" if m.get("headless", False) else "自动开始"
+        if m.get("exit_after", False):
+            tail += "，跑完关游戏"
+        return "%s · %s" % (name, tail)
+
+    def _maafgo_sub(self):
+        m = self.cfg.get("maafgo", {})
+        name = (m.get("instance") or "").strip()
+        idx = m.get("emulator_index", 1)
+        pkg = (m.get("game_package") or "").strip()
+        head = ("实例%d" % idx) if pkg else "FGO"
+        tail = "等游戏起来再开始任务" if m.get("autostart", True) else "只启动界面"
+        return ("%s · %s · %s" % (head, name, tail)) if name else ("%s · %s" % (head, tail))
+
+    # ---------- 绘制 ----------
+    def paint(self, target):
+        rc = wt.RECT()
+        user32.GetClientRect(self.hwnd, ctypes.byref(rc))
+        w, h = rc.right, rc.bottom
+        mem = gdi32.CreateCompatibleDC(target)
+        bmp = gdi32.CreateCompatibleBitmap(target, w, h)
+        gdi32.SelectObject(mem, bmp)
+
+        bg = gdi32.CreateSolidBrush(C["bg"])
+        full = wt.RECT(0, 0, w, h)
+        user32.FillRect(mem, ctypes.byref(full), bg)
+        gdi32.DeleteObject(bg)
+
+        self.layout(w, h)
+        R = self.rects
+
+        # 标题行左侧放本程序图标，标题与副标题一起右移对齐
+        tsz = self.S(22)
+        tx0 = R["title"][0]
+        draw_icon(mem, "launcher", tx0, R["title"][1] + self.S(4), tsz)
+        tdx = tsz + self.S(10)
+
+        self.text(mem, APP_TITLE,
+                  (tx0 + tdx, R["title"][1], R["title"][2], R["title"][3]),
+                  C["text"], self.font(21, True))
+        if self.page == "settings":
+            if self.first_run:
+                sub = "%s · 还没配置：先在「① 选择各实例的路径」里逐行点「选择」指路径" % APP_VERSION
+            else:
+                sub = "%s · 设置页：① 选路径 ② 换实例/版本 ③ 其它" % APP_VERSION
+        elif self.page == "custom":
+            sub = "%s · 二级 · 主界面项目：加自定义实例 / 删掉不用的行 / 恢复默认" % APP_VERSION
+        elif self.page == "night":
+            sub = "%s · 二级 · 《今晚的手游日常》= 一天要清两次日常的手游，勾在这里" % APP_VERSION
+        else:
+            # 副标题按当前可见的项生成（用户可能删过行）
+            hid = self.hidden()
+            parts = []
+            if "maaend" not in hid:
+                parts.append("MaaEnd")
+            n_vm = len([i for i in self.cfg.get("instances", []) or []
+                        if ("vm%d" % int(i.get("index", -1))) not in hid])
+            if n_vm:
+                parts.append("MuMu×%d" % n_vm)
+            for k, label in (("maa", "MAA"), ("maafgo", "MaaFgo"), ("okww", "ok-ww")):
+                if k not in hid:
+                    parts.append(label)
+            sub = "%s · %s" % (APP_VERSION, " → ".join(parts) or "就绪")
+        self.text(mem, sub, (R["sub"][0] + tdx, R["sub"][1], R["sub"][2], R["sub"][3]),
+                  C["muted"], self.font(12))
+
+        self.fill_round(mem, R["card"], 12, C["card"], C["border"])
+        rows = R["rows"]
+        for i, (item, y, rh) in enumerate(rows):
+            self.draw_row(mem, item, y, R["card"][0], R["card"][2], rh)
+            if i < len(rows) - 1:
+                self.hline(mem, R["card"][0] + self.S(22), R["card"][2] - self.S(22),
+                           y + rh - self.S(3), C["line"])
+
+        if self.page == "main":
+            self.draw_shortcuts(mem)
+        self.draw_buttons(mem)
+        self.draw_log(mem, R["logcard"])
+        self.text(mem, self.status, R["statusbar"], C["muted"], self.font(11))
+
+        if self.prompt:                     # 模态询问要盖在一切之上
+            self.draw_prompt(mem, w, h)
+        if self.exepick:                   # 「选 exe」卡片也在最上层
+            self.draw_exe_picker(mem, w, h)
+
+        gdi32.BitBlt(target, 0, 0, w, h, mem, 0, 0, 0x00CC0020)
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(mem)
+
+    # ---------- 「选 exe」卡片 ----------
+    def open_exe_picker(self, title, items, on_ok):
+        """弹出「从候选 exe 里挑一个」的卡片
+
+        系统自带的"打开文件"框在这台机器上用不了（GetOpenFileNameW 报错 87，
+        IFileDialog 链路太长且没法可靠验证），所以自绘一张卡片。
+        候选来自用户刚选的文件夹 —— 列的是该目录下的 exe。
+        """
+        self.exepick = {
+            "title": title,
+            "items": list(items),
+            "sel": 0,
+            "on_ok": on_ok,
+        }
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def close_exe_picker(self, ok):
+        """关掉卡片；ok=True 时把选中的路径交给 on_ok"""
+        st = self.exepick
+        self.exepick = None
+        if st and ok:
+            try:
+                st["on_ok"](st["items"][st["sel"]])
+            except Exception:
+                log_line("选择 exe 时出错：\n" + traceback.format_exc())
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def draw_exe_picker(self, hdc, w, h):
+        """画「选 exe」卡片：标题 + 候选列表 + 确定/取消"""
+        S = self.S
+        st = self.exepick
+        if not st:
+            return
+        R = self.rects
+        card = R.get("expick")
+        if not card:
+            return
+
+        mask = gdi32.CreateSolidBrush(rgb("#E7ECF3"))
+        user32.FillRect(hdc, ctypes.byref(wt.RECT(0, 0, w, h)), mask)
+        gdi32.DeleteObject(mask)
+
+        self.fill_round(hdc, (card[0] + S(1), card[1] + S(4),
+                              card[2] + S(1), card[3] + S(4)),
+                        16, rgb("#DCE2EC"))
+        self.fill_round(hdc, card, 16, C["card"], C["border"], 1.2)
+
+        x1 = card[0] + S(26)
+        x2 = card[2] - S(26)
+        y1 = card[1]
+
+        self.text(hdc, st["title"], (x1, y1 + S(16), x2, y1 + S(42)),
+                  C["text"], self.font(14.5, True))
+        self.text(hdc, "点一行选中它，再点「确定」；也可以双击那一行直接选。",
+                  (x1, y1 + S(44), x2, y1 + S(64)), C["muted"], self.font(10.5))
+
+        # 候选列表
+        top = y1 + S(72)
+        bot = card[3] - S(66)
+        self.fill_round(hdc, (x1, top, x2, bot), 8, C["iconbg"])
+        items = st["items"]
+        lh = S(26)
+        maxn = max(1, int((bot - top - S(8)) // lh))
+        sel = st["sel"]
+        first = max(0, min(sel - maxn // 2, len(items) - maxn))
+        if len(items) <= maxn:
+            first = 0
+        for k in range(min(maxn, len(items))):
+            idx = first + k
+            path = items[idx]
+            iy = top + S(4) + k * lh
+            if idx == sel:
+                self.fill_round(hdc, (x1 + S(4), iy, x2 - S(4), iy + lh - S(2)),
+                                5, C["accent_l"])
+            label = os.path.basename(path)
+            self.text(hdc, label, (x1 + S(12), iy, x2 - S(12), iy + lh - S(2)),
+                      C["text"] if idx == sel else C["text2"], self.font(11))
+        if len(items) > maxn:
+            self.text(hdc, "… 共 %d 个，用滚轮上下翻" % len(items),
+                      (x1 + S(12), bot - S(20), x2 - S(12), bot - S(4)),
+                      C["muted"], self.font(9.5))
+
+        # 确定 / 取消
+        bw, bh, gap = S(96), S(34), S(12)
+        bx = x2 - bw * 2 - gap
+        by = card[3] - S(50)
+        for key, label, primary in (("expick_ok", "确定", True),
+                                    ("expick_cancel", "取消", False)):
+            r = R.get(key)
+            if not r:
+                continue
+            hot = self.hover == key
+            if primary:
+                bg = C["accent_d"] if hot else C["accent"]
+                col = rgb("#FFFFFF")
+            else:
+                bg = C["ghost_bg_h"] if hot else C["ghost_bg"]
+                col = C["text2"]
+            self.fill_round(hdc, r, 9, bg, C["accent"] if primary else C["border"], 1.1)
+            self.text(hdc, label, r, col, self.font(12, True),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+    # 设置页每一行的「文字块」高度（逻辑像素）= 标题带 + 副标题带。
+    # 固定成一块再在行内垂直居中：这样行高不一样时文字间距也一致，
+    # 也不会因为行高一小两行字就叠在一起。
+    SET_TEXT_BLOCK = 30
+    SET_TITLE_H = 17
+
+    def draw_setting_row(self, hdc, item, y, cx1, cx2, rh=None):
+        """设置页的一行：左边图标+标题+当前值，右边一个按钮（「选择」或可切换的 chip）
+
+        坐标一律按逻辑像素排版，最后统一乘 DPI 系数。
+        （之前这里拿物理行高又套了一次 S()，图标和按钮整体被推到副标题那一行，
+          跟标题对不齐 —— 就是那个「图标和文字错位」的 bug。）
+        """
+        S = self.S
+        kk = max(0.01, self.dpi / 96.0)
+        key = item["key"]
+        is_cfg = key == "config"
+        btn_w = 78
+        # 进来的全是物理像素，先换算成逻辑像素统一排版
+        y = y / kk
+        cx1 = cx1 / kk
+        cx2 = cx2 / kk
+        if rh is None:
+            rh = getattr(self, "row_h_logical", 58)
+        else:
+            rh = rh / kk
+
+        # ---- 分组标题行：整行就是标题，没有图标也没有按钮 ----
+        if key.startswith("sec:"):
+            self.fill_round(hdc, (S(cx1 + 16), S(y + 1), S(cx2 - 16), S(y + rh - 3)),
+                            7, C["accent_l"])
+            self.text(hdc, item["title"],
+                      (S(cx1 + 28), S(y + 2), S(cx2 - 28), S(y + rh - 4)),
+                      C["accent"], self.font(12, True),
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+            return
+
+        # 文字块：标题带 + 副标题带，整体在行内垂直居中
+        blk = min(self.SET_TEXT_BLOCK, rh)
+        top = y + (rh - blk) / 2.0
+        th = self.SET_TITLE_H if blk >= self.SET_TITLE_H else blk
+
+        # 左侧图标：跟「标题」这一行的中线对齐（不是跟整块居中），
+        # 才会跟标题看起来在同一行上。行高不够放不下就自动缩小。
+        isz = min(22, max(14, th + 2))
+        ix = cx1 + 20
+        iy = top + th / 2.0 - isz / 2.0
+        self.fill_round(hdc, (S(ix), S(iy), S(ix + isz), S(iy + isz)), 8, C["iconbg"])
+        if not draw_icon(hdc, item.get("icon"), S(ix), S(iy), S(isz)):
+            ch = (item.get("title") or "?")[:1]
+            self.text(hdc, ch, (S(ix), S(iy), S(ix + isz), S(iy + isz)), C["muted"],
+                      self.font(11.5, True),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+        tx1 = ix + isz + 14
+        tx2 = cx2 - btn_w - 26
+
+        self.text(hdc, item["title"], (S(tx1), S(top), S(tx2), S(top + th)),
+                  C["text"], self.font(12, True))
+        self.text(hdc, item["sub"], (S(tx1), S(top + th), S(tx2), S(top + blk)),
+                  C["muted"], self.font(9.5),
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX)
+
+        bx2 = cx2 - 22
+        bx1 = bx2 - btn_w
+        bh = 23
+        by1 = y + (rh - bh) / 2.0
+        by2 = by1 + bh
+        hot = self.hover == "set:" + key
+        chip = item.get("chip")
+        if is_cfg:
+            bgc = C["ghost_bg_h"] if hot else C["ghost_bg"]
+            txt, col = "打开", C["text2"]
+        elif chip:
+            # 可切换的选项（实例号 / FGO 版本 / 删除 / 恢复）：点一下换下一个
+            bgc = C["accent_l"] if hot else C["ghost_bg"]
+            txt = chip
+            if chip == "删除":
+                col = C["err"]
+                bgc = C["err_bg_h"] if hot else C["err_bg"]
+            elif chip == "说明":
+                col = C["muted"]
+                bgc = C["ghost_bg"]
+            elif chip in ("恢复", "添加", "管理", "设置"):
+                col = C["accent"]
+            else:
+                col = C["accent"] if hot else C["text2"]
+        else:
+            bgc = C["accent_l"] if hot else C["ghost_bg"]
+            txt, col = "选择", C["accent"] if hot else C["text2"]
+        self.fill_round(hdc, (S(bx1), S(by1), S(bx2), S(by2)), 8, bgc, C["border"], 1.1)
+        self.text(hdc, txt, (S(bx1), S(by1), S(bx2), S(by2)), col, self.font(11, True),
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+    def draw_row(self, hdc, item, y, cx1, cx2, rh=None):
+        if self.sub_page:
+            self.draw_setting_row(hdc, item, y, cx1, cx2, rh)
+            return
+        key = item["key"]
+        state, detail = self.steps.get(key, ("idle", ""))
+        if key.startswith("vm"):
+            checked = self.chk.get(int(item["index"]), True)
+        elif key.startswith("custom:"):
+            checked = self.chk_custom.get(key[7:], True)
+        elif key == "maa":
+            checked = self.maa_on
+        elif key == "maaend":
+            checked = self.maaend_on
+        elif key == "okww":
+            checked = self.okww_on
+        else:
+            checked = self.maafgo_on
+
+        S = self.S
+        # 左侧图标（28 逻辑像素），行高 58，垂直居中
+        isz = S(28)
+        ix = cx1 + S(20)
+        iy = y + (S(58) - isz) // 2
+        self.fill_round(hdc, (ix, iy, ix + isz, iy + isz), 9, C["iconbg"])
+        if not draw_icon(hdc, item.get("icon"), ix, iy, isz):
+            ch = (item.get("title") or "?")[:1]
+            self.text(hdc, ch, (ix, iy, ix + isz, iy + isz), C["muted"],
+                      self.font(12, True),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+        bx, by, bs = ix + isz + S(13), y + S(20), S(19)
+        if checked:
+            self.fill_round(hdc, (bx, by, bx + bs, by + bs), 5, C["accent"])
+            self.check_mark(hdc, bx + S(5), by + S(10), rgb("#FFFFFF"))
+        else:
+            self.fill_round(hdc, (bx, by, bx + bs, by + bs), 5, C["card"], C["border"], 1.2)
+
+        tx = bx + bs + S(13)
+        self.text(hdc, item["title"], (tx, y + S(8), cx2 - S(180), y + S(32)),
+                  C["text"] if checked else C["muted"], self.font(13, True))
+        self.text(hdc, item["sub"], (tx, y + S(30), cx2 - S(180), y + S(52)),
+                  C["muted"], self.font(11))
+
+        label = {"idle": "待启动", "run": "进行中", "ok": "完成", "err": "失败"}[state]
+        if detail:
+            label = detail
+        color = {"idle": C["muted"], "run": C["run"], "ok": C["ok"], "err": C["err"]}[state]
+        dotc = {"idle": C["idle"], "run": C["run"], "ok": C["ok"], "err": C["err"]}[state]
+        self.text(hdc, label, (cx2 - S(220), y + S(18), cx2 - S(40), y + S(42)), color,
+                  self.font(11.5, state != "idle"),
+                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        self.dot(hdc, cx2 - S(26), y + S(30), 4.5, dotc)
+
+    def draw_shortcuts(self, hdc):
+        """标题右侧的一键开关：全选"""
+        R = self.rects
+        S = self.S
+        for key, label, on in (("all", "全选", self.all_checked()),):
+            r = R.get(key)
+            if not r:
+                continue
+            hot = self.hover == key
+            bg = C["accent_l"] if on else (C["ghost_bg_h"] if hot else C["ghost_bg"])
+            self.fill_round(hdc, r, 13, bg, C["accent"] if on else C["border"], 1.2)
+
+            bs = S(11)
+            bx = r[0] + S(10)
+            by = (r[1] + r[3]) // 2 - bs // 2
+            if on:
+                self.fill_round(hdc, (bx, by, bx + bs, by + bs), 3, C["accent"])
+                self.check_mark(hdc, bx + S(1.5), by + S(6), rgb("#FFFFFF"))
+            else:
+                self.fill_round(hdc, (bx, by, bx + bs, by + bs), 3,
+                                C["card"], C["border"], 1.1)
+
+            self.text(hdc, label, (bx + bs + S(6), r[1], r[2] - S(8), r[3]),
+                      C["accent"] if on else C["text2"], self.font(11.5, on),
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+    def draw_prompt(self, hdc, w, h):
+        """开机询问卡片：要不要只跑「一天要清两次体力」的手游日常
+
+        GDI 没有真正的半透明，铺一层比背景略深的实色当遮罩，
+        视觉上就是"模态弹窗盖住了主界面"。
+        """
+        S = self.S
+        R = self.rects
+        card = R.get("prompt")
+        if not card:
+            return
+
+        mask = gdi32.CreateSolidBrush(rgb("#E7ECF3"))
+        user32.FillRect(hdc, ctypes.byref(wt.RECT(0, 0, w, h)), mask)
+        gdi32.DeleteObject(mask)
+
+        self.fill_round(hdc, (card[0] + S(1), card[1] + S(4),
+                              card[2] + S(1), card[3] + S(4)),
+                        16, rgb("#DCE2EC"))
+        self.fill_round(hdc, card, 16, C["card"], C["border"], 1.2)
+
+        x1 = card[0] + S(26)
+        x2 = card[2] - S(26)
+        y1 = card[1]
+
+        # 右上角：剩余秒数
+        left = int(self.prompt.get("left", 0))
+        tw = S(48)
+        tr = (card[2] - S(22) - tw, y1 + S(18), card[2] - S(22), y1 + S(42))
+        self.fill_round(hdc, tr, S(12), C["accent_l"])
+        self.text(hdc, "%d 秒" % left, tr, C["accent"], self.font(11, True),
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+        self.text(hdc, "按上次的勾选全部一键启动吗？",
+                  (x1, y1 + S(18), card[2] - S(78), y1 + S(44)),
+                  C["text"], self.font(15.5, True))
+
+        self.text(hdc, "否 = 只启动《今晚的手游日常》：%s" % self.night_desc(),
+                  (x1, y1 + S(50), x2, y1 + S(70)), C["text2"], self.font(11.5))
+        self.text(hdc, "《今晚的手游日常》= 一天要清两次日常的手游（可在设置里改）",
+                  (x1, y1 + S(70), x2, y1 + S(90)), C["text2"], self.font(11.5))
+        self.text(hdc, "不操作就等 %d 秒，按上次的勾选全部启动" % PROMPT_SECONDS,
+                  (x1, y1 + S(92), x2, y1 + S(112)), C["muted"], self.font(10.5))
+
+        for key, label, primary in (("prompt_night", "否", True),
+                                    ("prompt_cancel", "取消启动", False)):
+            r = R.get(key)
+            if not r:
+                continue
+            hot = self.hover == key
+            if primary:
+                bg = C["accent_d"] if hot else C["accent"]
+                self.fill_round(hdc, r, S(10), bg, C["accent"], 1.0)
+                col = rgb("#FFFFFF")
+            else:
+                bg = C["ghost_bg_h"] if hot else C["ghost_bg"]
+                self.fill_round(hdc, r, S(10), bg, C["border"], 1.1)
+                col = C["text2"]
+            self.text(hdc, label, r, col, self.font(12.5, True),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+    def draw_buttons(self, hdc):
+        R = self.rects
+        r = R["start"]
+        if self.sub_page:
+            f, txtc, label = C["accent_l"], C["disabled"], "▶  一键启动"
+        elif self.busy:
+            f, txtc, label = C["accent_l"], C["accent"], "启动中…"
+        elif self.hover == "start":
+            f, txtc, label = C["accent_d"], rgb("#FFFFFF"), "▶  一键启动"
+        else:
+            f, txtc, label = C["accent"], rgb("#FFFFFF"), "▶  一键启动"
+        self.fill_round(hdc, r, 9, f)
+        self.text(hdc, label, r, txtc, self.font(13.5, True),
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+        # 取消启动：仅启动过程中可用，可用时红字
+        r = R["cancel"]
+        if self.busy:
+            bgc = C["err_bg_h"] if self.hover == "cancel" else C["err_bg"]
+            self.fill_round(hdc, r, 9, bgc, C["err_border"], 1.2)
+            self.text(hdc, "■  取消启动", r, C["err"], self.font(12, True),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        else:
+            self.fill_round(hdc, r, 9, C["card"], C["border"], 1.2)
+            self.text(hdc, "取消启动", r, C["disabled"], self.font(12),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+        # 关闭模拟器（启动中禁用，避免和启动流程抢 MuMu 控制权）
+        r = R["shutdown"]
+        if self.busy or self.sub_page:
+            self.fill_round(hdc, r, 9, C["card"], C["border"], 1.2)
+            self.text(hdc, "关闭模拟器", r, C["disabled"], self.font(12),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        else:
+            bgc = C["ghost_bg_h"] if self.hover == "shutdown" else C["ghost_bg"]
+            self.fill_round(hdc, r, 9, bgc, C["border"], 1.2)
+            self.text(hdc, "关闭模拟器", r, C["text2"], self.font(12),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+        r = R["edit"]
+        in_set = self.sub_page
+        if in_set:
+            # 二级页的返回目标是「一级设置页」，一级设置页的返回目标是主界面
+            blabel = "← 返回设置" if self.page in ("custom", "night") else "← 返回"
+            bgc = C["accent_l"] if self.hover == "edit" else C["ghost_bg"]
+            self.fill_round(hdc, r, 9, bgc, C["accent"], 1.2)
+            self.text(hdc, blabel, r, C["accent"], self.font(12, True),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        else:
+            bgc = C["ghost_bg_h"] if self.hover == "edit" else C["ghost_bg"]
+            self.fill_round(hdc, r, 9, bgc, C["border"], 1.2)
+            self.text(hdc, "设置", r, C["text2"], self.font(12),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+        # 显示 / 隐藏「MuMu模拟器」主窗口（实例开着也能随时切换）
+        r = R["mainwin"]
+        label = "隐藏 MuMu" if self.main_vis_cached() else "显示 MuMu"
+        bgc = (C["ghost_bg_h"] if (self.hover == "mainwin" and not self.sub_page)
+               else C["ghost_bg"])
+        self.fill_round(hdc, r, 9, bgc, C["border"], 1.2)
+        self.text(hdc, label, r, C["text2"], self.font(12),
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+    def main_vis_cached(self):
+        """主窗口是否可见（1 秒缓存，避免每次重绘都枚举窗口）"""
+        now = time.time()
+        if now - getattr(self, "_main_vis_at", 0) > 1.0:
+            self._main_vis = main_window_visible()
+            self._main_vis_at = now
+        return getattr(self, "_main_vis", False)
+
+    def draw_log(self, hdc, rect):
+        self.fill_round(hdc, rect, 10, C["logbg"], C["border"])
+        l, t, r, b = rect
+        S = self.S
+        pad = S(14)
+        line_h = S(18)
+        gdi32.SaveDC(hdc)
+        gdi32.IntersectClipRect(hdc, l + pad - S(2), t + S(10), r - pad + S(4), b - S(8))
+        fnt = self.font(11.5, False, "Consolas")
+        avail = max(1, int((b - t - S(22)) // line_h))
+        lines = self.logs[-avail:]
+        yy = t + S(12)
+        for text, ckey in lines:
+            self.text(hdc, text, (l + pad, yy, r - pad, yy + line_h),
+                      C.get(ckey, C["text2"]), fnt)
+            yy += line_h
+        gdi32.RestoreDC(hdc, -1)
+
+    # ---------- 命中 ----------
+    def hit(self, x, y):
+        R = self.rects
+        if self.prompt:
+            # 询问卡是模态的：只认卡片上的两个按钮，别的一律吞掉
+            for key in ("prompt_night", "prompt_cancel"):
+                r = R.get(key)
+                if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                    return key
+            return "prompt_mask"
+        if self.exepick:
+            # 「选 exe」卡片也是模态的
+            for key in ("expick_ok", "expick_cancel"):
+                r = R.get(key)
+                if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                    return key
+            for idx, a, b in R.get("expick_rows", []):
+                if a <= y <= b:
+                    return "expick_row:%d" % idx
+            return "expick_mask"
+        # 设置页 / 自定义页里只有「返回」可用，其余按钮是灰的，不参与命中
+        keys = (("edit",) if self.page in ("settings", "custom", "night")
+                else ("start", "cancel", "shutdown", "edit", "mainwin",
+                      "all"))
+        for key in keys:
+            r = R.get(key)
+            if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                return key
+        rh = R.get("row_h", self.S(56))
+        prefix = "chk:" if self.page == "main" else "set:"
+        for item, ry, rowh in R.get("rows", []):
+            if item["key"].startswith("sec:"):
+                continue                       # 分组标题行不可点
+            if ry - 2 <= y <= ry + rowh - 2:
+                return prefix + item["key"]
+        return None
+
+    def _persist_selection(self):
+        """把界面上的勾选写进 config.json —— 这就是"记住上次选择"的实现"""
+        for i, on in self.chk.items():
+            for inst in self.cfg.get("instances", []):
+                if int(inst["index"]) == i:
+                    inst["enabled"] = bool(on)
+        self.cfg["maaend"]["enabled"] = self.maaend_on
+        self.cfg["maa"]["enabled"] = self.maa_on
+        self.cfg["maafgo"]["enabled"] = self.maafgo_on
+        self.cfg["okww"]["enabled"] = self.okww_on
+        for it in self.cfg.get("custom_items", []) or []:
+            cid = it.get("id")
+            if cid in self.chk_custom:
+                it["enabled"] = bool(self.chk_custom[cid])
+        self.cfg["last_selection_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_config(self.cfg)
+
+    def selection_summary(self):
+        """当前勾选了哪几项，一句话说清（用在日志和状态栏）"""
+        hid = self.hidden()
+        picked = []
+        total = 0
+        if "maaend" not in hid:
+            total += 1
+            if self.maaend_on:
+                picked.append("MaaEnd")
+        for inst in self.cfg.get("instances", []):
+            i = int(inst["index"])
+            if ("vm%d" % i) in hid:
+                continue
+            total += 1
+            if self.chk.get(i, True):
+                picked.append("实例%d" % i)
+        for key, on, label in (("maa", self.maa_on, "MAA"),
+                               ("maafgo", self.maafgo_on, "MaaFgo"),
+                               ("okww", self.okww_on, "ok-ww")):
+            if key in hid:
+                continue
+            total += 1
+            if on:
+                picked.append(label)
+        for it in self.cfg.get("custom_items", []) or []:
+            cid = it.get("id")
+            if ("custom:%s" % cid) in hid:
+                continue
+            total += 1
+            if self.chk_custom.get(cid, True):
+                picked.append(it.get("name") or "自定义")
+        if total and len(picked) == total:
+            return "全部 %d 项" % total
+        if not picked:
+            return "一项都没勾"
+        return "%d/%d 项：%s" % (len(picked), total, "、".join(picked))
+
+    # ---------- 快捷开关：全选 / 开机询问（夜间启动） ----------
+    def _inst_indexes(self):
+        return [int(i["index"]) for i in self.cfg.get("instances", [])]
+
+    def all_checked(self):
+        idxs = self._inst_indexes()
+        return (all(self.chk.get(i) for i in idxs)
+                and self.maaend_on and self.maa_on
+                and self.maafgo_on and self.okww_on)
+
+    def night_keep(self):
+        """夜间模式要保留的实例号（MAA 和 MaaFgo 各一台，可能是同一台）"""
+        a = int(self.cfg.get("maa", {}).get("instance_index", 0))
+        f = int(self.cfg.get("maafgo", {}).get("emulator_index", 1))
+        keep = []
+        for i in (a, f):
+            if i in self._inst_indexes() and i not in keep:
+                keep.append(i)
+        return keep
+
+    def night_keys(self):
+        """夜间模式只跑哪几项：MAA + MaaFgo，以及它们各自绑定的实例
+
+        「每日要清两次体力」的就是这两个手游；终末地和鸣潮是 PC 端、
+        一天一次，晚上可以不跑。
+        """
+        return ["maa", "maafgo"] + ["vm%d" % i for i in self.night_keep()]
+
+    def answer_prompt(self, night):
+        """回答开机的「按上次的勾选全部一键启动吗」
+
+        night=True  → 回答"否"：不按上次勾选全跑，只启动《今晚的手游日常》，
+                      不改勾选、不写 config.json，下次打开照旧
+        night=False → 「取消启动」：这次什么都不启动
+        """
+        self.prompt = None
+        user32.InvalidateRect(self.hwnd, None, False)
+        if not night:
+            self.status = "已取消：这次不启动任何东西"
+            self.ui_log("已取消启动：什么都没开。下次打开还会再问一次。")
+            return
+        keys = self.night_keys()
+        self.run_only = set(keys)
+        self.status = "只启动《今晚的手游日常》"
+        self.ui_log("《今晚的手游日常》：只启动 %s；其余项本次跳过（勾选未改动）"
+                    % "、".join(self._night_label(k) for k in keys))
+        self.do("start")
+
+    def _tick_prompt(self):
+        """开机询问的倒计时：到点就当作"不回答"，按上次的勾选全部启动"""
+        if not self.prompt:
+            return
+        left = int(self.prompt["until"] - time.time() + 0.999)
+        if left <= 0:
+            self.prompt = None
+            self.ui_log("等了 %d 秒没有回答，按上次的勾选全部启动。"
+                        % PROMPT_SECONDS)
+            self.status = "按上次的勾选全部启动"
+            self.do("start")
+            return
+        if left != self.prompt.get("left"):
+            self.prompt["left"] = left
+            user32.InvalidateRect(self.hwnd, None, False)
+
+    def _apply_checks(self, vm_on, maaend, maa, maafgo, okww):
+        """一次性把 5 组开关写进内存和 config.json"""
+        for i in self._inst_indexes():
+            self.chk[i] = vm_on
+            for inst in self.cfg.get("instances", []):
+                if int(inst["index"]) == i:
+                    inst["enabled"] = vm_on
+        self.maaend_on = maaend
+        self.cfg["maaend"]["enabled"] = maaend
+        self.maa_on = maa
+        self.cfg["maa"]["enabled"] = maa
+        self.maafgo_on = maafgo
+        self.cfg["maafgo"]["enabled"] = maafgo
+        self.okww_on = okww
+        self.cfg["okww"]["enabled"] = okww
+        self._persist_selection()
+
+    def toggle_all(self):
+        on = not self.all_checked()
+        self._apply_checks(on, on, on, on, on)
+        n = len(self._inst_indexes()) + 4
+        if on:
+            self.ui_log("已全选：%d 项全部勾上" % n)
+            self.status = "已全选（%d 项）" % n
+        else:
+            self.ui_log("已全部取消：%d 项都没勾，点「一键启动」将什么都不做" % n)
+            self.status = "已全部取消"
+
+    def toggle(self, key):
+        if not key.startswith("chk:"):
+            return
+        k = key[4:]
+        if k.startswith("vm"):
+            idx = int(k[2:])
+            self.chk[idx] = not self.chk.get(idx, True)
+            for inst in self.cfg.get("instances", []):
+                if int(inst["index"]) == idx:
+                    inst["enabled"] = self.chk[idx]
+        elif k == "maaend":
+            self.maaend_on = not self.maaend_on
+            self.cfg["maaend"]["enabled"] = self.maaend_on
+        elif k == "maa":
+            self.maa_on = not self.maa_on
+            self.cfg["maa"]["enabled"] = self.maa_on
+        elif k == "maafgo":
+            self.maafgo_on = not self.maafgo_on
+            self.cfg["maafgo"]["enabled"] = self.maafgo_on
+        elif k == "okww":
+            self.okww_on = not self.okww_on
+            self.cfg["okww"]["enabled"] = self.okww_on
+        elif k.startswith("custom:"):
+            cid = k[7:]
+            self.chk_custom[cid] = not self.chk_custom.get(cid, True)
+            for it in self.cfg.get("custom_items", []) or []:
+                if it.get("id") == cid:
+                    it["enabled"] = self.chk_custom[cid]
+        self._persist_selection()
+
+    def cycle_setting(self, kind):
+        """设置页那三个"点一下就换"的选项：实例号 / FGO 版本"""
+        idxs = self._inst_indexes() or [0]
+        if kind in ("maa_instance", "fgo_instance"):
+            sec = "maa" if kind == "maa_instance" else "maafgo"
+            field = "instance_index" if kind == "maa_instance" else "emulator_index"
+            cur = int(self.cfg.get(sec, {}).get(field, idxs[0]))
+            nxt = idxs[(idxs.index(cur) + 1) % len(idxs)] if cur in idxs else idxs[0]
+            self.cfg.setdefault(sec, {})[field] = nxt
+            label = "MAA" if kind == "maa_instance" else "MaaFgo"
+            msg = "%s 改为连接实例 %d" % (label, nxt)
+            if len(idxs) == 1:
+                msg += "（MuMu 里只有这一个实例；要分开两台就在 MuMu 里新建实例）"
+        elif kind == "fgo_ver":
+            cur = (self.cfg.get("maafgo", {}) or {}).get("game_package", "")
+            pkgs = [p for _n, p in FGO_PACKAGES]
+            nxt = pkgs[(pkgs.index(cur) + 1) % len(pkgs)] if cur in pkgs else pkgs[0]
+            self.cfg.setdefault("maafgo", {})["game_package"] = nxt
+            name = next((n for n, p in FGO_PACKAGES if p == nxt), nxt)
+            msg = "FGO 版本改为 %s（%s）" % (name, nxt)
+            msg += " —— 别的服在 config.json 改 maafgo.game_package"
+        else:
+            return
+        save_config(self.cfg)
+        self.ui_log(msg)
+        self.status = msg
+
+    # ---------- 自定义实例 / 主界面增删 / 夜间项目 ----------
+    def add_custom(self):
+        """加一个自定义实例：先选脚本所在的文件夹 → 挑 exe，再选游戏文件夹 → 挑 exe"""
+        items = self.cfg.setdefault("custom_items", [])
+        if len(items) >= MAX_CUSTOM:
+            msg = ("自定义实例最多 %d 个（再多主界面就挤不下了），先删一个再加"
+                   % MAX_CUSTOM)
+            self.ui_log(msg)
+            self.status = msg
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        self._cus_state = {"script": "", "game": ""}
+        self.pick_exe_step("第 1 步：选脚本 exe", "script")
+
+    def pick_exe_step(self, title, which):
+        """选文件夹 → 列出里面的 exe → 弹卡片让用户挑
+
+        系统的"打开文件"框在这台机器上用不了（GetOpenFileNameW 报错误 87，
+        IFileDialog 的 Show 虽能弹出但整条链路没法可靠验证），
+        只有 SHBrowseForFolder（选文件夹）实测 100% 可靠。
+        所以拆成两步：选文件夹 → 在自绘卡片里挑 exe。
+        """
+        folder = pick_folder(self.hwnd, title + "（选它所在的文件夹）")
+        if not folder:
+            self.ui_log("已取消（%s）" % title)
+            self.status = "已取消"
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        exes = list_exes_in(folder)
+        if not exes:
+            msg = "「%s」里没有找到 .exe 文件，换个文件夹试试" % folder
+            self.ui_log("✗ " + msg)
+            self.status = msg
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if len(exes) == 1:
+            self.ui_log("「%s」里只有一个 exe，直接选它：%s"
+                        % (os.path.basename(folder), os.path.basename(exes[0])))
+            self.on_exe_picked(which, exes[0])
+            return
+        self.ui_log("「%s」里有 %d 个 exe，请挑一个"
+                    % (os.path.basename(folder), len(exes)))
+        self.open_exe_picker(title, exes,
+                             lambda p: self.on_exe_picked(which, p))
+
+    def on_exe_picked(self, which, path):
+        st = getattr(self, "_cus_state", None)
+        if st is None:
+            return
+        st[which] = path
+        self.ui_log("已选%s：%s"
+                    % ("脚本" if which == "script" else "游戏", path))
+        if which == "script":
+            self.pick_exe_step("第 2 步：选游戏的启动 exe", "game")
+        else:
+            self.finish_custom(st.get("script", ""), st.get("game", ""))
+
+    def finish_custom(self, script, game):
+        if not script:
+            self.ui_log("✗ 没选到脚本 exe，放弃添加")
+            self.status = "已放弃"
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        items = self.cfg.setdefault("custom_items", [])
+        name = os.path.splitext(os.path.basename(script))[0]
+        cid = "c%d" % int(time.time() * 1000)
+        items.append({"id": cid, "name": name, "script": script,
+                      "game": game, "enabled": True})
+        self.chk_custom[cid] = True
+        save_config(self.cfg)
+        self.ui_log("已添加自定义实例「%s」：脚本 %s%s"
+                    % (name, os.path.basename(script),
+                       ("、游戏 " + os.path.basename(game)) if game
+                       else "（没选游戏，只开脚本）"))
+        self.ui_log("⚠ 这是「未适配」项：启动器只负责把游戏和脚本打开，"
+                    "不会帮你点任务、也不检测任务完成 —— "
+                    "任务要在脚本自己的界面里点开始。")
+        self.status = "已添加：%s" % name
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def _key_label(self, key):
+        for k, label in (("maaend", "MaaEnd · 终末地"),
+                         ("maa", "MAA · 明日方舟"),
+                         ("maafgo", "MaaFgo · FGO"),
+                         ("okww", "ok-ww · 鸣潮")):
+            if k == key:
+                return label
+        if key.startswith("vm"):
+            return "MuMu 实例 %s" % key[2:]
+        if key.startswith("custom:"):
+            for it in self.cfg.get("custom_items", []) or []:
+                if it.get("id") == key[7:]:
+                    return it.get("name") or "自定义"
+        return key
+
+    def toggle_hidden(self, key):
+        """主界面行的删除 / 恢复（删掉 = 从主界面隐藏，不真删配置）"""
+        hid = self.cfg.setdefault("hidden_items", [])
+        if key in hid:
+            hid.remove(key)
+            msg = "已放回主界面：%s" % self._key_label(key)
+        else:
+            hid.append(key)
+            msg = ("已从主界面隐藏：%s（想放回来再到「主界面项目」这一页点「恢复」）"
+                   % self._key_label(key))
+        save_config(self.cfg)
+        self.ui_log(msg)
+        self.status = msg
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def restore_default(self):
+        """恢复默认主界面：自定义项清空、删掉的行全部放回来"""
+        self.cfg["custom_items"] = []
+        self.cfg["hidden_items"] = []
+        self.chk_custom = {}
+        save_config(self.cfg)
+        msg = "已恢复默认主界面：自定义项清空、删掉的行全部放回"
+        self.ui_log(msg)
+        self.status = msg
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def toggle_night(self, key):
+        """《今晚的手游日常》勾选/取消"""
+        items = self.cfg.setdefault("night_items", ["maa", "maafgo"])
+        if key in items:
+            items.remove(key)
+            msg = "《今晚的手游日常》不再包含 %s" % self._night_label(key)
+        else:
+            items.append(key)
+            msg = "《今晚的手游日常》现在包含 %s" % self._night_label(key)
+        save_config(self.cfg)
+        self.ui_log(msg)
+        self.status = msg
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def restore_night(self):
+        self.cfg["night_items"] = ["maa", "maafgo"]
+        save_config(self.cfg)
+        msg = "《今晚的手游日常》已恢复默认：明日方舟（MAA）+ FGO（MaaFgo）"
+        self.ui_log(msg)
+        self.status = msg
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def pick_row(self, kind):
+        """设置页点了一行：路径类弹文件夹选择框，选项类就地循环切换"""
+        if self.busy:
+            return
+        if kind in ("maa_instance", "fgo_instance", "fgo_ver"):
+            self.cycle_setting(kind)
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind == "custom_page":
+            self.page_stack.append("settings")
+            self.page = "custom"
+            self.status = "二级 · 主界面项目：加自定义实例、删掉不用的行、恢复默认"
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind == "night_page":
+            self.page_stack.append("settings")
+            self.page = "night"
+            self.status = "二级 · 《今晚的手游日常》：勾哪些项目算"
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind == "c_add":
+            self.add_custom()
+            return
+        if kind.startswith("c_del:"):
+            self.toggle_hidden(kind[6:])
+            return
+        if kind == "c_restore":
+            self.restore_default()
+            return
+        if kind.startswith("n_toggle:"):
+            self.toggle_night(kind[9:])
+            return
+        if kind == "n_restore":
+            self.restore_night()
+            return
+        if kind == "config":
+            try:
+                subprocess.Popen(["notepad.exe", CONFIG_PATH], creationflags=CREATE_NO_WINDOW)
+            except Exception as e:
+                self.ui_log("打开配置失败：%s" % e)
+            return
+        titles = {
+            "mumu": "选择 MuMu 模拟器安装目录（里面应有 nx_main 文件夹）",
+            "maaend": "选择 MaaEnd 所在目录（会自动找 MaaEnd.exe）",
+            "maa": "选择 MAA 所在目录（会自动找 MAA.exe）",
+            "maafgo": "选择 MaaFgo 所在目录（会自动找 MaaFgo.exe）",
+            "okww": "选择 ok-ww.exe 所在目录",
+        }
+        folder = pick_folder(self.hwnd, titles.get(kind, "选择目录"))
+        if not folder:
+            self.status = "已取消"
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        msg = apply_path_choice(kind, self.cfg, folder)
+        save_config(self.cfg)
+        self.ui_log(msg)
+        self.status = msg
+        if kind == "mumu":
+            self.ports = {}          # 端口缓存作废，下次重绘重新读
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def do(self, key):
+        if key in ("prompt_night", "prompt_cancel"):
+            self.answer_prompt(key == "prompt_night")
+            return
+        if key == "prompt_mask":       # 点在询问卡外面：什么也不做
+            return
+        if key == "expick_ok":
+            self.close_exe_picker(True)
+            return
+        if key == "expick_cancel":
+            self.close_exe_picker(False)
+            return
+        if key == "expick_mask":       # 点在卡片外面：什么也不做
+            return
+        if key.startswith("expick_row:"):
+            idx = int(key.split(":")[1])
+            if self.exepick:
+                self.exepick["sel"] = idx
+                user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if key == "start":
+            if not self.busy:
+                self._persist_selection()      # 点启动前再存一次，确保下次能记住
+                self.logs = []
+                self.status = "启动中…"
+                # 点过「是」就只跑手游那套；其余情况 None = 按勾选跑
+                self.runner.only = self.run_only
+                self.run_only = None
+                threading.Thread(target=self.runner.run, daemon=True).start()
+        elif key == "cancel":
+            if self.busy:
+                self.runner.cancel()
+                self.status = "正在取消…"
+                user32.InvalidateRect(self.hwnd, None, False)
+        elif key == "shutdown":
+            if not self.busy:
+                threading.Thread(target=self.runner.shutdown_all, daemon=True).start()
+        elif key == "mainwin":
+            # 主窗口在就隐藏，不在就显示；顺手刷新一下缓存，按钮文字立刻变
+            vis = main_window_visible()
+            self._main_vis = vis
+            self._main_vis_at = time.time()
+            set_main_window(not vis, self.ui_log)
+            self._main_vis = main_window_visible()
+            self._main_vis_at = time.time()
+            user32.InvalidateRect(self.hwnd, None, False)
+        elif key == "all":
+            if self.busy:
+                return
+            self.toggle_all()
+            user32.InvalidateRect(self.hwnd, None, False)
+        elif key == "edit":
+            if self.busy:
+                return
+            if self.page == "main":
+                # 主界面 → 一级设置页
+                self.page_stack.append("main")
+                self.page = "settings"
+                self.status = "设置：点右侧「选择」换目录，改完立刻生效"
+                self.emit("log", "设置页：先在「① 选择各实例的路径」里指路径，"
+                                 "再在「② 模拟器实例与游戏版本」里切换。")
+            elif self.page == "settings":
+                # 一级设置页 → 回主界面
+                if self.page_stack and self.page_stack[-1] == "main":
+                    self.page_stack.pop()
+                self.page = "main"
+                self.status = "就绪"
+            else:
+                # 二级页 → 回一级设置页（不是主界面）
+                self.page = self.page_stack.pop() if self.page_stack else "settings"
+                self.status = "设置：点右侧「选择」换目录，改完立刻生效"
+            user32.InvalidateRect(self.hwnd, None, False)
+
+    # ---------- 窗口过程 ----------
+    def wndproc(self, hwnd, msg, wp, lp):
+        try:
+            if msg == WM_PAINT:
+                ps = PAINTSTRUCT()
+                hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+                self.paint(hdc)
+                user32.EndPaint(hwnd, ctypes.byref(ps))
+                return 0
+            if msg == WM_ERASEBKGND:
+                return 1
+            if msg == WM_MOUSEMOVE:
+                x = ctypes.c_short(lp & 0xFFFF).value
+                y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                h = self.hit(x, y)
+                if h != self.hover:
+                    self.hover = h
+                    user32.InvalidateRect(hwnd, None, False)
+                return 0
+            if msg == WM_LBUTTONDOWN:
+                x = ctypes.c_short(lp & 0xFFFF).value
+                y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                self.pressed = self.hit(x, y)
+                return 0
+            if msg == WM_LBUTTONUP:
+                x = ctypes.c_short(lp & 0xFFFF).value
+                y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                h = self.hit(x, y)
+                if h and h == self.pressed:
+                    if h.startswith("chk:"):
+                        if not self.busy:
+                            self.toggle(h)
+                            user32.InvalidateRect(hwnd, None, False)
+                    elif h.startswith("set:"):
+                        self.pick_row(h[4:])
+                        user32.InvalidateRect(hwnd, None, False)
+                    else:
+                        self.do(h)
+                self.pressed = None
+                return 0
+            if msg == WM_LBUTTONDBLCLK:
+                # 双击「选 exe」列表里的某一行 = 直接选中并确认
+                x = ctypes.c_short(lp & 0xFFFF).value
+                y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                h = self.hit(x, y)
+                if h and h.startswith("expick_row:"):
+                    self.do(h)
+                    self.close_exe_picker(True)
+                return 0
+            if msg == WM_MOUSEWHEEL:
+                # 「选 exe」列表用滚轮翻页
+                if self.exepick:
+                    delta = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                    st = self.exepick
+                    n = len(st["items"])
+                    if n > 1:
+                        st["sel"] = max(0, min(n - 1, st["sel"] - (1 if delta > 0 else -1)))
+                        user32.InvalidateRect(hwnd, None, False)
+                return 0
+            if msg == WM_SETCURSOR:
+                if self.hover:
+                    user32.SetCursor(load_cursor(32649))
+                    return 1
+            if msg == WM_TIMER:
+                self.drain()
+                self._tick_prompt()
+                if self._auto_pending and not self.busy and time.time() >= self._auto_at:
+                    self._auto_pending = False
+                    self.do("start")
+                return 0
+            if msg == WM_KEYDOWN:
+                if wp == 0x0D and not self.busy:
+                    self.do("start")
+                    return 0
+            if msg == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+        except Exception:
+            log_line("wndproc 异常：\n" + traceback.format_exc())
+        return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    # ---------- 图标 ----------
+    def apply_icon(self, hwnd):
+        """优先用自带的角色图标；打包后直接用 exe 里嵌的那张"""
+        cands = []
+        if getattr(sys, "frozen", False):
+            cands.append(("exe", sys.executable))
+        for p in (os.path.join(APP_DIR, "build", "mumu.ico"),
+                  os.path.join(APP_DIR, "mumu.ico"),
+                  os.path.join(APP_DIR, "源码", "build", "mumu.ico")):
+            if os.path.isfile(p):
+                cands.append(("ico", p))
+                break
+        mumu = os.path.join(self.cfg.get("mumu_root", ""), "nx_main", "MuMuNxMain.exe")
+        if os.path.isfile(mumu):
+            cands.append(("exe", mumu))
+        big_px = user32.GetSystemMetrics(11)    # SM_CXICON
+        small_px = user32.GetSystemMetrics(49)  # SM_CXSMICON
+        for kind, path in cands:
+            hb = hs = None
+            if kind == "ico":
+                hb = user32.LoadImageW(None, path, 1, big_px, big_px, 0x0010)
+                hs = user32.LoadImageW(None, path, 1, small_px, small_px, 0x0010)
+            else:
+                lb, ls = wt.HICON(), wt.HICON()
+                if shell32.ExtractIconExW(path, 0, ctypes.byref(lb), ctypes.byref(ls), 1) > 0:
+                    hb = lb.value if lb else None
+                    hs = ls.value if ls else None
+            if hb:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hb)
+            if hs:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hs)
+            if hb:
+                return hb
+        return None
+
+    # ---------- 创建 ----------
+    def create(self):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                user32.SetProcessDPIAware()
+            except Exception:
+                pass
+        # 取真实 DPI：打包后由 manifest 声明 per-monitor v2，这里只需按 DPI 放大绘制
+        dpi = 0
+        try:
+            dpi = int(user32.GetDpiForSystem())
+        except Exception:
+            dpi = 0
+        if not dpi:
+            hdc = user32.GetDC(None)
+            dpi = gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            user32.ReleaseDC(None, hdc)
+        self.dpi = float(dpi or 96)
+
+        hInst = kernel32.GetModuleHandleW(None)
+        cls = "DailyLauncherWndClass"
+
+        wc = WNDCLASSW()
+        self._proc = WNDPROC(self.wndproc)
+        wc.style = 0x0002 | 0x0020  # CS_HREDRAW | CS_VREDRAW
+        wc.lpfnWndProc = self._proc
+        wc.hInstance = hInst
+        wc.hbrBackground = gdi32.CreateSolidBrush(C["bg"])
+        wc.hCursor = load_cursor(32512)
+        wc.lpszClassName = cls
+        user32.RegisterClassW(ctypes.byref(wc))
+
+        # --shot 自检不参与单实例保护：否则程序开着时就没法截图验证界面
+        if getattr(self, "no_mutex", False):
+            ctypes.set_last_error(0)          # 别让上次的 183 残留误判
+        else:
+            kernel32.CreateMutexW(None, False, "DailyLauncherMutex_v1")
+        if ctypes.get_last_error() == 183:
+            old = user32.FindWindowW(cls, None)
+            if old:
+                # 已有实例正常开着：把它提到前面
+                user32.ShowWindow(old, 9)
+                user32.SetForegroundWindow(old)
+                return None
+
+            # 互斥量还在、窗口却找不到 —— 上一次异常退出留下的僵尸进程。
+            # 以前这里直接 return None，用户看到的就是"双击没反应"，很难排查。
+            exe_name = os.path.basename(sys.executable)
+            if getattr(sys, "frozen", False):
+                ans = user32.MessageBoxW(
+                    None,
+                    "检测到上一次的启动器进程还留在后台（没有窗口）。\n\n"
+                    "点「是」结束它并重新打开。",
+                    APP_NAME, 0x00000004 | 0x00000030)  # YESNO | 警告图标
+                if ans != 6:            # IDYES
+                    return None
+                killed = 0
+                for pid, ppid, name in list_processes():
+                    if name.lower() == exe_name.lower() and pid != os.getpid():
+                        rc, _ = run_hidden(["taskkill", "/F", "/PID", str(pid)], 20)
+                        if rc == 0:
+                            killed += 1
+                if killed:
+                    time.sleep(0.6)
+                else:
+                    user32.MessageBoxW(
+                        None,
+                        "清除失败（可能那个进程权限更高）。\n\n"
+                        "请打开任务管理器，结束所有「一键日常启动器.exe」后再试。",
+                        APP_NAME, 0x00000000 | 0x00000030)
+                    return None
+            else:
+                return None
+
+        style = 0x00CF0000 & ~0x00010000 & ~0x00040000  # 去掉最大化/可调边框
+        # 设置页现在有 14 行（3 个分组标题 + 11 行内容），比主界面高不少，
+        # 窗口要留够高度，否则子页面的日志区会被压扁。
+        cw, ch = self.S(760), self.S(780)
+        rect = wt.RECT(0, 0, cw, ch)
+        user32.AdjustWindowRectEx(ctypes.byref(rect), style, False, 0)
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        x = (user32.GetSystemMetrics(0) - w) // 2
+        y = (user32.GetSystemMetrics(1) - h) // 3
+        hwnd = user32.CreateWindowExW(0, cls, APP_NAME, style, x, y, w, h,
+                                      None, None, hInst, None)
+        if not hwnd:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.hwnd = hwnd
+
+        try:
+            self.apply_icon(hwnd)
+        except Exception:
+            pass
+
+        user32.ShowWindow(hwnd, 5)
+        user32.UpdateWindow(hwnd)
+        user32.SetTimer(hwnd, 1, 120, None)
+
+        # 后台摸一遍 MuMu 里到底有几个实例（不卡界面，读完自己刷新）
+        threading.Thread(target=self._discover_instances, daemon=True).start()
+
+        auto = bool(self.cfg.get("auto_start_on_launch", True)) and not self.no_auto
+        if self.first_run:
+            self.emit("log", "还没配置好：已经在设置页了。逐行点右侧「选择」，把 5 个路径指对。")
+            self.emit("log", "下面三行是「MAA/MaaFgo 连哪台实例」和「FGO 版本」，点一下就能换。")
+            self.emit("log", "都指好之后回主界面点「一键启动」—— 启动前会自动自检，"
+                             "哪项没准备好会直接说明原因。")
+        elif auto:
+            self.emit("log", "「打开即启动」已开启：先问一句要不要只跑手游日常，"
+                             "%d 秒不回答就按上次的勾选全部启动。" % PROMPT_SECONDS)
+        else:
+            self.emit("log", "准备就绪：点「一键启动」，或先点掉不想启动的项。")
+        if not self.first_run:
+            self.emit("log", "已记住上次的勾选（%s）—— 想改就点对应那一行，改完自动存"
+                      % self.selection_summary())
+        self.emit("log", "权限：%s" % ("管理员（MuMu 可正常启动）" if is_admin()
+                                      else "普通权限（MuMu 会弹 UAC，可能启动失败）"))
+        self.emit("log", "路径不对就点「设置」换目录（选文件夹，自动找 exe）。")
+        user32.InvalidateRect(hwnd, None, False)
+        if auto:
+            # 先进「要只跑手游日常吗」询问卡；5 秒不回答就走默认一键启动。
+            # 嫌烦可以 config.json 里 night_prompt 设 false，恢复成直接开跑。
+            if self.cfg.get("night_prompt", True):
+                self.prompt = {"until": time.time() + PROMPT_SECONDS,
+                               "left": PROMPT_SECONDS}
+            else:
+                self._auto_pending = True
+                self._auto_at = time.time() + 1.0
+        return hwnd
+
+    def _discover_instances(self):
+        """后台读一次 MuMu 实际实例数：新用户常常只建了 1 个，
+        配置里却躺着 0 和 1，界面得先让人看见这件事。"""
+        try:
+            if sync_instances(self.cfg, self.ui_log):
+                save_config(self.cfg)
+                self.emit("sync")
+        except Exception:
+            log_line("实例发现失败：\n" + traceback.format_exc())
+
+    def run(self):
+        hwnd = self.create()
+        if not hwnd:
+            return 0
+        msg = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        return 0
+
+
+# ----------------------------------------------------------------------------
+# 调试：整屏截图（--shot 输出路径）
+# ----------------------------------------------------------------------------
+def screenshot(path, rect=None):
+    if path.lower().endswith((".py", ".json", ".exe", ".bat")):
+        log_line("拒绝写入 %s（防止覆盖程序文件）" % path)
+        return
+    hdc_screen = user32.GetDC(None)
+    cw = user32.GetSystemMetrics(0)
+    ch = user32.GetSystemMetrics(1)
+    mem = gdi32.CreateCompatibleDC(hdc_screen)
+    bmp = gdi32.CreateCompatibleBitmap(hdc_screen, cw, ch)
+    gdi32.SelectObject(mem, bmp)
+    gdi32.BitBlt(mem, 0, 0, cw, ch, hdc_screen, 0, 0, 0x00CC0020)
+    bi = BITMAPINFOHEADER()
+    bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bi.biWidth = cw
+    bi.biHeight = -ch
+    bi.biPlanes = 1
+    bi.biBitCount = 32
+    buf = ctypes.create_string_buffer(cw * ch * 4)
+    gdi32.GetDIBits(mem, bmp, 0, ch, buf, ctypes.byref(bi), 0)
+    import zlib, struct
+    data = buf.raw
+    row = cw * 4
+    x0, y0, ow, oh = 0, 0, cw, ch
+    if rect:
+        x0, y0, ow, oh = rect
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        ow = min(ow, cw - x0)
+        oh = min(oh, ch - y0)
+    raw = bytearray()
+    for yy in range(y0, y0 + oh):
+        line = data[yy * row + x0 * 4: yy * row + (x0 + ow) * 4]
+        raw.append(0)
+        for xx in range(0, len(line), 4):
+            raw += bytes((line[xx + 2], line[xx + 1], line[xx]))
+
+    def chunk(tag, d):
+        return (struct.pack(">I", len(d)) + tag + d
+                + struct.pack(">I", zlib.crc32(tag + d) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", ow, oh, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+           + chunk(b"IEND", b""))
+    open(path, "wb").write(png)
+
+
+def main():
+    args = sys.argv[1:]
+    shot = None
+    if "--shot" in args:
+        i = args.index("--shot")
+        shot = args[i + 1] if len(args) > i + 1 else os.path.join(APP_DIR, "shot.png")
+
+    # 每次启动都记一行"身份信息"，方便定位 UAC 到底是谁弹的：
+    # 进程链里出现 svchost.exe  => 走的是计划任务（已是管理员，不该再弹 UAC）
+    # 进程链里出现 explorer.exe => 双击启动（普通权限，必要时才自提权）
+    # （onefile 的 exe 会先跑一个引导进程再拉起本体，所以要多追几层）
+    try:
+        _snap = {pid: (ppid, name) for pid, ppid, name in list_processes()}
+        _pid, _chain = os.getpid(), []
+        for _ in range(4):
+            _n = _snap.get(_pid)
+            if not _n:
+                break
+            _chain.append("%s(%d)" % (_n[1], _pid))
+            _pid = _n[0]
+    except Exception:
+        _chain = []
+    log_line("start: pid=%d admin=%s chain=%s args=%s"
+             % (os.getpid(), "yes" if is_admin() else "no",
+                " -> ".join(_chain) or "?", " ".join(sys.argv[1:]) or "(none)"))
+    # 命令行快捷方式：只处理「MuMu模拟器」主窗口，不开界面
+    # （必须和 MuMu 同权限才改得动窗口，所以没提权就先提自己一次）
+    if "--hide-main" in args or "--show-main" in args:
+        want = "--show-main" in args
+        if not is_admin() and "--no-elevate" not in args and elevate_self():
+            return 0
+        set_main_window(want, log_line)
+        return 0
+
+    # 默认不再自提权：MuMuNxMain 直接 spawn 就能跑（VMM 服务由 SCM 管理），
+    # 每次双击弹 UAC 属于多余。确实需要管理员的场景（清 SYSTEM 僵尸进程、
+    # 关模拟器）失败了会在日志里提示，不影响启动。
+    # 想要恢复"开机就提权"：config.json 里把 require_admin 设为 true。
+    if not shot and "--no-elevate" not in args and not is_admin():
+        # 首选：计划任务。它让本程序以最高权限启动且不弹 UAC，
+        # 子进程（MuMuNxDevice）随之继承权限，也就不会各自弹 UAC。
+        if "--no-task" not in args and trigger_task():
+            return 0
+        # 次选：免 UAC 没走成，就自己 runas 提权一次。
+        # 这样子进程（MuMuNxDevice）会继承权限，不会再各自弹 UAC。
+        # 想彻底不弹任何 UAC，先让上面的计划任务生效即可。
+        try:
+            _c0 = load_config() or {}
+        except Exception:
+            _c0 = {}
+        if _c0.get("require_admin", True) or "--elevate" in args:
+            log_line("计划任务免 UAC 未生效，改为自提权（会弹一次 UAC）")
+            if elevate_self():
+                return 0
+            log_line("未获得管理员权限（UAC 被取消），继续以普通权限运行")
+        else:
+            log_line("未提权运行：MuMu 设备进程可能会自己弹 UAC")
+
+    # 已经是管理员：顺手把计划任务对齐到当前 exe（换目录/改名后免 UAC 会失效）
+    if not shot and is_admin() and "--no-task" not in args:
+        ensure_task()
+
+    app = App()
+    if shot or "--no-auto" in args:
+        app.no_auto = True
+    if shot:
+        app.no_mutex = True                # 自检截图不抢单实例锁
+    if shot and "--prompt" in args:
+        # 自检用：--shot 会关掉自动启动，这里手动把询问卡摆出来截图
+        app.prompt = {"until": time.time() + PROMPT_SECONDS, "left": PROMPT_SECONDS}
+    if shot and "--exepick" in args:
+        # 自检用：把「选 exe」卡片摆出来截图
+        app.exepick = {
+            "title": "第 1 步：选脚本 exe",
+            "items": [r"D://game//StarRail.exe", r"D://game//ZZZ.exe",
+                      r"D://game//GenshinImpact.exe", r"D://game//HSR Launcher.exe",
+                      r"D://game//unins000.exe"],
+            "sel": 1,
+            "on_ok": lambda p: None,
+        }
+    if shot and "--page" in args:
+        _i = args.index("--page")
+        if len(args) > _i + 1:
+            _pg = args[_i + 1].lower()
+            if _pg.startswith("set"):
+                app.page = "settings"          # 自检时截设置页
+            elif _pg.startswith("cus"):
+                app.page = "custom"            # 自检时截「主界面项目」页
+            elif _pg.startswith("nig"):
+                app.page = "night"             # 自检时截《今晚的手游日常》页
+    if shot:
+        def later():
+            time.sleep(1.4)
+            try:
+                hwnd = app.hwnd
+                user32.SetWindowPos(hwnd, wt.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+                user32.SetForegroundWindow(hwnd)
+                time.sleep(0.6)
+                r = wt.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(r))
+                cr = wt.RECT()
+                user32.GetClientRect(hwnd, ctypes.byref(cr))
+                log_line("dpi=%s screen=%sx%s win=(%s,%s,%s,%s) client=%sx%s" % (
+                    app.dpi, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1),
+                    r.left, r.top, r.right - r.left, r.bottom - r.top,
+                    cr.right, cr.bottom))
+                screenshot(shot, (r.left, r.top, r.right - r.left, r.bottom - r.top))
+                log_line("screenshot -> %s" % shot)
+            except Exception:
+                log_line("shot fail: " + traceback.format_exc())
+            user32.PostMessageW(app.hwnd, WM_CLOSE, 0, 0)
+        threading.Thread(target=later, daemon=True).start()
+
+    # --test-ui：自检「增加自定义实例」这条链路
+    # 走的是真实代码路径（pick_row → add_custom → pick_folder → 挑 exe 卡片）。
+    if "--test-ui" in args:
+        def tui():
+            for _ in range(80):
+                if app.hwnd:
+                    break
+                time.sleep(0.1)
+            time.sleep(0.8)
+            try:
+                log_line("TEST-UI: 进设置页")
+                app.page = "settings"
+                app.page_stack.append("main")
+                log_line("TEST-UI: 进「主界面项目」页")
+                app.pick_row("custom_page")
+                log_line("TEST-UI: 点「添加」")
+                app.pick_row("c_add")
+                log_line("TEST-UI: 已返回（说明文件夹框被关掉了）")
+            except Exception:
+                log_line("TEST-UI error://n" + traceback.format_exc())
+            try:
+                user32.PostMessageW(app.hwnd, WM_CLOSE, 0, 0)
+            except Exception:
+                pass
+        threading.Thread(target=tui, daemon=True).start()
+
+    return app.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,9 @@
+config.json
+config.json.bak
+*.log
+__pycache__/
+*.py[cod]
+build_tmp/
+dist/
+*.spec
+/*.exe
