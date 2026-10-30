@@ -215,16 +215,12 @@ def main():
         app_dir = build_onedir(py, src, EXE_NAME, icon, manifest, assets,
                                os.path.join(dist, "onedir"),
                                os.path.join(work, "w_onedir"))
-        # 开发用的那份：直接放到工程根的 一键日常启动器/ 里，双击即跑
-        portable_dir = os.path.join(src, EXE_NAME)
-        # 覆盖而不是先删：批量删除会撞上本机的安全策略，而且覆盖也够用了
-        shutil.copytree(app_dir, portable_dir, dirs_exist_ok=True)
+        # 不再往工程根拷一份"开发用的文件夹版"：
+        # 工程根本身就装着一份（exe + _internal），再拷一份会让目录里出现
+        # 两层同名文件夹版，分不清哪个在跑。要试跑就直接跑 dist 里这份。
         make_payload(app_dir, payload, version)
         zip_dir(app_dir, os.path.join(rel, port_name), arc_root=EXE_NAME)
-        print("文件夹版：%s（%.1f MB）"
-              % (portable_dir,
-                 sum(os.path.getsize(os.path.join(r, f))
-                     for r, _d, fs in os.walk(portable_dir) for f in fs) / 1048576.0))
+        print("文件夹版产物：%s（双击可直接试跑，不用装）" % app_dir)
 
     if a.only in ("all", "setup"):
         if not os.path.isfile(payload):
@@ -242,7 +238,18 @@ def main():
         onefile = build_onefile(py, src, EXE_NAME, icon, manifest, assets,
                                 os.path.join(dist, "onefile"),
                                 os.path.join(work, "w_onefile"))
-        shutil.copy2(onefile, os.path.join(src, EXE_NAME + ".exe"))
+        # ⚠ 工程根如果已经是一份"文件夹版"安装（旁边有 _internal），
+        #   绝不能把单文件版覆盖上去 —— 那样 _internal 会变成孤儿，
+        #   下次谁把 exe 单独拷走就报 "Failed to start embedded python
+        #   interpreter!"。这种情况把单文件版放到 release/ 里。
+        root_exe = os.path.join(src, EXE_NAME + ".exe")
+        if os.path.isdir(os.path.join(src, "_internal")):
+            alt = os.path.join(rel, EXE_NAME + "-单文件版.exe")
+            shutil.copy2(onefile, alt)
+            print("注意：工程根是一份文件夹版安装，已跳过覆盖 %s；"
+                  "单文件版放在 %s" % (root_exe, alt))
+        else:
+            shutil.copy2(onefile, root_exe)
         tmp = os.path.join(work, "single")
         os.makedirs(tmp, exist_ok=True)
         shutil.copy2(onefile, os.path.join(tmp, EXE_NAME + ".exe"))
@@ -250,9 +257,10 @@ def main():
         if os.path.isfile(readme):
             shutil.copy2(readme, os.path.join(tmp, "README.md"))
         zip_dir(tmp, os.path.join(rel, single_name))
-        print("单文件版：%s（%.2f MB）"
-              % (os.path.join(src, EXE_NAME + ".exe"),
-                 os.path.getsize(onefile) / 1048576.0))
+        print("单文件版：%.2f MB（发布包 %s）"
+              % (os.path.getsize(onefile) / 1048576.0,
+                 os.path.join(rel, single_name)))
+        print("提示: 换过 manifest 仍发虚就把 exe 改个名字（Windows 按路径缓存激活上下文）")
 
     if not a.keep_work and a.only == "all":
         for d in (dist, work):
