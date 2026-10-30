@@ -26,7 +26,7 @@ import traceback
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.7.1"
+APP_VERSION = "v2.9.0"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -108,6 +108,24 @@ MAX_CUSTOM = 4
 # ----------------------------------------------------------------------------
 # 配置
 # ----------------------------------------------------------------------------
+# 配置结构版本：升级 exe 时靠它判断要不要跑迁移。
+# 只做"加字段/改语义"的小步升级，每次 bump 都要在 migrate_config() 里补一段。
+CONFIG_VERSION = 2
+
+# 「关于」页的信息。全都放进 config.json 的 about 里，
+# 换地址/改署名不用重新打包 exe。
+ABOUT_INFO = {
+    "author": "Cru77z7M",
+    "author_page": "https://space.bilibili.com/5707907",
+    # 项目主页（下载新版都在这里）
+    "project": ("https://github.com/cru77z7m/"
+                "Mobile-game-daily-task-one-click-launcher/releases"),
+    "issues": ("https://github.com/cru77z7m/"
+               "Mobile-game-daily-task-one-click-launcher/issues"),
+    # 留空就不显示这一行
+    "group": "",
+}
+
 DEFAULT_CONFIG = {
     # 首次运行时是空的：靠「首次使用向导」让用户点设置页选目录。
     # 这里绝不能写死作者机器上的路径——把程序发给别人时，那些路径根本不存在，
@@ -196,6 +214,12 @@ DEFAULT_CONFIG = {
     "custom_items": [],
     # 被用户从主界面删掉的项，键是 maaend / maa / maafgo / okww / vm0 / custom:<id>
     "hidden_items": [],
+    # ---- 以下是给「关于」页和升级用的，一般不用动 ----
+    # 配置结构版本号：升级 exe 时靠它判断要不要迁移老配置。
+    "config_version": CONFIG_VERSION,
+    # 上次运行这个配置的软件版本。换新版 exe 后第一跑会在这里记一条日志。
+    "last_run_version": "",
+    "about": dict(ABOUT_INFO),
 }
 
 
@@ -212,14 +236,67 @@ def config_ready(cfg):
     return False
 
 
+def _backup_config(tag):
+    """升级前把老配置留一份，出问题能翻回去"""
+    if not os.path.isfile(CONFIG_PATH):
+        return ""
+    dst = "%s.%s.bak" % (CONFIG_PATH, tag)
+    try:
+        shutil.copy2(CONFIG_PATH, dst)
+        return dst
+    except Exception:
+        return ""
+
+
+def migrate_config(cfg, ver=None):
+    """把老版本的 config.json 补成当前结构
+
+    原则：**只补缺的字段、只纠错的类型，绝不覆盖用户已经填的值**。
+    覆盖 exe 升级时用户唯一不能丢的就是路径和勾选，所以这里一律 setdefault。
+
+    ver 要传**从文件里读到的旧版本号**（不能传 cfg 的，cfg 是拿默认值打底合并出来的，
+    版本号已经是新的了，那样永远判不出"需要迁移"）。
+    返回改动说明列表（空列表 = 不用动）。
+    """
+    notes = []
+    if ver is None:
+        ver = cfg.get("config_version")
+    try:
+        ver = int(ver or 1)
+    except Exception:
+        ver = 1
+    if ver < 1:
+        ver = 1
+
+    # v1 → v2：加「关于」页字段 + 记录上次运行的版本号
+    if ver < 2:
+        about = cfg.get("about")
+        if not isinstance(about, dict):
+            cfg["about"] = dict(ABOUT_INFO)
+        else:
+            for k, v in ABOUT_INFO.items():
+                about.setdefault(k, v)
+        cfg.setdefault("last_run_version", "")
+        notes.append("v1 → v2：补上「关于」页字段")
+        ver = 2
+
+    cfg["config_version"] = CONFIG_VERSION
+    return notes
+
+
 def load_config():
     """读配置：主文件坏了自动退到 .bak，两边都读不了才用默认值
 
     勾选记忆就存在这个文件里，所以读失败等于"用户的选择全丢"，
     必须留一条后路。
+
+    **升级 exe 时这个文件不会被覆盖**：它就躺在 exe 旁边，换版本/换名字
+    都不影响。读进来之后只做「补字段」，用户填的路径和勾选一律保留；
+    真要改结构就先备份成 config.json.v<旧版本>.bak，再按 migrate 的说明补。
     """
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     merged = False
+    data = {}
     for path in (CONFIG_PATH, CONFIG_PATH + ".bak"):
         if not os.path.isfile(path):
             continue
@@ -229,9 +306,20 @@ def load_config():
         except Exception as e:
             log_line("配置读取失败（%s）：%s" % (os.path.basename(path), e))
             continue
+        if not isinstance(data, dict):
+            log_line("配置格式不对（不是 JSON 对象），跳过：%s"
+                     % os.path.basename(path))
+            data = {}
+            continue
         for k, v in data.items():
-            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                cfg[k].update(v)
+            dv = cfg.get(k)
+            if isinstance(dv, dict):
+                if isinstance(v, dict):
+                    # 子项逐个合并：新增字段用默认值，已有的用用户的值
+                    dv.update(v)
+                else:
+                    log_line("配置项 %s 应该是对象，实际是 %s，保留默认值"
+                             % (k, type(v).__name__))
             else:
                 cfg[k] = v
         merged = True
@@ -240,6 +328,23 @@ def load_config():
             save_config(cfg)                 # 顺手把主文件修回来
         break
     if not merged:
+        save_config(cfg)
+        return cfg
+
+    # ---- 从老版本升级上来：先备份原文件，再补字段，用户的值原样保留 ----
+    try:
+        ver_old = int(data.get("config_version") or 1)
+    except Exception:
+        ver_old = 1
+    notes = migrate_config(cfg, ver_old)
+    if notes:
+        bak = _backup_config("v%d" % ver_old)
+        for n in notes:
+            log_line("配置升级：" + n)
+        if bak:
+            log_line("老配置已备份：%s" % os.path.basename(bak))
+        save_config(cfg)
+    elif cfg.get("config_version") != ver_old:
         save_config(cfg)
     return cfg
 
@@ -283,6 +388,21 @@ def log_line(msg):
                 f.write(line + "\n")
     except Exception:
         pass
+
+
+def open_url(url):
+    """用系统默认浏览器打开一个网址；失败返回错误串"""
+    if not url:
+        return "没有链接"
+    try:
+        # ShellExecuteW 的 "open" 会交给默认浏览器，比 webbrowser 模块可靠
+        rc = shell32.ShellExecuteW(None, "open", url, None, None, 1)
+        # ShellExecuteW 返回值 > 32 表示成功
+        if int(rc or 0) <= 32:
+            return "系统拒绝了打开请求（%s）" % rc
+        return ""
+    except Exception as e:
+        return "%s: %s" % (type(e).__name__, e)
 
 
 # ----------------------------------------------------------------------------
@@ -2961,6 +3081,8 @@ RAINBOW = {
     "disabled": "#B7BEC9",
     "logbg": "#FBFCFD",
     "iconbg": "#EEF2F8",     # 行图标背后的圆角底板
+    "panel": "#F7F8FA",      # 关于页里的信息块底色
+    "panel_line": "#EDF0F5",  # 信息块的描边
 }
 C = {k: rgb(v) for k, v in RAINBOW.items()}
 
@@ -3212,11 +3334,13 @@ class App:
         self.maafgo_on = bool(self.cfg.get("maafgo", {}).get("enabled", True))
         self.okww_on = bool(self.cfg.get("okww", {}).get("enabled", True))
         self.maaend_on = bool(self.cfg.get("maaend", {}).get("enabled", False))
-        self.page = "main"          # main | settings | custom | night
+        self.page = "main"          # main | settings | custom | night | about
         self.sub_page = False       # 是否处于子页面（子页面只有「返回」可点）
         # 页面栈：记录从哪儿来，返回时按栈回退
         #   main → settings → custom/night
         self.page_stack = []
+        # 关于页的排版缓存（layout 里算，paint / hit 共用）
+        self._about = None
         # 「选 exe」卡片：{"items": [...], "sel": 选中下标, "title": 标题, "on_ok": 回调}
         self.exepick = None
         # 开机的「只跑手游日常吗」询问：{"until": 到点时间戳, "left": 剩余秒}
@@ -3226,6 +3350,12 @@ class App:
         # 路径还没指过（或中途被清空）：直接进设置页，绝不自动开跑。
         # 默认配置里没有任何真实路径，自动跑只会满屏「找不到 xxx.exe」。
         self.first_run = not config_ready(self.cfg)
+        # 换新版 exe 后第一跑：记下上一版，日志里提示一句"配置沿用了"。
+        # （配置就在 exe 旁边，覆盖 exe 不会碰它，这里只是个凭据）
+        self.prev_version = str(self.cfg.get("last_run_version") or "")
+        if self.prev_version != APP_VERSION:
+            self.cfg["last_run_version"] = APP_VERSION
+            save_config(self.cfg)
         if self.first_run:
             self.page_stack.append("main")
             self.page = "settings"
@@ -3359,9 +3489,9 @@ class App:
         card_t = 82
         # 子页面（设置 / 自定义 / 夜间）行数多，用矮一点的行高，日志区才不会被挤没。
         # 三个子页面统一行高，各分组内部密度才一致（之前 ①组 38、②③组 32，看着参差）。
-        row_h = {"settings": 34, "custom": 34, "night": 34}.get(self.page, 58)
+        row_h = {"settings": 33, "custom": 33, "night": 33}.get(self.page, 58)
         self.row_h_logical = row_h
-        self.sub_page = self.page in ("settings", "custom", "night")
+        self.sub_page = self.page in ("settings", "custom", "night", "about")
         items = self.current_rows()
 
         # 行高可变：分组标题行矮一点，且和上一组拉开距离
@@ -3369,20 +3499,23 @@ class App:
         y = card_t + 6
         for it in items:
             if it.get("key", "").startswith("sec:"):
-                y += 7              # 分组标题前面留一点空隙，视觉上分组清楚
-                rh = int(it.get("h") or 26)
+                y += 6              # 分组标题前面留一点空隙，视觉上分组清楚
+                rh = int(it.get("h") or 24)
             else:
                 rh = int(it.get("h") or row_h)
             rows.append((it, y, rh))
             y += rh
         card_b = y + 6
+        if self.page == "about":
+            # 关于页是自绘的整块，占满到按钮行之前，不留日志区
+            card_b = H - 40 - 46 - 14
 
-        by = card_b + 14
+        by = card_b + 12
         b_h = 46
         # 按钮从左到右排：宽 200 / 118 / 118 / 104 / 110，间距 12 或 10
         x = pad
-        log_top = by + b_h + 14
-        log_bot = max(log_top, H - 40)      # 子页面行多，日志区可能被压成 0 高
+        log_top = by + b_h + 12
+        log_bot = max(log_top, H - 38)      # 子页面行多，日志区可能被压成 0 高
         rects = {
             "title": (pad, 16, W - pad, 46),
             "sub": (pad, 46, W - pad, 68),
@@ -3392,7 +3525,7 @@ class App:
         }
         for i, (key, bw) in enumerate(
                 (("start", 200), ("cancel", 118), ("shutdown", 118),
-                 ("edit", 104), ("mainwin", 110))):
+                 ("edit", 104), ("night", 110))):
             rects[key] = (x, by, x + bw, by + b_h)
             x += bw + (12 if i == 0 else 10)
 
@@ -3401,6 +3534,12 @@ class App:
         all_w = 96
         xr = W - pad
         rects["all"] = (xr - all_w, chip_t, xr, chip_b)
+
+        # 关于页：自绘整块，顺手把可点的链接矩形登记进来（逻辑坐标，后面统一乘 kk）
+        if self.page == "about":
+            self._about = self.about_geom((pad, card_t, W - pad, card_b))
+            for i, (url, lr) in enumerate(self._about[2]):
+                rects["about_link:%d" % i] = tuple(lr)
 
         # 「夜间启动」询问卡片：模态盖住整个客户区，居中一块卡片 + 两个按钮
         if self.prompt:
@@ -3452,6 +3591,8 @@ class App:
         R["row_h"] = int(round(row_h * kk))
 
     def current_rows(self):
+        if self.page == "about":
+            return []                   # 关于页是自绘整块，不用行列表
         if self.page == "custom":
             return self.custom_rows()
         if self.page == "night":
@@ -3459,6 +3600,172 @@ class App:
         if self.page == "settings":
             return self.settings_rows()
         return self.instance_rows()
+
+    # ---------- 关于页 ----------
+    @staticmethod
+    def _short_url(u):
+        """长网址压短一点，点得着就行；点一下会用浏览器打开完整地址"""
+        u = (u or "").strip()
+        for pre in ("https://", "http://"):
+            if u.startswith(pre):
+                u = u[len(pre):]
+        return u.rstrip("/")
+
+    def about_blocks(self):
+        """关于页要展示的几块内容：[(块标题, [(标签, 值, 链接), ...]), ...]
+
+        作者名/主页/仓库都从 config.json 的 about 里读，换地址不用重打包。
+        """
+        ab = self.cfg.get("about")
+        if not isinstance(ab, dict):
+            ab = {}
+
+        def g(key, default=""):
+            v = ab.get(key)
+            return (default if v is None else str(v)).strip()
+
+        author = g("author", ABOUT_INFO["author"]) or "未填写"
+        author_page = g("author_page", ABOUT_INFO["author_page"])
+        project = g("project", ABOUT_INFO["project"])
+        issues = g("issues", ABOUT_INFO["issues"])
+        group = g("group")
+
+        lines = [("作者", author, None)]
+        if group:
+            lines.append(("交流群", group, None))
+        if author_page:
+            lines.append(("作者主页", self._short_url(author_page), author_page))
+        if project:
+            lines.append(("项目与下载", self._short_url(project), project))
+        if issues:
+            lines.append(("问题反馈", self._short_url(issues), issues))
+
+        return [
+            ("作者与项目", lines),
+            ("使用声明", [
+                ("免费使用", "完全免费，无广告、无内购、不收费，也不收赞助", None),
+                ("非商业用途", "仅供个人自用；请勿转卖、代练代肝、随盘附赠等任何盈利场景", None),
+                ("只跑本机", "只操作本机的模拟器和脚本，不联网、不上传任何信息", None),
+                ("按原样给", "不提供任何担保，用出问题（账号/数据）需自行承担", None),
+                ("转载", "随便转载，但请保留作者署名和项目地址，别删掉当自己的", None),
+            ]),
+            ("第三方组件", [
+                ("", "MAA / MaaEnd / MaaFgo / ok-ww / MuMu 版权归各自作者，本程序只做串联调用", None),
+            ]),
+        ]
+
+    def about_geom(self, card):
+        """关于页排版（逻辑像素）：返回 (头部矩形, 各块, 可点链接)
+
+        绘制和命中都吃这一份数字，避免"看着在这儿却点不着"。
+        """
+        x1, y1, x2, y2 = card
+        cx = (x1 + x2) / 2.0
+        pad = 26
+        av = 64
+        g = {"avatar": (cx - av / 2.0, y1 + 22, cx + av / 2.0, y1 + 22 + av)}
+        g["name"] = (x1 + pad, g["avatar"][3] + 10, x2 - pad, g["avatar"][3] + 40)
+        g["ver"] = (x1 + pad, g["name"][3], x2 - pad, g["name"][3] + 18)
+        g["tag"] = (x1 + pad, g["ver"][3], x2 - pad, g["ver"][3] + 20)
+
+        bx1, bx2 = x1 + pad, x2 - pad
+        y = g["tag"][3] + 14
+        blocks, links = [], []
+        for title, lines in self.about_blocks():
+            h = 28 + len(lines) * 21 + 12
+            rect = (bx1, y, bx2, y + h)
+            rows = []
+            ly = y + 28
+            for label, value, url in lines:
+                lr = (bx1 + 20, ly, bx2 - 16, ly + 21)
+                rows.append((label, value, url, lr))
+                if url:
+                    links.append((url, lr))
+                ly += 21
+            blocks.append((title, rect, rows))
+            y += h + 12
+
+        # 底部一行：配置文件真实路径（点一下打开）。
+        # 顺便在界面上把"覆盖 exe 升级不丢配置"这件事讲明白。
+        fy = y2 - 32
+        g["cfg"] = (x1 + pad, fy - 4, x2 - pad, fy + 20)
+        links.append(("file:" + CONFIG_PATH, g["cfg"]))
+        return g, blocks, links
+
+    def draw_about(self, hdc, card):
+        """关于页：头像 + 名字 + 版本 + 一句话 + 几块说明（自绘，跟行列表无关）"""
+        S = self.S
+        if not getattr(self, "_about", None):
+            return
+        g, blocks, links = self._about
+
+        # 头像：白底圆角块 + 程序图标
+        ax1, ay1, ax2, ay2 = g["avatar"]
+        self.fill_round(hdc, (S(ax1) - S(2), S(ay1) + S(2), S(ax2) + S(2), S(ay2) + S(4)),
+                        16, rgb("#DCE2EC"))
+        self.fill_round(hdc, (S(ax1), S(ay1), S(ax2), S(ay2)), 14,
+                        C["card"], C["border"], 1.2)
+        draw_icon(hdc, "launcher", S(ax1 + 9), S(ay1 + 9), S(46))
+
+        self.text(hdc, APP_TITLE, tuple(S(v) for v in g["name"]),
+                  C["text"], self.font(19, True),
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        self.text(hdc, "%s · 单文件 exe · 双击即用 · 不写注册表" % APP_VERSION,
+                  tuple(S(v) for v in g["ver"]), C["muted"], self.font(10.5),
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        self.text(hdc, "按顺序拉起 MaaEnd → MuMu 实例 → MAA → MaaFgo → ok-ww，全程不弹 UAC",
+                  tuple(S(v) for v in g["tag"]), C["text2"], self.font(11),
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX)
+
+        for title, rect, rows in blocks:
+            self.fill_round(hdc, tuple(S(v) for v in rect), 10,
+                            C["panel"], C["panel_line"])
+            # 标题左边一根小竖条，代替图标
+            th = 12
+            ty = (rect[1] + 14, rect[1] + 14 + th)
+            self.fill_round(hdc, (S(rect[0] + 20), S(ty[0]),
+                                  S(rect[0] + 23), S(ty[1])), 1.5, C["accent"])
+            self.text(hdc, title,
+                      (S(rect[0] + 32), S(rect[1] + 8), S(rect[2] - 16), S(rect[1] + 32)),
+                      C["text"], self.font(11.5, True),
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+            for label, value, url, lr in rows:
+                lx = lr[0]
+                if label:
+                    self.dot(hdc, S(lx - 6), S((lr[1] + lr[3]) / 2.0), 1.6, C["muted"])
+                    self.text(hdc, label, (S(lx), S(lr[1]), S(lx + 70), S(lr[3])),
+                              C["muted"], self.font(10.5),
+                              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+                    vx1 = lx + 72
+                else:
+                    vx1 = lx
+                hot = url and any(
+                    self.hover == "about_link:%d" % i
+                    for i, (u, r) in enumerate(links) if u == url and r == lr)
+                col = (C["accent_d"] if hot else C["accent"]) if url else C["text2"]
+                self.text(hdc, value, (S(vx1), S(lr[1]), S(lr[2]), S(lr[3])),
+                          col, self.font(10.5, bool(url)),
+                          DT_LEFT | DT_SINGLELINE | DT_VCENTER
+                          | DT_END_ELLIPSIS | DT_NOPREFIX)
+
+        # 底部的配置文件路径行
+        cr = g.get("cfg")
+        if cr:
+            hot = any(self.hover == "about_link:%d" % i
+                      for i, (u, r) in enumerate(links)
+                      if u.startswith("file:") and r == cr)
+            self.text(hdc, "配置文件", (S(cr[0]), S(cr[1]), S(cr[0] + 66), S(cr[3])),
+                      C["muted"], self.font(10.5),
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+            hint = "（就在 exe 旁边，覆盖 exe 升级不会丢）"
+            self.text(hdc, CONFIG_PATH, (S(cr[0] + 68), S(cr[1]), S(cr[2] - 190), S(cr[3])),
+                      C["accent_d"] if hot else C["accent"], self.font(10.5),
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER
+                      | DT_END_ELLIPSIS | DT_NOPREFIX)
+            self.text(hdc, hint, (S(cr[2] - 186), S(cr[1]), S(cr[2]), S(cr[3])),
+                      C["muted"], self.font(9.5),
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
 
     def settings_rows(self):
         """设置页：三大块 —— ① 各脚本/模拟器路径 ② 模拟器实例与版本 ③ 其它
@@ -3469,14 +3776,14 @@ class App:
         cfg = self.cfg
         out = [{
             "key": "sec:path",
-            "h": 26,
+            "h": 24,
             "title": "① 选择各实例的路径",
             "sub": "选各个模拟器 / 脚本所在的文件夹（点右侧「选择」）",
         }]
         out.append({
             "key": "mumu",
             "icon": "mumu",
-            "h": 34,
+            "h": 33,
             "title": "MuMu 模拟器目录",
             "sub": cfg.get("mumu_root") or "未设置（点右侧「选择」）",
         })
@@ -3488,14 +3795,14 @@ class App:
             out.append({
                 "key": key,
                 "icon": key,
-                "h": 34,
+                "h": 33,
                 "title": "%s · %s" % (name, game),
                 "sub": p or "未设置（点右侧「选择」）",
             })
 
         out.append({
             "key": "sec:inst",
-            "h": 26,
+            "h": 24,
             "title": "② 模拟器实例与游戏版本",
             "sub": "决定脚本连哪台模拟器、用哪个服（点右侧按钮切换）",
         })
@@ -3531,7 +3838,7 @@ class App:
 
         out.append({
             "key": "sec:more",
-            "h": 26,
+            "h": 24,
             "title": "③ 其它",
             "sub": "主界面项目、每日手游清单、原始配置文件",
         })
@@ -3556,9 +3863,26 @@ class App:
         out.append({
             "key": "config",
             "icon": "cfg",
-            "h": 34,
+            "h": 33,
             "title": "config.json",
             "sub": "点这一行用记事本打开（超时、实例名、开关都在这）",
+        })
+
+        out.append({
+            "key": "sec:about",
+            "h": 24,
+            "title": "④ 关于",
+            "sub": "作者、项目主页、版本与使用声明",
+        })
+        ab = cfg.get("about") if isinstance(cfg.get("about"), dict) else {}
+        author = (ab.get("author") or "").strip() or "未填写"
+        out.append({
+            "key": "about_page",
+            "icon": "launcher",
+            "h": 33,
+            "title": "关于本软件",
+            "sub": "%s · 免费使用 · 非商业用途 · 作者 %s" % (APP_VERSION, author),
+            "chip": "查看",
         })
         return out
 
@@ -3699,21 +4023,38 @@ class App:
         return list(items)
 
     def night_keep(self):
-        """《今晚的手游日常》实际会启动哪些键
+        """《今晚的手游日常》实际会启动哪些键（这一个函数说了算）
 
-        勾了脚本就自动带上它用的模拟器实例 —— 不带的话脚本起来也连不上，
-        等于白开。实例号跟着设置页里 MAA / MaaFgo 配的那台走。
+        规则：
+          - 设置里勾了谁就带谁（含用户自己加的项目 `custom:<id>`）；
+          - 勾了 MAA / MaaFgo 就自动带上它绑定的那台模拟器实例 ——
+            不带的话脚本起来也连不上，等于白开；
+          - 实例已经被删掉的就丢掉。
+
+        ⚠ 历史上这里曾有**两个同名定义**，后一个（返回实例号列表）把
+        前一个覆盖了，于是「勾了鸣潮也只跑 MAA+MaaFgo」。改这块前先确认
+        全文件只有这一个 `def night_keep`。
         """
-        items = set(self.night_items())
-        keys = set(k for k in items if not k.startswith("custom:"))
+        keys = []
+        for k in self.night_items():
+            if not isinstance(k, str):
+                continue
+            if k.startswith("vm"):
+                continue                  # 实例统一在下面按绑定关系补，避免重复
+            if k not in keys:
+                keys.append(k)
+        vms = set()
         if "maa" in keys:
-            keys.add("vm%d" % int(self.cfg.get("maa", {}).get("instance_index", 0)))
+            vms.add(int(self.cfg.get("maa", {}).get("instance_index", 0)))
         if "maafgo" in keys:
-            keys.add("vm%d" % int(self.cfg.get("maafgo", {}).get("emulator_index", 1)))
-        for k in list(keys):
-            if k.startswith("vm") and int(k[2:]) not in self._inst_indexes():
-                keys.discard(k)
-        return sorted(keys)
+            vms.add(int(self.cfg.get("maafgo", {}).get("emulator_index", 1)))
+        idxs = self._inst_indexes()
+        for v in sorted(vms):
+            if v in idxs:
+                k = "vm%d" % v
+                if k not in keys:
+                    keys.append(k)
+        return keys
 
     def night_desc(self):
         """《今晚的手游日常》包含哪些 —— 弹窗里那一行短描述"""
@@ -3751,7 +4092,7 @@ class App:
             "key": "n_hint",
             "icon": "cfg",
             "title": "一天要清两次日常的手游",
-            "sub": "勾上的算《今晚的手游日常》—— 开机弹窗里点「否」就只启动它们",
+            "sub": "勾上的算《今晚的手游日常》—— 开机弹窗点「否」，或主界面按「夜间启动」，都只跑它们",
             "chip": "说明",
         }]
         for k, label in self.NIGHT_SCRIPTS:
@@ -3845,11 +4186,13 @@ class App:
             if self.first_run:
                 sub = "%s · 还没配置：先在「① 选择各实例的路径」里逐行点「选择」指路径" % APP_VERSION
             else:
-                sub = "%s · 设置页：① 选路径 ② 换实例/版本 ③ 其它" % APP_VERSION
+                sub = "%s · 设置页：① 选路径 ② 换实例/版本 ③ 其它 ④ 关于" % APP_VERSION
         elif self.page == "custom":
             sub = "%s · 二级 · 主界面项目：加自定义实例 / 删掉不用的行 / 恢复默认" % APP_VERSION
         elif self.page == "night":
             sub = "%s · 二级 · 《今晚的手游日常》= 一天要清两次日常的手游，勾在这里" % APP_VERSION
+        elif self.page == "about":
+            sub = "%s · 二级 · 关于本软件：作者、项目主页、使用声明" % APP_VERSION
         else:
             # 副标题按当前可见的项生成（用户可能删过行）
             hid = self.hidden()
@@ -3868,17 +4211,21 @@ class App:
                   C["muted"], self.font(12))
 
         self.fill_round(mem, R["card"], 12, C["card"], C["border"])
-        rows = R["rows"]
-        for i, (item, y, rh) in enumerate(rows):
-            self.draw_row(mem, item, y, R["card"][0], R["card"][2], rh)
-            if i < len(rows) - 1:
-                self.hline(mem, R["card"][0] + self.S(22), R["card"][2] - self.S(22),
-                           y + rh - self.S(3), C["line"])
+        if self.page == "about":
+            self.draw_about(mem, R["card"])
+        else:
+            rows = R["rows"]
+            for i, (item, y, rh) in enumerate(rows):
+                self.draw_row(mem, item, y, R["card"][0], R["card"][2], rh)
+                if i < len(rows) - 1:
+                    self.hline(mem, R["card"][0] + self.S(22), R["card"][2] - self.S(22),
+                               y + rh - self.S(3), C["line"])
 
         if self.page == "main":
             self.draw_shortcuts(mem)
         self.draw_buttons(mem)
-        self.draw_log(mem, R["logcard"])
+        if self.page != "about":          # 关于页占满整块，没有日志区
+            self.draw_log(mem, R["logcard"])
         self.text(mem, self.status, R["statusbar"], C["muted"], self.font(11))
 
         if self.prompt:                     # 模态询问要盖在一切之上
@@ -4270,7 +4617,8 @@ class App:
         in_set = self.sub_page
         if in_set:
             # 二级页的返回目标是「一级设置页」，一级设置页的返回目标是主界面
-            blabel = "← 返回设置" if self.page in ("custom", "night") else "← 返回"
+            blabel = ("← 返回设置" if self.page in ("custom", "night", "about")
+                      else "← 返回")
             bgc = C["accent_l"] if self.hover == "edit" else C["ghost_bg"]
             self.fill_round(hdc, r, 9, bgc, C["accent"], 1.2)
             self.text(hdc, blabel, r, C["accent"], self.font(12, True),
@@ -4281,22 +4629,18 @@ class App:
             self.text(hdc, "设置", r, C["text2"], self.font(12),
                       DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
 
-        # 显示 / 隐藏「MuMu模拟器」主窗口（实例开着也能随时切换）
-        r = R["mainwin"]
-        label = "隐藏 MuMu" if self.main_vis_cached() else "显示 MuMu"
-        bgc = (C["ghost_bg_h"] if (self.hover == "mainwin" and not self.sub_page)
-               else C["ghost_bg"])
-        self.fill_round(hdc, r, 9, bgc, C["border"], 1.2)
-        self.text(hdc, label, r, C["text2"], self.font(12),
-                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-
-    def main_vis_cached(self):
-        """主窗口是否可见（1 秒缓存，避免每次重绘都枚举窗口）"""
-        now = time.time()
-        if now - getattr(self, "_main_vis_at", 0) > 1.0:
-            self._main_vis = main_window_visible()
-            self._main_vis_at = now
-        return getattr(self, "_main_vis", False)
+        # 夜间启动：等价于开机弹窗里点「否」——只跑《今晚的手游日常》。
+        # 启动中 / 二级页里不可用（灰掉）。
+        r = R["night"]
+        if self.busy or self.sub_page:
+            self.fill_round(hdc, r, 9, C["card"], C["border"], 1.2)
+            self.text(hdc, "夜间启动", r, C["disabled"], self.font(12),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        else:
+            bgc = C["accent_l"] if self.hover == "night" else C["ghost_bg"]
+            self.fill_round(hdc, r, 9, bgc, C["accent"], 1.2)
+            self.text(hdc, "夜间启动", r, C["accent"], self.font(12, True),
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
 
     def draw_log(self, hdc, rect):
         self.fill_round(hdc, rect, 10, C["logbg"], C["border"])
@@ -4336,14 +4680,19 @@ class App:
                 if a <= y <= b:
                     return "expick_row:%d" % idx
             return "expick_mask"
-        # 设置页 / 自定义页里只有「返回」可用，其余按钮是灰的，不参与命中
-        keys = (("edit",) if self.page in ("settings", "custom", "night")
-                else ("start", "cancel", "shutdown", "edit", "mainwin",
+        # 设置页 / 自定义页 / 关于页里只有「返回」可用，其余按钮是灰的，不参与命中
+        keys = (("edit",) if self.page in ("settings", "custom", "night", "about")
+                else ("start", "cancel", "shutdown", "edit", "night",
                       "all"))
         for key in keys:
             r = R.get(key)
             if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
                 return key
+        # 关于页的链接行：整行都能点，比只点文字好点
+        if self.page == "about":
+            for k, r in R.items():
+                if k.startswith("about_link:") and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                    return k
         rh = R.get("row_h", self.S(56))
         prefix = "chk:" if self.page == "main" else "set:"
         for item, ry, rowh in R.get("rows", []):
@@ -4417,23 +4766,23 @@ class App:
                 and self.maaend_on and self.maa_on
                 and self.maafgo_on and self.okww_on)
 
-    def night_keep(self):
-        """夜间模式要保留的实例号（MAA 和 MaaFgo 各一台，可能是同一台）"""
-        a = int(self.cfg.get("maa", {}).get("instance_index", 0))
-        f = int(self.cfg.get("maafgo", {}).get("emulator_index", 1))
-        keep = []
-        for i in (a, f):
-            if i in self._inst_indexes() and i not in keep:
-                keep.append(i)
-        return keep
+    def night_start(self):
+        """只跑《今晚的手游日常》—— 开机弹窗的「否」和主界面「夜间启动」共用
 
-    def night_keys(self):
-        """夜间模式只跑哪几项：MAA + MaaFgo，以及它们各自绑定的实例
-
-        「每日要清两次体力」的就是这两个手游；终末地和鸣潮是 PC 端、
-        一天一次，晚上可以不跑。
+        只影响这一轮：`run_only` 交给 Runner 当白名单用，**不动勾选、
+        不写 config.json**，下次打开还是原来的选择。
         """
-        return ["maa", "maafgo"] + ["vm%d" % i for i in self.night_keep()]
+        keys = self.night_keep()
+        if not keys:
+            self.status = "《今晚的手游日常》里一个项目都没选"
+            self.ui_log("「夜间启动」没跑：设置 → ③ 其它 →《今晚的手游日常》里"
+                        "先勾上要跑的项目。")
+            return
+        self.run_only = set(keys)
+        self.do("start")            # 内部会把 run_only 交给 Runner 再清空
+        self.status = "只启动《今晚的手游日常》"
+        self.ui_log("《今晚的手游日常》：只启动 %s；其余项本次跳过（勾选未改动）"
+                    % "、".join(self._night_label(k) for k in keys))
 
     def answer_prompt(self, night):
         """回答开机的「按上次的勾选全部一键启动吗」
@@ -4448,12 +4797,8 @@ class App:
             self.status = "已取消：这次不启动任何东西"
             self.ui_log("已取消启动：什么都没开。下次打开还会再问一次。")
             return
-        keys = self.night_keys()
-        self.run_only = set(keys)
-        self.status = "只启动《今晚的手游日常》"
-        self.ui_log("《今晚的手游日常》：只启动 %s；其余项本次跳过（勾选未改动）"
-                    % "、".join(self._night_label(k) for k in keys))
-        self.do("start")
+        # 和「夜间启动」按钮同一条路
+        self.night_start()
 
     def _tick_prompt(self):
         """开机询问的倒计时：到点就当作"不回答"，按上次的勾选全部启动"""
@@ -4719,6 +5064,12 @@ class App:
             self.status = "二级 · 《今晚的手游日常》：勾哪些项目算"
             user32.InvalidateRect(self.hwnd, None, False)
             return
+        if kind == "about_page":
+            self.page_stack.append("settings")
+            self.page = "about"
+            self.status = "二级 · 关于本软件：免费使用、非商业用途"
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
         if kind == "c_add":
             self.add_custom()
             return
@@ -4780,6 +5131,29 @@ class App:
                 self.exepick["sel"] = idx
                 user32.InvalidateRect(self.hwnd, None, False)
             return
+        if key.startswith("about_link:"):
+            # 关于页的链接：http(s) 交给默认浏览器；file: 是配置文件，用记事本打开
+            try:
+                url = self._about[2][int(key.split(":")[1])][0]
+            except Exception:
+                url = ""
+            if url.startswith("file:"):
+                target = url[5:]
+                try:
+                    subprocess.Popen(["notepad.exe", target], creationflags=CREATE_NO_WINDOW)
+                    self.status = "已用记事本打开 config.json"
+                except Exception as e:
+                    self.ui_log("打开配置失败：%s" % e)
+                user32.InvalidateRect(self.hwnd, None, False)
+                return
+            err = open_url(url)
+            if err:
+                self.ui_log("打开链接失败：%s（%s）" % (err, url))
+            else:
+                self.status = "已在浏览器打开：%s" % self._short_url(url)
+                self.ui_log("打开链接：%s" % url)
+                user32.InvalidateRect(self.hwnd, None, False)
+            return
         if key == "start":
             if not self.busy:
                 self._persist_selection()      # 点启动前再存一次，确保下次能记住
@@ -4797,15 +5171,10 @@ class App:
         elif key == "shutdown":
             if not self.busy:
                 threading.Thread(target=self.runner.shutdown_all, daemon=True).start()
-        elif key == "mainwin":
-            # 主窗口在就隐藏，不在就显示；顺手刷新一下缓存，按钮文字立刻变
-            vis = main_window_visible()
-            self._main_vis = vis
-            self._main_vis_at = time.time()
-            set_main_window(not vis, self.ui_log)
-            self._main_vis = main_window_visible()
-            self._main_vis_at = time.time()
-            user32.InvalidateRect(self.hwnd, None, False)
+        elif key == "night":
+            if self.busy:
+                return
+            self.night_start()
         elif key == "all":
             if self.busy:
                 return
@@ -5054,6 +5423,10 @@ class App:
         threading.Thread(target=self._discover_instances, daemon=True).start()
 
         auto = bool(self.cfg.get("auto_start_on_launch", True)) and not self.no_auto
+        if self.prev_version and self.prev_version != APP_VERSION:
+            # 覆盖 exe 升级上来：路径/勾选全在 config.json 里，原样沿用
+            self.emit("log", "已从 %s 升级到 %s：路径、勾选、自定义项都沿用，"
+                             "不用重新设置。" % (self.prev_version, APP_VERSION))
         if self.first_run:
             self.emit("log", "还没配置好：已经在设置页了。逐行点右侧「选择」，把 5 个路径指对。")
             self.emit("log", "下面三行是「MAA/MaaFgo 连哪台实例」和「FGO 版本」，点一下就能换。")
@@ -5243,6 +5616,9 @@ def main():
                 app.page = "custom"            # 自检时截「主界面项目」页
             elif _pg.startswith("nig"):
                 app.page = "night"             # 自检时截《今晚的手游日常》页
+            elif _pg.startswith("abo"):
+                app.page = "about"             # 自检时截「关于」页
+                app.page_stack.append("settings")
     if shot:
         def later():
             time.sleep(1.4)
