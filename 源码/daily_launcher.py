@@ -599,8 +599,11 @@ def _http_query(req, what):
     return buf.value
 
 
-def _http_open(url, timeout=15):
-    """发 GET、等响应头。返回 (req, [句柄...])，调用方负责关"""
+def _http_open(url, timeout=15, extra_headers=None):
+    """发 GET、等响应头。返回 (req, [句柄...])，调用方负责关
+
+    extra_headers：额外的请求头（下载断点续传要带 Range），换行自己拼好传进来。
+    """
     m = re.match(r"(?i)(https?)://([^/:]+)(?::(\d+))?(/.*)?$", url or "")
     if not m:
         raise RuntimeError("地址不对：%s" % url)
@@ -630,6 +633,8 @@ def _http_open(url, timeout=15):
                                  ctypes.byref(policy), ctypes.sizeof(policy))
         headers = ("User-Agent: %s\r\nAccept: application/vnd.github+json\r\n"
                    % UPDATE_UA)
+        if extra_headers:
+            headers += extra_headers.rstrip("\r\n") + "\r\n"
         if not winhttp.WinHttpSendRequest(req, headers, -1, None, 0, 0, 0):
             raise OSError("发不出请求（err=%s）" % ctypes.get_last_error())
         if not winhttp.WinHttpReceiveResponse(req, None):
@@ -735,25 +740,53 @@ def find_latest_release(timeout=8):
 
 
 
-def download_file(url, dst, on_progress=None, timeout=20):
-    """流式下载，每 64KB 回调一次 (已下, 总大小)；总大小未知时给 0"""
-    req, handles = _http_open(url, timeout)
-    got = 0
-    try:
+def download_file(url, dst, on_progress=None, timeout=60, retries=4):
+    """流式下载，每 64KB 回调一次 (已下, 总大小)；总大小未知时给 0
+
+    为什么要断点续传：GitHub 在国内经常 20~40 KB/s，10 MB 的安装程序要下好几分钟，
+    中途一次卡顿（WinHTTP 读超时 err=12002）就得从头再来。这里每次失败后用
+    Range 头接着下，最多试 retries 次；服务器不认 Range（返回 200）就老实重下。
+    """
+    got = os.path.getsize(dst) if os.path.isfile(dst) else 0
+    last = None
+    for attempt in range(retries + 1):
         try:
-            total = int(_http_query(req, WINHTTP_QUERY_CONTENT_LENGTH) or 0)
-        except Exception:
-            total = 0
-        with open(dst, "wb") as f:
-            for chunk in _http_chunks(req):
-                f.write(chunk)
-                got += len(chunk)
-                if on_progress:
-                    on_progress(got, total)
-    finally:
-        for h in handles:
-            winhttp.WinHttpCloseHandle(h)
-    return got
+            extra = ("Range: bytes=%d-" % got) if got else None
+            req, handles = _http_open(url, timeout, extra)
+            try:
+                code = 0
+                try:
+                    code = int(_http_query(req, WINHTTP_QUERY_STATUS_CODE) or 0)
+                except Exception:
+                    code = 0
+                try:
+                    clen = int(_http_query(req, WINHTTP_QUERY_CONTENT_LENGTH) or 0)
+                except Exception:
+                    clen = 0
+                if got and code != 206:
+                    # 服务器没理我们的 Range：那就只能整份重下
+                    got = 0
+                total = (got + clen) if clen else 0
+                with open(dst, "ab" if got else "wb") as f:
+                    for chunk in _http_chunks(req):
+                        f.write(chunk)
+                        got += len(chunk)
+                        if on_progress:
+                            on_progress(got, total)
+            finally:
+                for h in handles:
+                    winhttp.WinHttpCloseHandle(h)
+            return got
+        except HttpError as e:
+            # 416 = 服务器说你已经下完了（Range 起点越界），当成成功
+            if getattr(e, "code", 0) == 416 and got:
+                return got
+            last = e
+        except Exception as e:
+            last = e
+        if attempt < retries:
+            time.sleep(1.5 * (attempt + 1))
+    raise last if last else OSError("下载失败")
 
 
 def extract_new_exe(zip_path, out_dir):
