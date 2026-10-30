@@ -6517,6 +6517,31 @@ def main():
     if "--apply-update" in args:
         return apply_update_cli(args)
 
+    # 自检：冻结版里 zipfile 还能不能用（打包时排掉了 bz2/lzma，别把 deflate 也带走了）
+    if "--selftest" in args:
+        import tempfile
+        ok = True
+        try:
+            import zipfile
+            d = tempfile.mkdtemp(prefix="dl_selftest_")
+            zp = os.path.join(d, "t.zip")
+            with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+                z.writestr("a.txt", b"hello launcher" * 100)
+            with zipfile.ZipFile(zp) as z:
+                got = z.read("a.txt")
+            ok = got.startswith(b"hello launcher")
+            shutil.rmtree(d, ignore_errors=True)
+            msg = "selftest: zipfile deflate %s" % ("OK" if ok else "FAIL(内容不对)")
+        except Exception as e:
+            msg = "selftest: zipfile FAIL %s: %s" % (type(e).__name__, e)
+            ok = False
+        for fn in (print, log_line):
+            try:
+                fn(msg)
+            except Exception:
+                pass
+        return 0 if ok else 1
+
     # 命令行查更新（排障 / 自检用）：结果同时写日志，窗口版 exe 也能查
     if "--check-update" in args:
         try:
