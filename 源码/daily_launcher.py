@@ -29,7 +29,7 @@ import zipfile
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.12.0"
+APP_VERSION = "v2.12.1"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -6070,21 +6070,30 @@ class App:
                     self.close_exe_picker(True)
                 return 0
             if msg == WM_MOUSEWHEEL:
+                # ⚠ 滚轮增量在 **wParam 的高 16 位**；lParam 是鼠标的屏幕坐标
+                #   （低 16 位 x、高 16 位 y）。以前误用了 lp，算出来的"增量"
+                #   其实是鼠标 y 坐标，永远是正的 —— 于是只能"往上滚"，
+                #   停在顶部就再也滚不动，看起来就是滚轮失灵。
+                delta = ctypes.c_short((wp >> 16) & 0xFFFF).value
+                if not delta:
+                    return 0
+                # 一格 = 120，触控板/高精度滚轮可能是 30、60 之类的小值
+                notches = delta / 120.0
+                if not notches:
+                    notches = 1.0 if delta > 0 else -1.0
                 # 「选 exe」列表用滚轮翻页
                 if self.exepick:
-                    delta = ctypes.c_short((lp >> 16) & 0xFFFF).value
                     st = self.exepick
                     n = len(st["items"])
                     if n > 1:
-                        st["sel"] = max(0, min(n - 1, st["sel"] - (1 if delta > 0 else -1)))
+                        mv = 1 if notches > 0 else -1
+                        st["sel"] = max(0, min(n - 1, st["sel"] - mv))
                         user32.InvalidateRect(hwnd, None, False)
                     return 0
                 # 设置/自定义/夜间/任务页：内容超长时滚轮上下滚
                 if self._scroll_max > 0:
-                    delta = ctypes.c_short((lp >> 16) & 0xFFFF).value
-                    step = self.S(48)
                     self.scroll = max(0, min(self._scroll_max,
-                                             self.scroll - (step if delta > 0 else -step)))
+                                             self.scroll - int(notches * self.S(48))))
                     user32.InvalidateRect(hwnd, None, False)
                 return 0
             if msg == WM_SETCURSOR:
@@ -6468,7 +6477,7 @@ def main():
             "sel": 1,
             "on_ok": lambda p: None,
         }
-    if shot and "--page" in args:
+    if "--page" in args and (shot or "--test-wheel" in args):
         _i = args.index("--page")
         if len(args) > _i + 1:
             _pg = args[_i + 1].lower()
@@ -6492,6 +6501,40 @@ def main():
         except Exception:
             app.scroll = 0
         app._scroll_page = app.page
+    # --test-wheel：往真实窗口发滚轮消息，验证 wndproc 真的收到、方向也对
+    # （滚轮增量在 wParam 高 16 位，搞错了就是"只能往上滚"，肉眼看像失灵）
+    if "--test-wheel" in args:
+        def tw():
+            time.sleep(1.2)
+            try:
+                rc = wt.RECT()
+                user32.GetClientRect(app.hwnd, ctypes.byref(rc))
+                app.layout(rc.right, rc.bottom)
+                app.scroll = 0
+                app._scroll_page = app.page
+
+                def spin(delta):
+                    user32.SendMessageW(app.hwnd, WM_MOUSEWHEEL,
+                                        (delta & 0xFFFF) << 16, 0)
+                    return app.scroll
+
+                mx = app._scroll_max
+                d1 = spin(-120)          # 向下滚一格
+                u1 = spin(120)           # 向上滚一格
+                # 内容装得下（max=0）就没什么可滚的，算 SKIP 不算失败
+                if mx <= 0:
+                    verdict = "SKIP(内容装得下，无需滚动)"
+                else:
+                    verdict = "OK" if (d1 > 0 and u1 < d1) else "FAIL"
+                log_line("wheel test: page=%s max=%d down=%d up=%d => %s"
+                         % (app.page, mx, d1, u1, verdict))
+                print("wheel test: page=%s max=%d down=%d up=%d => %s"
+                      % (app.page, mx, d1, u1, verdict))
+            except Exception:
+                log_line("wheel test fail: " + traceback.format_exc())
+            user32.PostMessageW(app.hwnd, WM_CLOSE, 0, 0)
+        threading.Thread(target=tw, daemon=True).start()
+
     if shot:
         def later():
             time.sleep(1.4)
@@ -6504,6 +6547,16 @@ def main():
                 user32.GetWindowRect(hwnd, ctypes.byref(r))
                 cr = wt.RECT()
                 user32.GetClientRect(hwnd, ctypes.byref(cr))
+                _R = app.rects
+                _c = _R.get("card"); _rows = _R.get("rows") or []
+                log_line("layout: page=%s scroll=%s max=%s card=%s rows=%d"
+                         % (app.page, app.scroll, app._scroll_max,
+                            [round(v) for v in _c] if _c else None, len(_rows)))
+                if _rows:
+                    u = _rows[0]; d = _rows[-1]
+                    log_line("rows: first y=%.0f h=%d (card_t=%.0f) | last y=%.0f h=%d bottom=%.0f (card_b=%.0f)"
+                             % (u[1], u[2], _c[1] if _c else -1,
+                                d[1], d[2], d[1] + d[2], _c[3] if _c else -1))
                 log_line("dpi=%s screen=%sx%s win=(%s,%s,%s,%s) client=%sx%s" % (
                     app.dpi, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1),
                     r.left, r.top, r.right - r.left, r.bottom - r.top,
