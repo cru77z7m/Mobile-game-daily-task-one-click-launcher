@@ -7,3 +7,7 @@ build_tmp/
 dist/
 *.spec
 /*.exe
+payload.zip
+源码/payload.zip
+release/
+/*.zip

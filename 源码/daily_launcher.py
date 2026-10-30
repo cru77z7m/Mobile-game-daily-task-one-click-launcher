@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -33,7 +34,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.13.0"
+APP_VERSION = "v2.14.0"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -71,6 +72,17 @@ def app_dir():
 
 
 APP_DIR = app_dir()
+
+# 两种发布形态，代码里到处要分：
+#   onefile —— 单文件 exe，双击即用；但每次启动都要把整包（5.6MB）解到 %TEMP%，
+#              冷启动多花两三百毫秒，还留下临时目录。
+#   onedir  —— 文件夹版：exe 旁边一个 _internal 目录，启动不用解包（秒开）；
+#              装的时候由「安装程序」铺好，更新也走安装程序。
+# 判断依据就是 exe 旁边有没有 _internal（PyInstaller onedir 的固定产物名）。
+FROZEN = bool(getattr(sys, "frozen", False))
+ONEDIR = bool(FROZEN and os.path.isdir(os.path.join(APP_DIR, "_internal")))
+# 安装程序铺的文件，用来判断"这是装出来的"还是"解压出来随便放的"
+INSTALL_MARK = os.path.join(APP_DIR, "install.json")
 
 
 def _pick_config(base):
@@ -135,6 +147,9 @@ UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
 UPDATE_UA = "daily-launcher-updater"          # GitHub API 要求带 UA，不带直接 403
 UPDATE_DIR = os.path.join(APP_DIR, "_update")  # 下载包解压在这儿，装完下次启动清掉
+# 安装程序不往 _update 里放：它安装时会清理安装目录，把自己正在跑的那个文件
+# 留在那儿只会让清理失败。扔 %TEMP% 里，装完/重启后系统自己会收拾。
+UPDATE_TMP = os.path.join(tempfile.gettempdir(), "daily-launcher-setup")
 
 # 「关于」页的信息。**写死在程序里**，不写进 config.json ——
 # 这是作者信息，不该让使用者（或随手改配置的人）改掉。
@@ -660,34 +675,64 @@ def http_json(url, timeout=8):
 
 
 def find_latest_release(timeout=8):
-    """查 GitHub 上最新的 Release，返回一个 dict（查不到就抛异常，由调用方兜）"""
+    """查 GitHub 上最新的 Release，返回一个 dict（查不到就抛异常，由调用方兜）
+
+    发布包现在有三种，按名字认（build_launcher.py 就是照这个名字产物命名的）：
+        ...-setup-x64.exe   安装程序 → 装出来是文件夹版（秒开）
+        ...-portable-x64.zip 免安装文件夹版
+        ...-windows-x64.zip  单文件版（老版本自动更新只认这个，必须留着）
+    """
     data = http_json(UPDATE_API, timeout)
     if not isinstance(data, dict):
         raise RuntimeError("GitHub 返回的不是对象")
     tag = str(data.get("tag_name") or "").strip()
-    assets = data.get("assets") or []
-    pick = None
-    # 优先挑名字里带 windows/x64 的 zip；没有就第一个 zip；再没有就第一个附件
-    for a in assets:
-        n = str(a.get("name") or "").lower()
-        if n.endswith(".zip") and ("windows" in n or "x64" in n):
-            pick = a
+    setup = zip_single = zip_portable = zip_any = None
+    for a in (data.get("assets") or []):
+        if not isinstance(a, dict) or not a.get("browser_download_url"):
+            continue
+        name = str(a.get("name") or "")
+        low = name.lower()
+        if low.endswith(".exe") and ("setup" in low or "install" in low or "安装" in name):
+            setup = setup or a
+        elif low.endswith(".zip"):
+            if "portable" in low:
+                zip_portable = zip_portable or a
+            elif "windows" in low or "single" in low or "onefile" in low:
+                zip_single = zip_single or a
+            zip_any = zip_any or a
+
+    def info(a):
+        a = a or {}
+        return {"url": str(a.get("browser_download_url") or ""),
+                "asset": str(a.get("name") or ""),
+                "size": int(a.get("size") or 0)}
+
+    # 文件夹版：优先安装程序（装完还是文件夹版，且能保留 config.json）
+    # 单文件版：优先单文件 zip，这样老用户升级过来的行为不变；
+    #           实在没有 zip 就用安装程序原地装成文件夹版。
+    if ONEDIR:
+        order = [("setup", setup), ("zip", zip_portable), ("zip", zip_single or zip_any)]
+    else:
+        order = [("zip", zip_single or zip_any), ("setup", setup)]
+    kind, pick = "none", {}
+    for k, a in order:
+        if a:
+            kind, pick = k, info(a)
             break
-    if pick is None:
-        pick = next((a for a in assets
-                     if str(a.get("name") or "").lower().endswith(".zip")), None)
-    if pick is None and assets:
-        pick = assets[0]
-    pick = pick or {}
     return {
         "tag": tag,
         "name": str(data.get("name") or tag),
-        "url": str(pick.get("browser_download_url") or ""),
-        "asset": str(pick.get("name") or ""),
-        "size": int(pick.get("size") or 0),
+        "kind": kind,
+        "url": pick.get("url", ""),
+        "asset": pick.get("asset", ""),
+        "size": pick.get("size", 0),
         "page": str(data.get("html_url") or UPDATE_PAGE),
         "published": str(data.get("published_at") or "")[:10],
+        # 备用：万一主选那条下不了（比如只看 zip 的老脚本），界面上能提示去哪手动下
+        "setup": info(setup),
+        "portable": info(zip_portable),
     }
+
 
 
 def download_file(url, dst, on_progress=None, timeout=20):
@@ -809,6 +854,136 @@ def apply_update_cli(args):
     return 0
 
 
+def run_setup_silent(setup_path, wait_pid=None, restart=True):
+    """跑「安装程序」的静默安装，把当前目录原地升级
+
+    为什么更新不再自己换文件：文件夹版是 exe + _internal 一整个目录，
+    一边跑一边替换自己等于自杀（DLL 全被锁着）。交给安装程序来做最干净：
+    它从 %TEMP% 跑，等我们退出 → 铺新文件（config.json 原样不动）→ 再把我们拉起来。
+    """
+    if not os.path.isfile(setup_path):
+        raise RuntimeError("安装程序不见了，请重新下载")
+    args = [setup_path, "/S", "/D=" + APP_DIR]
+    if wait_pid:
+        args.append("/WAITPID=%d" % int(wait_pid))
+    if restart:
+        args.append("/RESTART")
+    subprocess.Popen(args, close_fds=True)
+    return args
+
+
+def _known_folder(csidl):
+    """系统文件夹（桌面/开始菜单）——不能直接用 %USERPROFILE%，可能被 OneDrive 重定向"""
+    buf = ctypes.create_unicode_buffer(260)
+    try:
+        shell32.SHGetFolderPathW.argtypes = [wt.HWND, ctypes.c_int, wt.HANDLE,
+                                             wt.DWORD, wt.LPWSTR]
+        shell32.SHGetFolderPathW.restype = ctypes.c_long
+        if shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0:
+            return buf.value
+    except Exception:
+        pass
+    return ""
+
+
+CSIDL_PROGRAMS = 0x0002
+CSIDL_DESKTOPDIRECTORY = 0x0010
+UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\DailyLauncher"
+
+
+def shortcut_paths():
+    """安装程序建的那两个快捷方式（桌面 / 开始菜单）"""
+    out = []
+    for base, sub in ((_known_folder(CSIDL_DESKTOPDIRECTORY), ""),
+                      (_known_folder(CSIDL_PROGRAMS), "")):
+        if base:
+            out.append(os.path.join(base, APP_NAME + ".lnk"))
+    return out
+
+
+def uninstall_cli(args):
+    """--uninstall：把自己删干净（快捷方式、卸载登记项、计划任务、安装目录）
+
+    卸载程序没单独做一个 exe —— 就长在程序里，少一个需要维护的文件。
+    最后一步得等本进程退出才删得掉，所以交给 cmd 延迟 rmdir。
+    --dry-run 只打印要删什么，不真删（自检用）。
+    """
+    dry = "--dry-run" in args
+    if not FROZEN:
+        print("源码模式（没打包）不执行卸载，这是开发目录")
+        return 2
+    if not ONEDIR and not os.path.isfile(INSTALL_MARK):
+        # 单文件版可能是"随便放的一个 exe"，删整个目录太危险
+        print("这不是安装出来的文件夹版，卸载请直接删 exe 文件")
+        if not dry:
+            return 2
+    if len(APP_DIR.rstrip("\\")) < 8:
+        print("安装目录看起来像盘符根目录，拒绝卸载：%s" % APP_DIR)
+        return 2
+    if not dry:
+        user32.MessageBoxW.restype = ctypes.c_int
+        user32.MessageBoxW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.UINT]
+        r = user32.MessageBoxW(
+            None,
+            "要卸载《%s》吗？\n\n安装目录：%s\n\n"
+            "会一起删掉：程序文件、桌面和开始菜单的快捷方式、"
+            "「应用和功能」里的登记项、免 UAC 计划任务。\n"
+            "config.json（各程序的路径和勾选）也会一起删掉。"
+            % (APP_NAME, APP_DIR),
+            "卸载 " + APP_NAME,
+            0x04 | 0x30 | 0x100 | 0x02)          # YESNO | 警告图标 | 置前 | 默认"否"
+        if r != 6:                                # IDYES
+            print("取消卸载")
+            return 1
+
+    gone = []
+    for p in shortcut_paths():
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+                gone.append(p)
+        except Exception as e:
+            print("删不掉快捷方式 %s：%s" % (p, e))
+    try:
+        import winreg
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+        gone.append("HKCU\\" + UNINSTALL_KEY)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print("删不掉卸载登记项：%s" % e)
+    try:
+        # 用 PowerShell 而不是 schtasks.exe：本机把 schtasks 列进了黑名单，
+        # 而且 ensure_task() 本来也是走 PowerShell 注册的，两边保持一致。
+        ps = ("$ErrorActionPreference='SilentlyContinue'; "
+              "Unregister-ScheduledTask -TaskName '%s' -Confirm:$false" % TASK_NAME)
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-WindowStyle", "Hidden", "-Command", ps],
+                           capture_output=True, creationflags=CREATE_NO_WINDOW,
+                           timeout=30)
+        gone.append("计划任务 %s" % TASK_NAME)
+    except Exception as e:
+        print("删不掉计划任务：%s" % e)
+    print("已清理：\n  " + "\n  ".join(gone or ["（没有需要清理的）"]))
+    log_line("卸载：已清理 %s" % "；".join(gone or ["无"]))
+    if dry:
+        print("dry-run：不动 %s" % APP_DIR)
+        return 0
+    # 等本进程退出后整目录删掉。ping 当 sleep 用：不依赖 timeout.exe、不吃 stdin。
+    subprocess.Popen('ping -n 3 127.0.0.1 >nul & rmdir /s /q "%s"' % APP_DIR,
+                     shell=True, close_fds=True, creationflags=CREATE_NO_WINDOW)
+    print("程序退出后删除：%s" % APP_DIR)
+    if "--quiet" not in args:
+        user32.MessageBoxW.restype = ctypes.c_int
+        user32.MessageBoxW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.UINT]
+        user32.MessageBoxW(
+            None,
+            "已从本机移除《%s》。\n\n程序目录会在关掉这个提示后自动删除：\n%s"
+            % (APP_NAME, APP_DIR),
+            "卸载完成", 0x40 | 0x100 | 0x0)     # 信息图标 | 置前
+    return 0
+
+
 def cleanup_update_leftovers():
     """清掉上次更新留下的 _update 目录和 *.old 备份（删不掉就算了，下次再试）"""
     try:
@@ -816,12 +991,18 @@ def cleanup_update_leftovers():
             shutil.rmtree(UPDATE_DIR, ignore_errors=True)
     except Exception:
         pass
+    # 单文件版更新留下的 exe.old / 夹在旁边的旧 exe
     try:
         for name in os.listdir(APP_DIR):
-            if not name.lower().endswith(".exe.old"):
+            low = name.lower()
+            if not (low.endswith(".exe.old") or low.endswith(".old") or low.endswith(".bak.tmp")):
                 continue
+            p = os.path.join(APP_DIR, name)
             try:
-                os.remove(os.path.join(APP_DIR, name))
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
             except Exception:
                 pass
     except Exception:
@@ -3793,7 +3974,7 @@ class App:
         # 只影响界面提示，不阻塞任何启动流程。
         self.upd = {"state": "idle", "tag": "", "url": "", "page": "",
                     "size": 0, "asset": "", "date": "", "pct": 0,
-                    "err": "", "path": ""}
+                    "kind": "zip", "err": "", "path": ""}
         # 子页面内容超长时的滚动位置（逻辑像素，0 = 顶部）
         self.scroll = 0
         self._scroll_max = 0
@@ -4190,7 +4371,9 @@ class App:
         self.text(hdc, APP_TITLE, tuple(S(v) for v in g["name"]),
                   C["text"], self.font(19, True),
                   DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-        self.text(hdc, "%s · 单文件 exe · 双击即用 · 不写注册表" % APP_VERSION,
+        _variant = ("文件夹版 · 秒开 · 更新走安装程序" if ONEDIR
+                    else "单文件版 · 双击即用 · 换 exe 即升级")
+        self.text(hdc, "%s · %s" % (APP_VERSION, _variant),
                   tuple(S(v) for v in g["ver"]), C["muted"], self.font(10.5),
                   DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
         self.text(hdc, "按顺序拉起 MaaEnd → MuMu 实例 → MAA → MaaFgo → ok-ww，全程不弹 UAC",
@@ -5830,6 +6013,7 @@ class App:
                       "url": info.get("url") or "", "page": info.get("page") or "",
                       "size": info.get("size") or 0,
                       "asset": info.get("asset") or "",
+                      "kind": info.get("kind") or "zip",
                       "date": info.get("published") or "", "pct": 0})
             if st == "available":
                 u["page"] = u["page"] or UPDATE_PAGE
@@ -5842,7 +6026,8 @@ class App:
             u["state"] = "downloading"
             u["pct"] = info.get("pct") or 0
         elif st == "ready":
-            u.update({"state": "ready", "pct": 100, "path": info.get("path") or ""})
+            u.update({"state": "ready", "pct": 100, "path": info.get("path") or "",
+                      "kind": info.get("kind") or u.get("kind") or "zip"})
             self.ui_log("新版 %s 已下载完成。点设置页「安装」，或点状态栏右边那句。"
                         % (u.get("tag") or ""))
         elif st == "error":
@@ -5880,7 +6065,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def upd_download(self):
-        """把新版 zip 下到 _update，再解出 exe（后台线程，带进度）"""
+        """下载新版：文件夹版下安装程序，单文件版下 zip（后台线程，带进度）"""
         if self.upd.get("state") in ("checking", "downloading"):
             return
         url = self.upd.get("url") or ""
@@ -5893,13 +6078,18 @@ class App:
         self.upd["pct"] = 0
         user32.InvalidateRect(self.hwnd, None, False)
         asset = self.upd.get("asset") or ""
+        is_setup = (self.upd.get("kind") == "setup")
         self.ui_log("开始下载 %s（%s）…" % (tag, asset or "发布包"))
 
         def work():
             try:
-                os.makedirs(UPDATE_DIR, exist_ok=True)
-                zpath = os.path.join(
-                    UPDATE_DIR, asset or ("daily-launcher-%s-windows-x64.zip" % tag))
+                out_dir = UPDATE_TMP if is_setup else UPDATE_DIR
+                os.makedirs(out_dir, exist_ok=True)
+                if is_setup:
+                    path = os.path.join(out_dir, asset or ("setup-%s.exe" % tag))
+                else:
+                    path = os.path.join(
+                        out_dir, asset or ("daily-launcher-%s-windows-x64.zip" % tag))
                 last = [-5.0]
 
                 def prog(got, total):
@@ -5911,16 +6101,22 @@ class App:
                         last[0] = pct
                         self.emit("upd", "downloading", {"pct": pct})
 
-                download_file(url, zpath, prog)
-                exe = extract_new_exe(zpath, UPDATE_DIR)
-                self.emit("upd", "ready", {"path": exe})
+                download_file(url, path, prog)
+                if is_setup:
+                    if os.path.getsize(path) < 1024 * 1024:
+                        raise RuntimeError("安装程序只有 %d 字节，像是没下全"
+                                           % os.path.getsize(path))
+                    exe = path
+                else:
+                    exe = extract_new_exe(path, UPDATE_DIR)
+                self.emit("upd", "ready", {"path": exe, "kind": "setup" if is_setup else "zip"})
             except Exception as e:
                 self.emit("upd", "error", {"err": "下载失败：%s" % _short_net_err(e)})
 
         threading.Thread(target=work, daemon=True).start()
 
     def upd_apply(self):
-        """启动新 exe 当"更新器"，它会等本进程退出后替换 exe 并重新打开"""
+        """装更新：文件夹版交给安装程序（静默、原地、保留配置），单文件版还是换 exe"""
         if self.busy:
             self.ui_log("正在跑任务，等这一轮结束再装更新（或者先点「取消启动」）")
             return
@@ -5930,13 +6126,25 @@ class App:
             self.upd["state"] = "available"
             user32.InvalidateRect(self.hwnd, None, False)
             return
-        if not getattr(sys, "frozen", False):
-            self.ui_log("源码模式不支持自动替换 exe，请手动重新打包")
+        if not FROZEN:
+            self.ui_log("源码模式不支持自动更新，请手动重新打包")
             return
-        target = os.path.abspath(sys.executable)
-        self.ui_log("正在安装 %s：窗口会关闭，替换完成后自动重开…" % (self.upd.get("tag") or ""))
+        tag = self.upd.get("tag") or ""
         self.status = "正在安装更新，马上重开…"
         user32.InvalidateRect(self.hwnd, None, False)
+        if self.upd.get("kind") == "setup":
+            self.ui_log("正在安装 %s：安装程序会等本窗口退出后铺新文件，"
+                        "config.json 原样保留，装完自动重开…" % tag)
+            try:
+                run_setup_silent(path, wait_pid=os.getpid(), restart=True)
+            except Exception as e:
+                self.ui_log("启动安装程序失败：%s" % e)
+                return
+            time.sleep(0.3)
+            user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+            return
+        target = os.path.abspath(sys.executable)
+        self.ui_log("正在安装 %s：窗口会关闭，替换完成后自动重开…" % tag)
         try:
             subprocess.Popen([path, "--apply-update", target, str(os.getpid())],
                              close_fds=True)
@@ -6516,6 +6724,10 @@ def main():
     # 必须在最前面处理 —— 否则它会走下面的提权/计划任务逻辑，又开一个窗口。
     if "--apply-update" in args:
         return apply_update_cli(args)
+
+    # 卸载：先清快捷方式/卸载项/计划任务，再交给 cmd 等本进程退出后删目录
+    if "--uninstall" in args:
+        return uninstall_cli(args)
 
     # 自检：冻结版里 zipfile 还能不能用（打包时排掉了 bz2/lzma，别把 deflate 也带走了）
     if "--selftest" in args:
