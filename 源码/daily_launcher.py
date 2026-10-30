@@ -29,7 +29,7 @@ import zipfile
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.11.0"
+APP_VERSION = "v2.12.0"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -2245,11 +2245,15 @@ def maa_apply_config(maa_exe, port, instance_index, auto_run, fix_connect, note)
             return False
         gui = conf.setdefault("Gui", {})
 
-        if auto_run:
-            startup = gui.setdefault("StartUpSettings", {})
-            if startup.get("RunDirectly") is not True:
-                startup["RunDirectly"] = True
-                changed.append("启动后直接运行任务")
+        # 「启动后直接运行任务」两个方向都要写：
+        #   开  → RunDirectly = true（和以前一样）
+        #   关  → RunDirectly = false（用户在「各项目的自动任务」里关了它，
+        #         就真的别让 MAA 自己跑起来）
+        startup = gui.setdefault("StartUpSettings", {})
+        want_run = bool(auto_run)
+        if startup.get("RunDirectly") is not want_run:
+            startup["RunDirectly"] = want_run
+            changed.append("启动后直接运行任务" if want_run else "取消「启动后直接运行任务」")
 
         if fix_connect:
             conn = gui.setdefault("ConnectSettings", {})
@@ -2787,7 +2791,9 @@ class Runner:
                     try:
                         self.baseline["maa"] = time.time()
                         spawn(maa_exe, os.path.dirname(maa_exe))
-                        self.step("maa", "ok", "已启动 · 自动开始任务")
+                        self.step("maa", "ok",
+                                  "已启动 · 自动开始任务" if maa.get("auto_run", True)
+                                  else "已启动 · 等你手动开始")
                         self.log("MAA 已启动（等待模拟器完成后自动开始任务）")
                     except Exception as e:
                         self.step("maa", "err", "启动失败")
@@ -3090,7 +3096,9 @@ class Runner:
                 self.log("⚠ 写 %s 失败（%s），退回 main.py" % (entry, e))
                 entry = ""
         script = entry or "main.py"
-        args = [script, "-t", task]
+        # task 为空 = 用户选了「不自启」：不能传 -t ""，argparse 会当成空任务名报错，
+        # 干脆不传，ok-ww 就只开界面等你自己点。
+        args = [script] + (["-t", task] if task else [])
         if m.get("headless", False):
             # 必须用 --headless：ok 的 logger 里另有一个 argparse 也在读 -h，
             # 传 -h 会先被它当成 help，直接打印用法并退出
@@ -3500,6 +3508,15 @@ gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
 gdi32.DeleteObject.restype = wt.BOOL
 gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
 gdi32.SelectObject.restype = wt.HGDIOBJ
+
+# 滚动列表要靠裁剪把超出卡片的那几行切掉
+gdi32.SaveDC.argtypes = [wt.HDC]
+gdi32.SaveDC.restype = ctypes.c_int
+gdi32.RestoreDC.argtypes = [wt.HDC, ctypes.c_int]
+gdi32.RestoreDC.restype = wt.BOOL
+gdi32.IntersectClipRect.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int]
+gdi32.IntersectClipRect.restype = ctypes.c_int
 gdi32.SetTextColor.argtypes = [wt.HDC, wt.DWORD]
 gdi32.SetTextColor.restype = wt.DWORD
 gdi32.SetBkMode.argtypes = [wt.HDC, ctypes.c_int]
@@ -3639,6 +3656,10 @@ class App:
         self.upd = {"state": "idle", "tag": "", "url": "", "page": "",
                     "size": 0, "asset": "", "date": "", "pct": 0,
                     "err": "", "path": ""}
+        # 子页面内容超长时的滚动位置（逻辑像素，0 = 顶部）
+        self.scroll = 0
+        self._scroll_max = 0
+        self._scroll_page = None
         self._upd_due = time.time() + 3.0      # 开机 3 秒后才开始查，别和启动抢
         self._upd_tried = False
         # 路径还没指过（或中途被清空）：直接进设置页，绝不自动开跑。
@@ -3787,33 +3808,53 @@ class App:
         card_t = 82
         # 子页面（设置 / 自定义 / 夜间）行数多，用矮一点的行高，日志区才不会被挤没。
         # 三个子页面统一行高，各分组内部密度才一致（之前 ①组 38、②③组 32，看着参差）。
-        row_h = {"settings": 33, "custom": 33, "night": 33}.get(self.page, 58)
+        row_h = {"settings": 34, "custom": 34, "night": 34, "tasks": 34}.get(self.page, 58)
         self.row_h_logical = row_h
-        self.sub_page = self.page in ("settings", "custom", "night", "about")
+        self.sub_page = self.page in ("settings", "custom", "night", "about", "tasks")
         items = self.current_rows()
+        b_h = 46
 
-        # 行高可变：分组标题行矮一点，且和上一组拉开距离
+        # 换页时把滚动位置归零，别让新页面一进来就停在中间
+        if getattr(self, "_scroll_page", None) != self.page:
+            self._scroll_page = self.page
+            self.scroll = 0
+
+        # 先按"内容全长"排一遍，再决定卡片能显示多少、要不要滚动。
         rows = []
-        y = card_t + 6
+        y = 0
         for it in items:
             if it.get("key", "").startswith("sec:"):
-                y += 6              # 分组标题前面留一点空隙，视觉上分组清楚
+                y += 7              # 分组标题前面留一点空隙，视觉上分组清楚
                 rh = int(it.get("h") or 24)
             else:
                 rh = int(it.get("h") or row_h)
-            rows.append((it, y, rh))
+            rows.append([it, y, rh])
             y += rh
-        card_b = y + 6
+        content_h = y + 6                  # 底部内边距
+        view_top = card_t + 6
+
+        # 卡片最高到哪儿：底下要留出按钮行 + 至少 3 行日志
+        card_cap = H - 36 - b_h - 20 - 54
+        card_b = min(view_top + content_h, max(view_top + 80, card_cap))
         if self.page == "about":
             # 关于页是自绘的整块，占满到按钮行之前，不留日志区
             card_b = H - 40 - 46 - 14
+            content_h = card_b - view_top
 
-        by = card_b + 12
-        b_h = 46
+        # 内容比可视区高就滚动（子页面才滚；主界面行少，用不到）
+        self._scroll_max = max(0, content_h - (card_b - view_top))
+        self.scroll = max(0, min(int(getattr(self, "scroll", 0) or 0),
+                                 self._scroll_max))
+        off = view_top - self.scroll
+        for r in rows:
+            r[1] += off
+        rows = [tuple(r) for r in rows]
+
+        by = card_b + 10
         # 按钮从左到右排：宽 200 / 118 / 118 / 104 / 110，间距 12 或 10
         x = pad
-        log_top = by + b_h + 12
-        log_bot = max(log_top, H - 38)      # 子页面行多，日志区可能被压成 0 高
+        log_top = by + b_h + 10
+        log_bot = max(log_top, H - 36)      # 子页面行多，日志区可能被压成 0 高
         rects = {
             "title": (pad, 16, W - pad, 46),
             "sub": (pad, 46, W - pad, 68),
@@ -3900,6 +3941,8 @@ class App:
             return self.custom_rows()
         if self.page == "night":
             return self.night_rows()
+        if self.page == "tasks":
+            return self.task_rows()
         if self.page == "settings":
             return self.settings_rows()
         return self.instance_rows()
@@ -4066,6 +4109,195 @@ class App:
                       C["muted"], self.font(9.5),
                       DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
 
+    # ---------- 各项目的自动任务 ----------
+    MXU_CFG = {"maaend": "mxu-MaaEnd.json", "maafgo": "mxu-MaaFgo.json"}
+    TASK_DEFAULTS = {
+        "maaend.instance": "全套日常",
+        "maaend.autostart": True,
+        "maa.auto_run": True,
+        "maafgo.instance": "默认设置",
+        "maafgo.autostart": True,
+        "okww.task": "DailyTask",
+    }
+    # ok-ww 的任务名 → 界面上的中文（空串 = 不给 -t，只打开界面不自动开始）
+    OKWW_TASKS = (("DailyTask", "每日任务"), ("", "不自启（只打开）"))
+
+    def _mxu_options(self, key):
+        """MaaEnd / MaaFgo 有几套「任务配置」
+
+        这俩是 MXU 壳，任务都勾在它自己的 config\\mxu-*.json 里，
+        一套就是一个"实例"（名字由用户起）。我们只读名字，不改内容。
+        """
+        m = self.cfg.get(key, {}) or {}
+        p = (m.get("path") or "").strip()
+        fn = self.MXU_CFG.get(key)
+        if not p or not fn:
+            return []
+        j = os.path.join(os.path.dirname(p), "config", fn)
+        if not os.path.isfile(j):
+            return []
+        return _mxu_names(j) or []
+
+    def task_summary(self):
+        """设置页入口那行的一行摘要"""
+        c = self.cfg
+        parts = []
+        m = c.get("maaend", {}) or {}
+        if m.get("enabled", False):
+            parts.append("MaaEnd %s" % ((m.get("instance") or "").strip() or "未设"))
+        a = c.get("maa", {}) or {}
+        if a.get("enabled", True):
+            parts.append("MAA " + ("自动" if a.get("auto_run", True) else "不自动"))
+        f = c.get("maafgo", {}) or {}
+        if f.get("enabled", True):
+            parts.append("MaaFgo %s" % ((f.get("instance") or "").strip() or "未设"))
+        w = c.get("okww", {}) or {}
+        if w.get("enabled", True):
+            t = (w.get("task") or "").strip()
+            parts.append("ok-ww " + (dict(self.OKWW_TASKS).get(t, t) if t else "不自启"))
+        return "、".join(parts) or "（没有启用的项目）"
+
+    def task_rows(self):
+        """二级页：每个项目启动后自动跑什么"""
+        c = self.cfg
+        out = [{
+            "key": "t_hint",
+            "icon": "cfg",
+            "title": "改这里 = 改它们启动后自动做什么",
+            "sub": "只影响「启动后要不要自动开始」；具体勾了哪些子任务，在各脚本自己的界面里",
+            "chip": "说明",
+        }]
+
+        m = c.get("maaend", {}) or {}
+        opts = self._mxu_options("maaend")
+        cur = (m.get("instance") or "").strip()
+        out.append({
+            "key": "t_mx:maaend",
+            "icon": "maaend",
+            "title": "MaaEnd · 任务配置",
+            "sub": ("现在是「%s」" % cur if cur else "还没设")
+                   + ("· 点右侧换一套（共 %d 套）" % len(opts) if opts
+                      else "· 读不到列表：先手动打开一次 MaaEnd"),
+            "chip": cur or "未设",
+        })
+        out.append({
+            "key": "t_flag:maaend.autostart",
+            "icon": "maaend",
+            "title": "MaaEnd · 启动后自动开始",
+            "sub": ("开：带 --autostart，一打开就直接跑任务"
+                    if m.get("autostart", True)
+                    else "关：只把 MaaEnd 打开，任务要你自己点开始"),
+            "chip": "开" if m.get("autostart", True) else "关",
+        })
+
+        a = c.get("maa", {}) or {}
+        out.append({
+            "key": "t_flag:maa.auto_run",
+            "icon": "maa",
+            "title": "MAA · 启动后自动运行",
+            "sub": ("开：替你打开 MAA 的「启动后直接运行任务」"
+                    if a.get("auto_run", True)
+                    else "关：会把这选项改回关闭，任务要你在 MAA 里点"),
+            "chip": "开" if a.get("auto_run", True) else "关",
+        })
+
+        f = c.get("maafgo", {}) or {}
+        opts = self._mxu_options("maafgo")
+        cur = (f.get("instance") or "").strip()
+        out.append({
+            "key": "t_mx:maafgo",
+            "icon": "maafgo",
+            "title": "MaaFgo · 任务配置",
+            "sub": ("现在是「%s」" % cur if cur else "还没设")
+                   + ("· 点右侧换一套（共 %d 套）" % len(opts) if opts
+                      else "· 读不到列表：先手动打开一次 MaaFgo"),
+            "chip": cur or "未设",
+        })
+        out.append({
+            "key": "t_flag:maafgo.autostart",
+            "icon": "maafgo",
+            "title": "MaaFgo · 启动后自动开始",
+            "sub": ("开：带 --autostart，起来就开跑"
+                    if f.get("autostart", True)
+                    else "关：只打开 MaaFgo，任务要你自己点开始"),
+            "chip": "开" if f.get("autostart", True) else "关",
+        })
+
+        w = c.get("okww", {}) or {}
+        t = (w.get("task") or "").strip()
+        out.append({
+            "key": "t_okww",
+            "icon": "okww",
+            "title": "ok-ww · 用哪个任务",
+            "sub": ("每日任务：一条龙（开游戏 → 登录 → 月卡 → 刷声骸 → 领奖 → 邮件）"
+                    if t == "DailyTask" else "不自启：只把 ok-ww 打开，任务你自己点"),
+            "chip": dict(self.OKWW_TASKS).get(t, t) if t else "不自启",
+        })
+
+        out.append({
+            "key": "t_reset",
+            "icon": "cfg",
+            "title": "恢复全部默认",
+            "sub": "MaaEnd「全套日常」+ 自动开始 · MAA 自动运行 · ok-ww 每日任务",
+            "chip": "恢复",
+        })
+        return out
+
+    def cycle_task_config(self, key):
+        """MaaEnd / MaaFgo 换一套「任务配置」"""
+        label = "MaaEnd" if key == "maaend" else "MaaFgo"
+        opts = self._mxu_options(key)
+        m = self.cfg.setdefault(key, {})
+        cur = (m.get("instance") or "").strip()
+        if not opts:
+            self.ui_log("读不到 %s 的任务配置：先手动打开一次 %s（会生成 config\\%s），"
+                        "或者在 config.json 里直接改 %s.instance"
+                        % (label, label, self.MXU_CFG.get(key, ""), key))
+            self.status = "读不到 %s 的任务配置列表" % label
+            return
+        nxt = opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else opts[0]
+        m["instance"] = nxt
+        save_config(self.cfg)
+        self.ui_log("%s 的任务配置 →「%s」（下一轮启动生效）" % (label, nxt))
+        self.status = "%s 的任务配置：%s" % (label, nxt)
+
+    def toggle_task_flag(self, dotted):
+        """切换 maaend.autostart / maa.auto_run / maafgo.autostart 这类开关"""
+        try:
+            section, name = dotted.split(".", 1)
+        except ValueError:
+            return
+        m = self.cfg.setdefault(section, {})
+        val = not bool(m.get(name, True))
+        m[name] = val
+        save_config(self.cfg)
+        label = {"maaend": "MaaEnd", "maa": "MAA", "maafgo": "MaaFgo"}.get(section, section)
+        what = {"autostart": "启动后自动开始", "auto_run": "启动后自动运行"}.get(name, name)
+        self.ui_log("%s 的「%s」→ %s" % (label, what, "开" if val else "关"))
+        self.status = "%s · %s：%s" % (label, what, "开" if val else "关")
+
+    def cycle_okww_task(self):
+        """ok-ww 用哪个任务：每日任务 / 不自启"""
+        w = self.cfg.setdefault("okww", {})
+        cur = (w.get("task") or "").strip()
+        keys = [k for k, _ in self.OKWW_TASKS]
+        nxt = keys[(keys.index(cur) + 1) % len(keys)] if cur in keys else keys[0]
+        w["task"] = nxt
+        save_config(self.cfg)
+        label = dict(self.OKWW_TASKS).get(nxt, nxt) if nxt else "不自启（只打开）"
+        self.ui_log("ok-ww 的任务 → %s" % label)
+        self.status = "ok-ww：%s" % label
+
+    def reset_tasks(self):
+        """把这页的 6 个字段恢复默认，别的不动"""
+        for dotted, val in self.TASK_DEFAULTS.items():
+            section, name = dotted.split(".", 1)
+            self.cfg.setdefault(section, {})[name] = val
+        save_config(self.cfg)
+        self.ui_log("已恢复默认：MaaEnd「全套日常」+ 自动开始 · MAA 自动运行 · "
+                    "MaaFgo「默认设置」+ 自动开始 · ok-ww 每日任务")
+        self.status = "各项目的自动任务已恢复默认"
+
     def settings_rows(self):
         """设置页：三大块 —— ① 各脚本/模拟器路径 ② 模拟器实例与版本 ③ 其它
 
@@ -4075,14 +4307,14 @@ class App:
         cfg = self.cfg
         out = [{
             "key": "sec:path",
-            "h": 24,
+            "h": 22,
             "title": "① 选择各实例的路径",
             "sub": "选各个模拟器 / 脚本所在的文件夹（点右侧「选择」）",
         }]
         out.append({
             "key": "mumu",
             "icon": "mumu",
-            "h": 33,
+            "h": 34,
             "title": "MuMu 模拟器目录",
             "sub": cfg.get("mumu_root") or "未设置（点右侧「选择」）",
         })
@@ -4094,14 +4326,14 @@ class App:
             out.append({
                 "key": key,
                 "icon": key,
-                "h": 33,
+                "h": 34,
                 "title": "%s · %s" % (name, game),
                 "sub": p or "未设置（点右侧「选择」）",
             })
 
         out.append({
             "key": "sec:inst",
-            "h": 24,
+            "h": 22,
             "title": "② 模拟器实例与游戏版本",
             "sub": "决定脚本连哪台模拟器、用哪个服（点右侧按钮切换）",
         })
@@ -4137,7 +4369,7 @@ class App:
 
         out.append({
             "key": "sec:more",
-            "h": 24,
+            "h": 22,
             "title": "③ 其它",
             "sub": "主界面项目、每日手游清单、原始配置文件",
         })
@@ -4159,11 +4391,19 @@ class App:
             "sub": "一天要清两次日常的手游 · 现在是 %s" % self.night_desc(),
             "chip": "设置",
         })
+        out.append({
+            "key": "task_page",
+            "icon": "cfg",
+            "h": 34,
+            "title": "各项目的自动任务",
+            "sub": "启动后自动跑什么：%s" % self.task_summary(),
+            "chip": "设置",
+        })
         u_sub, u_chip = self.upd_text()
         out.append({
             "key": "update",
             "icon": "launcher",
-            "h": 33,
+            "h": 34,
             "title": "检查更新",
             "sub": u_sub,
             "chip": u_chip,
@@ -4171,7 +4411,7 @@ class App:
 
         out.append({
             "key": "sec:about",
-            "h": 24,
+            "h": 22,
             "title": "④ 关于",
             "sub": "作者、项目主页、版本与使用声明",
         })
@@ -4180,7 +4420,7 @@ class App:
         out.append({
             "key": "about_page",
             "icon": "launcher",
-            "h": 33,
+            "h": 34,
             "title": "关于本软件",
             "sub": "%s · 免费使用 · 非商业用途 · 作者 %s" % (APP_VERSION, author),
             "chip": "查看",
@@ -4492,6 +4732,8 @@ class App:
             sub = "%s · 二级 · 主界面项目：加自定义实例 / 删掉不用的行 / 恢复默认" % APP_VERSION
         elif self.page == "night":
             sub = "%s · 二级 · 《今晚的手游日常》= 一天要清两次日常的手游，勾在这里" % APP_VERSION
+        elif self.page == "tasks":
+            sub = "%s · 二级 · 每个项目启动后自动跑什么任务" % APP_VERSION
         elif self.page == "about":
             sub = "%s · 二级 · 关于本软件：作者、项目主页、使用声明" % APP_VERSION
         else:
@@ -4516,11 +4758,23 @@ class App:
             self.draw_about(mem, R["card"])
         else:
             rows = R["rows"]
+            # 内容能滚动时，超出卡片的部分必须裁掉，否则会画到按钮/日志区上
+            scrolling = self._scroll_max > 0
+            _dc = 0
+            if scrolling:
+                _dc = gdi32.SaveDC(mem)
+                card = R["card"]
+                gdi32.IntersectClipRect(mem, card[0], card[1], card[2], card[3])
             for i, (item, y, rh) in enumerate(rows):
                 self.draw_row(mem, item, y, R["card"][0], R["card"][2], rh)
                 if i < len(rows) - 1:
                     self.hline(mem, R["card"][0] + self.S(22), R["card"][2] - self.S(22),
                                y + rh - self.S(3), C["line"])
+            if scrolling:
+                gdi32.RestoreDC(mem, _dc)
+                self.draw_scrollbar(mem, R["card"], R["card"][1] + self.S(6),
+                                    R["card"][3] - self.S(6), self.scroll,
+                                    self._scroll_max)
 
         if self.page == "main":
             self.draw_shortcuts(mem)
@@ -4930,7 +5184,7 @@ class App:
         in_set = self.sub_page
         if in_set:
             # 二级页的返回目标是「一级设置页」，一级设置页的返回目标是主界面
-            blabel = ("← 返回设置" if self.page in ("custom", "night", "about")
+            blabel = ("← 返回设置" if self.page in ("custom", "night", "about", "tasks")
                       else "← 返回")
             bgc = C["accent_l"] if self.hover == "edit" else C["ghost_bg"]
             self.fill_round(hdc, r, 9, bgc, C["accent"], 1.2)
@@ -4954,6 +5208,20 @@ class App:
             self.fill_round(hdc, r, 9, bgc, C["accent"], 1.2)
             self.text(hdc, "夜间启动", r, C["accent"], self.font(12, True),
                       DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+
+    def draw_scrollbar(self, hdc, card, top, bot, offset, max_offset):
+        """卡片右侧那条细滚动条：只有内容比可视区高时才出现"""
+        if max_offset <= 0 or bot - top < self.S(40):
+            return
+        S = self.S
+        x1 = card[2] - S(7)
+        x2 = x1 + S(4)
+        self.fill_round(hdc, (x1, top, x2, bot), 2, C["line"])
+        visible = bot - top
+        total = visible + max_offset
+        hh = max(S(28), int(visible * visible / max(1, total)))
+        y = top + int((visible - hh) * (offset / float(max_offset)))
+        self.fill_round(hdc, (x1, y, x2, y + hh), 2, C["muted"])
 
     def draw_log(self, hdc, rect):
         self.fill_round(hdc, rect, 10, C["logbg"], C["border"])
@@ -4998,7 +5266,7 @@ class App:
         if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
             return "upd_goto"
         # 设置页 / 自定义页 / 关于页里只有「返回」可用，其余按钮是灰的，不参与命中
-        keys = (("edit",) if self.page in ("settings", "custom", "night", "about")
+        keys = (("edit",) if self.page in ("settings", "custom", "night", "about", "tasks")
                 else ("start", "cancel", "shutdown", "edit", "night",
                       "all"))
         for key in keys:
@@ -5010,6 +5278,10 @@ class App:
             for k, r in R.items():
                 if k.startswith("about_link:") and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
                     return k
+        # 行列表只算卡片可视区里那部分（滚动后上半截可能被挡住了）
+        card = R.get("card")
+        if card and not (card[1] <= y <= card[3]):
+            return None
         rh = R.get("row_h", self.S(56))
         prefix = "chk:" if self.page == "main" else "set:"
         for item, ry, rowh in R.get("rows", []):
@@ -5568,6 +5840,33 @@ class App:
             self.status = "二级 · 《今晚的手游日常》：勾哪些项目算"
             user32.InvalidateRect(self.hwnd, None, False)
             return
+        if kind == "task_page":
+            self.page_stack.append("settings")
+            self.page = "tasks"
+            self.status = "二级 · 各项目的自动任务：启动后自动跑什么"
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind.startswith("t_mx:"):
+            self.cycle_task_config(kind[5:])
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind.startswith("t_flag:"):
+            self.toggle_task_flag(kind[7:])
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind == "t_okww":
+            self.cycle_okww_task()
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind == "t_reset":
+            self.reset_tasks()
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind == "t_hint":
+            self.ui_log("这一页改的是「启动后要不要自动开始」，"
+                        "以及 MaaEnd / MaaFgo 用哪一套任务配置。"
+                        "具体勾哪些子任务，请在各脚本自己的界面里改。")
+            return
         if kind == "about_page":
             self.page_stack.append("settings")
             self.page = "about"
@@ -5779,6 +6078,14 @@ class App:
                     if n > 1:
                         st["sel"] = max(0, min(n - 1, st["sel"] - (1 if delta > 0 else -1)))
                         user32.InvalidateRect(hwnd, None, False)
+                    return 0
+                # 设置/自定义/夜间/任务页：内容超长时滚轮上下滚
+                if self._scroll_max > 0:
+                    delta = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                    step = self.S(48)
+                    self.scroll = max(0, min(self._scroll_max,
+                                             self.scroll - (step if delta > 0 else -step)))
+                    user32.InvalidateRect(hwnd, None, False)
                 return 0
             if msg == WM_SETCURSOR:
                 if self.hover:
@@ -6171,9 +6478,20 @@ def main():
                 app.page = "custom"            # 自检时截「主界面项目」页
             elif _pg.startswith("nig"):
                 app.page = "night"             # 自检时截《今晚的手游日常》页
+            elif _pg.startswith("tas"):
+                app.page = "tasks"             # 自检时截「各项目的自动任务」页
+                app.page_stack.append("settings")
             elif _pg.startswith("abo"):
                 app.page = "about"             # 自检时截「关于」页
                 app.page_stack.append("settings")
+    if shot and "--scroll" in args:
+        # 自检用：把子页面滚到指定位置再截图（看裁剪和滚动条对不对）
+        # 必须在 --page 之后设置，否则 layout 换页会把它归零
+        try:
+            app.scroll = max(0, int(args[args.index("--scroll") + 1]))
+        except Exception:
+            app.scroll = 0
+        app._scroll_page = app.page
     if shot:
         def later():
             time.sleep(1.4)
