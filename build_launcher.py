@@ -2,7 +2,7 @@
 """一键重新打包 一键日常启动器.exe
 
 在 skill 目录里改不了东西也能用：把 --src 指到工程目录即可。
-默认使用此脚本所在的项目目录。
+默认按本机工程 D:\\tools\\一键日常启动器 走。
 
 用法:
     python build_launcher.py                    # 用默认工程目录
@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import sys
 
-DEFAULT_SRC = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_SRC = r"D:\tools\一键日常启动器"
 EXE_NAME = "一键日常启动器"
 PY_NAME = "daily_launcher.py"
 ICON_NAME = "app.ico"
@@ -28,7 +28,13 @@ SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def find_python():
-    """使用当前 Python 环境进行构建。"""
+    """优先用本机的托管 Python（已装 pyinstaller/pillow）"""
+    cands = [
+        r"C:\Users\Cru77z7M\.workbuddy\binaries\python\versions\3.13.12\python.exe",
+    ]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
     return sys.executable
 
 
@@ -73,7 +79,18 @@ def main():
         "--distpath", dist,
         "--workpath", os.path.join(work, "work"),
         "--specpath", work,
+        "--optimize", "2",      # 去掉 docstring/assert，PYZ 小一点、导入快一点
     ]
+    # onefile 每次启动都要把整包解压到 %TEMP%，包越小启动越快。
+    # 这里排掉程序根本用不到的模块；其中 ssl/_ssl/_hashlib 最关键——
+    # 它们会把 libcrypto(8MB) + libssl(1.6MB) 拖进来，光解压就两三百毫秒。
+    # 网络部分已改用系统自带的 WinHTTP（见 daily_launcher.py 里 _http_open）。
+    for mod in ("ssl", "_ssl", "_hashlib", "email", "http", "urllib",
+                "xml", "xmlrpc", "sqlite3", "_sqlite3", "decimal",
+                "bz2", "lzma", "unittest", "doctest", "pydoc_data",
+                "asyncio", "multiprocessing", "lib2to3", "setuptools", "pip",
+                "unicodedata", "pickle", "_pickle", "logging", "argparse"):
+        cmd += ["--exclude-module", mod]
     # 界面图标（assets/icons/*.ico）必须一起打进去：
     # onefile 运行时解到 sys._MEIPASS，代码里 assets_dir() 会优先读那里。
     assets = os.path.join(src, "源码", "assets")
@@ -103,5 +120,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

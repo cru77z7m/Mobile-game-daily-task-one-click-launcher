@@ -10,6 +10,9 @@
 配置：同目录 config.json（界面里点「设置」可以改各程序的路径）
 """
 
+import time as _boot_time            # 启动计时用：越早拿到时间戳越好
+_BOOT_T = _boot_time.time()
+
 import ctypes
 import ctypes.wintypes as wt
 import json
@@ -21,15 +24,16 @@ import sys
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
-import zipfile
+import zipfile        # 只给"从发布包里挑 exe"用，见 extract_new_exe()
+
+_T_IMP = _boot_time.time()          # 导入全部完成
+_TMARK = {}                         # --timing 用的分阶段时间戳
 
 # ----------------------------------------------------------------------------
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.12.1"
+APP_VERSION = "v2.13.0"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -513,13 +517,146 @@ def is_newer(tag, base=None):
     return ver_tuple(tag) > ver_tuple(base or APP_VERSION)
 
 
+# ----------------------------------------------------------------------------
+# 极简 HTTP —— 只用 Windows 自带的 winhttp.dll
+#
+# 为什么不用 urllib：urllib 走 HTTPS 要 ssl → 打包会捎上 libcrypto(8MB) 和
+# libssl(1.6MB) 两个 DLL。onefile 每次启动都要把它们解压到临时目录，
+# 光这两个就多花两三百毫秒。WinHTTP 是系统组件，零体积、还自带系统代理和 TLS1.2+。
+# ----------------------------------------------------------------------------
+winhttp = ctypes.WinDLL("winhttp", use_last_error=True)
+
+WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
+WINHTTP_FLAG_SECURE = 0x00800000
+WINHTTP_OPTION_REDIRECT_POLICY = 88
+# 注意取值：0=NEVER、1=DISALLOW、2=ALLOW、3=禁止 https→http 降级。
+# 写 0 会"一个重定向都不跟"——GitHub 的下载地址全是 302，会拿到 0 字节。
+WINHTTP_OPTION_REDIRECT_POLICY_ALLOW = 2
+WINHTTP_QUERY_STATUS_CODE = 19
+WINHTTP_QUERY_CONTENT_LENGTH = 5
+
+
+class HttpError(RuntimeError):
+    """HTTP 状态码 >= 400（GitHub 限流时是 403/429）"""
+
+    def __init__(self, code):
+        self.code = int(code)
+        RuntimeError.__init__(self, "HTTP %d" % self.code)
+
+
+# ⚠ WinHTTP 返回的是 HINTERNET（64 位指针），必须写死 restype，
+#   不然 ctypes 会按 32 位 int 截断，句柄当场失效。
+winhttp.WinHttpOpen.argtypes = [wt.LPCWSTR, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
+winhttp.WinHttpOpen.restype = ctypes.c_void_p
+winhttp.WinHttpConnect.argtypes = [ctypes.c_void_p, wt.LPCWSTR, ctypes.c_ushort, wt.DWORD]
+winhttp.WinHttpConnect.restype = ctypes.c_void_p
+winhttp.WinHttpOpenRequest.argtypes = [ctypes.c_void_p, wt.LPCWSTR, wt.LPCWSTR,
+                                       wt.LPCWSTR, wt.LPCWSTR,
+                                       ctypes.POINTER(wt.LPCWSTR), wt.DWORD]
+winhttp.WinHttpOpenRequest.restype = ctypes.c_void_p
+winhttp.WinHttpSetTimeouts.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int]
+winhttp.WinHttpSetTimeouts.restype = wt.BOOL
+winhttp.WinHttpSetOption.argtypes = [ctypes.c_void_p, wt.DWORD, ctypes.c_void_p, wt.DWORD]
+winhttp.WinHttpSetOption.restype = wt.BOOL
+winhttp.WinHttpSendRequest.argtypes = [ctypes.c_void_p, wt.LPCWSTR, wt.DWORD,
+                                       ctypes.c_void_p, wt.DWORD, wt.DWORD, ctypes.c_size_t]
+winhttp.WinHttpSendRequest.restype = wt.BOOL
+winhttp.WinHttpReceiveResponse.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+winhttp.WinHttpReceiveResponse.restype = wt.BOOL
+winhttp.WinHttpQueryHeaders.argtypes = [ctypes.c_void_p, wt.DWORD, wt.LPCWSTR,
+                                        ctypes.c_void_p, ctypes.POINTER(wt.DWORD),
+                                        wt.LPCWSTR]
+winhttp.WinHttpQueryHeaders.restype = wt.BOOL
+winhttp.WinHttpReadData.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.DWORD,
+                                    ctypes.POINTER(wt.DWORD)]
+winhttp.WinHttpReadData.restype = wt.BOOL
+winhttp.WinHttpCloseHandle.argtypes = [ctypes.c_void_p]
+winhttp.WinHttpCloseHandle.restype = wt.BOOL
+
+
+def _http_query(req, what):
+    """取一个响应头/状态行里的数字字段"""
+    buf = ctypes.create_unicode_buffer(64)
+    n = wt.DWORD(ctypes.sizeof(buf))
+    if not winhttp.WinHttpQueryHeaders(req, what, None, buf, ctypes.byref(n), None):
+        return ""
+    return buf.value
+
+
+def _http_open(url, timeout=15):
+    """发 GET、等响应头。返回 (req, [句柄...])，调用方负责关"""
+    m = re.match(r"(?i)(https?)://([^/:]+)(?::(\d+))?(/.*)?$", url or "")
+    if not m:
+        raise RuntimeError("地址不对：%s" % url)
+    https = m.group(1).lower() == "https"
+    host = m.group(2)
+    port = int(m.group(3) or (443 if https else 80))
+    path = m.group(4) or "/"
+    sess = winhttp.WinHttpOpen(UPDATE_UA, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                               None, None, 0)
+    if not sess:
+        raise OSError("WinHttpOpen 失败（err=%s）" % ctypes.get_last_error())
+    conn = None
+    try:
+        ms = int(timeout * 1000)
+        winhttp.WinHttpSetTimeouts(sess, ms, ms, ms, ms)
+        conn = winhttp.WinHttpConnect(sess, host, port, 0)
+        if not conn:
+            raise OSError("连不上 %s（err=%s）" % (host, ctypes.get_last_error()))
+        req = winhttp.WinHttpOpenRequest(
+            conn, "GET", path, None, None, None,
+            WINHTTP_FLAG_SECURE if https else 0)
+        if not req:
+            raise OSError("请求创建失败（err=%s）" % ctypes.get_last_error())
+        # 跟随重定向：GitHub 的下载地址会 302 到 objects.githubusercontent.com
+        policy = wt.DWORD(WINHTTP_OPTION_REDIRECT_POLICY_ALLOW)
+        winhttp.WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY,
+                                 ctypes.byref(policy), ctypes.sizeof(policy))
+        headers = ("User-Agent: %s\r\nAccept: application/vnd.github+json\r\n"
+                   % UPDATE_UA)
+        if not winhttp.WinHttpSendRequest(req, headers, -1, None, 0, 0, 0):
+            raise OSError("发不出请求（err=%s）" % ctypes.get_last_error())
+        if not winhttp.WinHttpReceiveResponse(req, None):
+            raise OSError("没有响应（err=%s）" % ctypes.get_last_error())
+        try:
+            code = int(_http_query(req, WINHTTP_QUERY_STATUS_CODE) or 0)
+        except Exception:
+            code = 0
+        if code >= 400:
+            winhttp.WinHttpCloseHandle(req)
+            raise HttpError(code)
+        return req, [req, conn, sess]
+    except Exception:
+        if conn:
+            winhttp.WinHttpCloseHandle(conn)
+        winhttp.WinHttpCloseHandle(sess)
+        raise
+
+
+def _http_chunks(req, size=65536):
+    """一块一块往外吐响应体"""
+    n = wt.DWORD(0)
+    buf = ctypes.create_string_buffer(size)
+    while True:
+        if not winhttp.WinHttpReadData(req, buf, size, ctypes.byref(n)):
+            raise OSError("读取中断（err=%s）" % ctypes.get_last_error())
+        if not n.value:
+            return
+        yield buf.raw[:n.value]
+
+
+def http_get_text(url, timeout=8):
+    req, handles = _http_open(url, timeout)
+    try:
+        return b"".join(_http_chunks(req)).decode("utf-8", "replace")
+    finally:
+        for h in handles:
+            winhttp.WinHttpCloseHandle(h)
+
+
 def http_json(url, timeout=8):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UPDATE_UA,
-        "Accept": "application/vnd.github+json",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))
+    return json.loads(http_get_text(url, timeout))
 
 
 def find_latest_release(timeout=8):
@@ -555,22 +692,22 @@ def find_latest_release(timeout=8):
 
 def download_file(url, dst, on_progress=None, timeout=20):
     """流式下载，每 64KB 回调一次 (已下, 总大小)；总大小未知时给 0"""
-    req = urllib.request.Request(url, headers={"User-Agent": UPDATE_UA})
+    req, handles = _http_open(url, timeout)
     got = 0
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    try:
         try:
-            total = int(r.headers.get("Content-Length") or 0)
+            total = int(_http_query(req, WINHTTP_QUERY_CONTENT_LENGTH) or 0)
         except Exception:
             total = 0
         with open(dst, "wb") as f:
-            while True:
-                chunk = r.read(64 * 1024)
-                if not chunk:
-                    break
+            for chunk in _http_chunks(req):
                 f.write(chunk)
                 got += len(chunk)
                 if on_progress:
                     on_progress(got, total)
+    finally:
+        for h in handles:
+            winhttp.WinHttpCloseHandle(h)
     return got
 
 
@@ -3607,6 +3744,7 @@ STEP_KEYS = ["maaend", "vm0", "vm1", "maa", "maafgo", "okww"]
 class App:
     def __init__(self):
         self.cfg = load_config()
+        _TMARK["cfg"] = _boot_time.time()
         self.hwnd = None
         self.dpi = 96.0
         self.hover = None
@@ -5732,7 +5870,7 @@ class App:
                     self.emit("upd", "available", rel)
                 else:
                     self.emit("upd", "uptodate", rel)
-            except urllib.error.HTTPError as e:
+            except HttpError as e:
                 msg = ("GitHub 限流了，过一会儿再试" if e.code in (403, 429)
                        else "GitHub 返回 %s" % e.code)
                 self.emit("upd", "error", {"err": msg})
@@ -6254,6 +6392,14 @@ class App:
         user32.ShowWindow(hwnd, 5)
         user32.UpdateWindow(hwnd)
         user32.SetTimer(hwnd, 1, 120, None)
+        _TMARK["win"] = _boot_time.time()
+        if "--timing" in sys.argv:
+            # 启动耗时拆解：全部是 epoch 毫秒，外部脚本拿父进程的 spawn 时间就能算
+            log_line("TIMING py=%d imp=%d cfg=%d app=%d win=%d"
+                     % (_BOOT_T * 1000, _T_IMP * 1000,
+                        _TMARK.get("cfg", 0) * 1000,
+                        _TMARK.get("app", 0) * 1000,
+                        _TMARK.get("win", 0) * 1000))
 
         # 后台摸一遍 MuMu 里到底有几个实例（不卡界面，读完自己刷新）
         threading.Thread(target=self._discover_instances, daemon=True).start()
@@ -6363,6 +6509,7 @@ def screenshot(path, rect=None):
 
 
 def main():
+    _TMARK["main"] = _boot_time.time()
     args = sys.argv[1:]
 
     # 更新器模式：新版 exe 被旧进程拉起来替自己换文件。跑完就退，绝不进界面。
@@ -6455,6 +6602,7 @@ def main():
     threading.Thread(target=cleanup_update_leftovers, daemon=True).start()
 
     app = App()
+    _TMARK["app"] = _boot_time.time()
     if shot or "--no-auto" in args:
         app.no_auto = True
     if shot:
