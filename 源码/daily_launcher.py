@@ -34,7 +34,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.14.0"
+APP_VERSION = "v2.14.1"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -2553,9 +2553,26 @@ def ensure_task(name=TASK_NAME):
 def trigger_task(name=TASK_NAME):
     """存在同名计划任务 -> 用它把自己以最高权限拉起来（不弹 UAC）。
 
-    用 PowerShell cmdlet 而不是 schtasks.exe：后者在受限制的运行环境里
-    会被安全策略直接拦截。失败原因会写进 launcher.log，方便排查。
+    两条路，先快后慢：
+      1. `schtasks /run` —— 百来毫秒，绝大多数机器都行（实测 0.1s）；
+      2. PowerShell 的 Start-ScheduledTask —— 一定能用，但光加载 ScheduledTasks
+         模块就要 2~5 秒（v2.14.0 之前只走这条，双击到窗口要 10 秒，被用户投诉）。
+    只有第 1 条被安全策略拦了（rc≠0）才走第 2 条。
     """
+    t0 = time.time()
+    try:
+        r = subprocess.run(["schtasks", "/run", "/tn", name],
+                           creationflags=CREATE_NO_WINDOW,
+                           capture_output=True, timeout=8)
+        if r.returncode == 0:
+            log_line("trigger: task=%s schtasks 成功（%.0f ms）"
+                     % (name, (time.time() - t0) * 1000))
+            return True
+        log_line("trigger: schtasks 不可用（rc=%s），退回 PowerShell"
+                 % r.returncode)
+    except Exception as e:
+        log_line("trigger: schtasks 异常 %s: %s，退回 PowerShell"
+                 % (type(e).__name__, e))
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -2564,8 +2581,8 @@ def trigger_task(name=TASK_NAME):
             capture_output=True, timeout=60,
         )
         ok = r.returncode == 0
-        log_line("trigger: task=%s rc=%s ok=%s out=%r err=%r"
-                 % (name, r.returncode, ok,
+        log_line("trigger: task=%s rc=%s ok=%s 总耗时 %.0f ms out=%r err=%r"
+                 % (name, r.returncode, ok, (time.time() - t0) * 1000,
                     (r.stdout or b"")[:160], (r.stderr or b"")[:300]))
         return ok
     except Exception as e:
@@ -6845,18 +6862,20 @@ def main():
     # 关模拟器）失败了会在日志里提示，不影响启动。
     # 想要恢复"开机就提权"：config.json 里把 require_admin 设为 true。
     if not shot and "--no-elevate" not in args and not is_admin():
-        # 首选：计划任务。它让本程序以最高权限启动且不弹 UAC，
-        # 子进程（MuMuNxDevice）随之继承权限，也就不会各自弹 UAC。
-        if "--no-task" not in args and trigger_task():
-            return 0
-        # 次选：免 UAC 没走成，就自己 runas 提权一次。
-        # 这样子进程（MuMuNxDevice）会继承权限，不会再各自弹 UAC。
-        # 想彻底不弹任何 UAC，先让上面的计划任务生效即可。
         try:
             _c0 = load_config() or {}
         except Exception:
             _c0 = {}
-        if _c0.get("require_admin", True) or "--elevate" in args:
+        want_admin = bool(_c0.get("require_admin", True)) or "--elevate" in args
+        # 只有真要管理员才多起一个进程 —— 否则每次双击都白白多花半秒
+        if want_admin:
+            # 首选：计划任务。它让本程序以最高权限启动且不弹 UAC，
+            # 子进程（MuMuNxDevice）随之继承权限，也就不会各自弹 UAC。
+            if "--no-task" not in args and trigger_task():
+                return 0
+            # 次选：免 UAC 没走成，就自己 runas 提权一次。
+            # 这样子进程（MuMuNxDevice）会继承权限，不会再各自弹 UAC。
+            # 想彻底不弹任何 UAC，先让上面的计划任务生效即可。
             log_line("计划任务免 UAC 未生效，改为自提权（会弹一次 UAC）")
             if elevate_self():
                 return 0
@@ -6864,9 +6883,11 @@ def main():
         else:
             log_line("未提权运行：MuMu 设备进程可能会自己弹 UAC")
 
-    # 已经是管理员：顺手把计划任务对齐到当前 exe（换目录/改名后免 UAC 会失效）
+    # 已经是管理员：顺手把计划任务对齐到当前 exe（换目录/改名后免 UAC 会失效）。
+    # ⚠ 一定要放后台线程：这一步要起 PowerShell，冷启动时要 2~5 秒，
+    #   放在建窗口之前会把"双击到出窗口"的时间拖长 5 秒（v2.14.0 实测 10 秒）。
     if not shot and is_admin() and "--no-task" not in args:
-        ensure_task()
+        threading.Thread(target=ensure_task, daemon=True).start()
 
     # 上次更新留下的 _update 目录 / *.exe.old，开机顺手清掉（删不掉就下次再说）
     threading.Thread(target=cleanup_update_leftovers, daemon=True).start()
