@@ -21,12 +21,15 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
+import zipfile
 
 # ----------------------------------------------------------------------------
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.9.0"
+APP_VERSION = "v2.11.0"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -84,6 +87,14 @@ def _pick_config(base):
 CONFIG_PATH = _pick_config(APP_DIR)
 LOG_PATH = os.path.join(APP_DIR, "launcher.log")
 
+# 程序自己的内部状态（配置结构版本号、上次运行用的是哪版）。
+# 这些**不是用户配置**：用户既不该看、也不该改，所以单独放一个文件，
+# 免得跟 config.json 里那些路径/勾选混在一起被人手滑改坏。
+# 跟 config.json 同目录 —— 它可能被 _pick_config 指到上一级去。
+STATE_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "launcher.state.json")
+STATE = {}                  # load_state() 之后填充；save_state() 整体写回
+STATE_FIX = False           # 主状态文件读不了（靠 .bak 或默认值救的），下次顺手修回来
+
 # 旁边有没有 config.json —— 只用于记日志；"要不要走设置向导"看 config_ready()，
 # 因为用户可能第一次打开、看一眼就关掉，留下一个"全空但存在"的配置。
 CONFIG_EXISTED = os.path.isfile(CONFIG_PATH)
@@ -110,10 +121,20 @@ MAX_CUSTOM = 4
 # ----------------------------------------------------------------------------
 # 配置结构版本：升级 exe 时靠它判断要不要跑迁移。
 # 只做"加字段/改语义"的小步升级，每次 bump 都要在 migrate_config() 里补一段。
-CONFIG_VERSION = 2
+# 这个值存在 launcher.state.json 里，**不写进 config.json**（用户不该动它）。
+CONFIG_VERSION = 3
 
-# 「关于」页的信息。全都放进 config.json 的 about 里，
-# 换地址/改署名不用重新打包 exe。
+# ---- 自动更新 ----
+# 只查 Releases API 的 latest，不要 token（公开仓库匿名够用，60 次/小时/ip）。
+UPDATE_REPO = "cru77z7m/Mobile-game-daily-task-one-click-launcher"
+UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+UPDATE_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
+UPDATE_UA = "daily-launcher-updater"          # GitHub API 要求带 UA，不带直接 403
+UPDATE_DIR = os.path.join(APP_DIR, "_update")  # 下载包解压在这儿，装完下次启动清掉
+
+# 「关于」页的信息。**写死在程序里**，不写进 config.json ——
+# 这是作者信息，不该让使用者（或随手改配置的人）改掉。
+# 要换地址/改署名就改这里，重新打包一次。
 ABOUT_INFO = {
     "author": "Cru77z7M",
     "author_page": "https://space.bilibili.com/5707907",
@@ -197,6 +218,9 @@ DEFAULT_CONFIG = {
     "timeouts": {"boot": 300, "adb": 180},
     "close_tools_with_emulator": False,
     "auto_start_on_launch": True,
+    # 打开软件 3 秒后悄悄查一次 GitHub 有没有新版：**不弹窗**，
+    # 只在状态栏右边显示一句可点的提示。关掉就设 false。
+    "check_update_on_launch": True,
     # 打开就自动启动之前，先问一句"要不要只跑手游日常"（5 秒不回答按默认全跑）。
     # 嫌烦就设 false：变成直接开跑，不弹询问卡。
     "night_prompt": True,
@@ -214,12 +238,9 @@ DEFAULT_CONFIG = {
     "custom_items": [],
     # 被用户从主界面删掉的项，键是 maaend / maa / maafgo / okww / vm0 / custom:<id>
     "hidden_items": [],
-    # ---- 以下是给「关于」页和升级用的，一般不用动 ----
-    # 配置结构版本号：升级 exe 时靠它判断要不要迁移老配置。
-    "config_version": CONFIG_VERSION,
-    # 上次运行这个配置的软件版本。换新版 exe 后第一跑会在这里记一条日志。
-    "last_run_version": "",
-    "about": dict(ABOUT_INFO),
+    # ⚠ 这里**只放用户的东西**（路径、开关、勾选、自定义项）。
+    # 版本号这类程序内部状态在 launcher.state.json；
+    # 作者信息写死在 ABOUT_INFO。以前这两样混在这儿，用户一改就出事。
 }
 
 
@@ -248,39 +269,88 @@ def _backup_config(tag):
         return ""
 
 
+def load_state():
+    """读程序的内部状态（配置结构版本、上次运行版本）
+
+    坏了 / 丢了都不要紧：当作全新状态处理，最多多做一次"补默认值"，
+    用户的路径和勾选一律不受影响 —— 这正是把它跟 config.json 分开的好处。
+    """
+    global STATE_FIX
+    STATE_FIX = False
+    st = {"config_version": 1, "last_run_version": ""}
+    for path in (STATE_PATH, STATE_PATH + ".bak"):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except Exception as e:
+            log_line("状态文件读取失败（%s）：%s" % (os.path.basename(path), e))
+            if path == STATE_PATH:
+                STATE_FIX = True       # 主文件坏了，等下用 .bak 或默认值重写它
+            continue
+        if not isinstance(data, dict):
+            continue
+        for k in st:
+            if k in data:
+                st[k] = data[k]
+        break
+    try:
+        st["config_version"] = max(1, int(st.get("config_version") or 1))
+    except Exception:
+        st["config_version"] = 1
+    st["last_run_version"] = str(st.get("last_run_version") or "")
+    return st
+
+
+def save_state():
+    """原子写内部状态（就两个字段，整份重写）"""
+    tmp = STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_PATH)
+        try:
+            shutil.copy2(STATE_PATH, STATE_PATH + ".bak")
+        except Exception:
+            pass
+    except Exception as e:
+        log_line("状态文件保存失败: %s" % e)
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
 def migrate_config(cfg, ver=None):
-    """把老版本的 config.json 补成当前结构
+    """把老版本的 config.json 整理成当前结构
 
-    原则：**只补缺的字段、只纠错的类型，绝不覆盖用户已经填的值**。
-    覆盖 exe 升级时用户唯一不能丢的就是路径和勾选，所以这里一律 setdefault。
+    原则：**只补缺的字段、只搬走程序内部的东西，绝不覆盖用户填的值**。
+    覆盖 exe 升级时用户唯一不能丢的就是路径和勾选。
 
-    ver 要传**从文件里读到的旧版本号**（不能传 cfg 的，cfg 是拿默认值打底合并出来的，
-    版本号已经是新的了，那样永远判不出"需要迁移"）。
+    ver 要传**从文件 / 状态里读到的旧版本号**（不能传合并后的 cfg，
+    那时版本号已经是新的了，永远判不出"需要迁移"）。
     返回改动说明列表（空列表 = 不用动）。
     """
     notes = []
-    if ver is None:
-        ver = cfg.get("config_version")
     try:
-        ver = int(ver or 1)
+        ver = int(ver if ver is not None else 1)
     except Exception:
         ver = 1
-    if ver < 1:
-        ver = 1
 
-    # v1 → v2：加「关于」页字段 + 记录上次运行的版本号
-    if ver < 2:
-        about = cfg.get("about")
-        if not isinstance(about, dict):
-            cfg["about"] = dict(ABOUT_INFO)
-        else:
-            for k, v in ABOUT_INFO.items():
-                about.setdefault(k, v)
-        cfg.setdefault("last_run_version", "")
-        notes.append("v1 → v2：补上「关于」页字段")
-        ver = 2
-
-    cfg["config_version"] = CONFIG_VERSION
+    # v2 → v3：config.json 只留"用户的东西"。
+    # 版本号搬去 launcher.state.json（load_config 里已经搬过了），
+    # 作者信息改由程序里的 ABOUT_INFO 提供 —— 放在配置里等于谁都能改，
+    # 改完「关于」页显示的就是假的了。
+    moved = [k for k in ("config_version", "last_run_version", "about") if k in cfg]
+    for k in moved:
+        cfg.pop(k, None)
+    if moved:
+        notes.append("config.json 里不再保存 %s：版本号改存 launcher.state.json，"
+                     "作者信息写死在程序里" % " / ".join(moved))
     return notes
 
 
@@ -292,9 +362,16 @@ def load_config():
 
     **升级 exe 时这个文件不会被覆盖**：它就躺在 exe 旁边，换版本/换名字
     都不影响。读进来之后只做「补字段」，用户填的路径和勾选一律保留；
-    真要改结构就先备份成 config.json.v<旧版本>.bak，再按 migrate 的说明补。
+    真要改结构就先备份成 config.json.v<旧版本>.bak，再按 migrate 的说明改。
+
+    这个文件里**只有用户的东西**。版本号在 launcher.state.json，
+    作者信息在代码里的 ABOUT_INFO —— 老版本混在 config.json 里的那些，
+    这里会顺手搬家 + 清掉。
     """
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    STATE.clear()
+    STATE.update(load_state())
+
     merged = False
     data = {}
     for path in (CONFIG_PATH, CONFIG_PATH + ".bak"):
@@ -327,27 +404,42 @@ def load_config():
             log_line("主配置读不了，已用 config.json.bak 恢复勾选和路径")
             save_config(cfg)                 # 顺手把主文件修回来
         break
+
     if not merged:
         save_config(cfg)
+        if STATE.get("config_version") != CONFIG_VERSION:
+            STATE["config_version"] = CONFIG_VERSION
+            save_state()
         return cfg
 
-    # ---- 从老版本升级上来：先备份原文件，再补字段，用户的值原样保留 ----
+    # ---- 老 config.json 里可能还留着程序内部状态（v3 之前是混在一起的）----
     try:
-        ver_old = int(data.get("config_version") or 1)
+        legacy_ver = int(data.get("config_version") or 0)
     except Exception:
-        ver_old = 1
+        legacy_ver = 0
+    legacy_last = str(data.get("last_run_version") or "")
+    ver_old = max(int(STATE.get("config_version") or 1), legacy_ver, 1)
+
+    state_dirty = False
+    if legacy_last and not STATE.get("last_run_version"):
+        STATE["last_run_version"] = legacy_last     # 搬家：别让升级提示失效
+        state_dirty = True
+
+    # ---- 从老版本升级上来：先备份原文件，再整理，用户的值原样保留 ----
     notes = migrate_config(cfg, ver_old)
     if notes:
         bak = _backup_config("v%d" % ver_old)
         for n in notes:
-            log_line("配置升级：" + n)
+            log_line("配置整理：" + n)
         if bak:
             log_line("老配置已备份：%s" % os.path.basename(bak))
         save_config(cfg)
-    elif cfg.get("config_version") != ver_old:
-        save_config(cfg)
+    if int(STATE.get("config_version") or 1) != CONFIG_VERSION:
+        STATE["config_version"] = CONFIG_VERSION
+        state_dirty = True
+    if state_dirty or STATE_FIX:
+        save_state()
     return cfg
-
 
 def save_config(cfg):
     """原子写 + 留一份 .bak
@@ -403,6 +495,200 @@ def open_url(url):
         return ""
     except Exception as e:
         return "%s: %s" % (type(e).__name__, e)
+
+
+# ----------------------------------------------------------------------------
+# 自动更新（GitHub Releases）
+# ----------------------------------------------------------------------------
+def ver_tuple(tag):
+    """v2.11.0 / 2.11 / V2.11.0-beta 都变成 (2, 11, 0)，认不出就当 (0,)"""
+    nums = re.findall(r"\d+", str(tag or ""))
+    if not nums:
+        return (0,)
+    return tuple(int(n) for n in nums[:4])
+
+
+def is_newer(tag, base=None):
+    """tag 是不是比当前版本新（按数字段比较，不按字符串）"""
+    return ver_tuple(tag) > ver_tuple(base or APP_VERSION)
+
+
+def http_json(url, timeout=8):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UPDATE_UA,
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def find_latest_release(timeout=8):
+    """查 GitHub 上最新的 Release，返回一个 dict（查不到就抛异常，由调用方兜）"""
+    data = http_json(UPDATE_API, timeout)
+    if not isinstance(data, dict):
+        raise RuntimeError("GitHub 返回的不是对象")
+    tag = str(data.get("tag_name") or "").strip()
+    assets = data.get("assets") or []
+    pick = None
+    # 优先挑名字里带 windows/x64 的 zip；没有就第一个 zip；再没有就第一个附件
+    for a in assets:
+        n = str(a.get("name") or "").lower()
+        if n.endswith(".zip") and ("windows" in n or "x64" in n):
+            pick = a
+            break
+    if pick is None:
+        pick = next((a for a in assets
+                     if str(a.get("name") or "").lower().endswith(".zip")), None)
+    if pick is None and assets:
+        pick = assets[0]
+    pick = pick or {}
+    return {
+        "tag": tag,
+        "name": str(data.get("name") or tag),
+        "url": str(pick.get("browser_download_url") or ""),
+        "asset": str(pick.get("name") or ""),
+        "size": int(pick.get("size") or 0),
+        "page": str(data.get("html_url") or UPDATE_PAGE),
+        "published": str(data.get("published_at") or "")[:10],
+    }
+
+
+def download_file(url, dst, on_progress=None, timeout=20):
+    """流式下载，每 64KB 回调一次 (已下, 总大小)；总大小未知时给 0"""
+    req = urllib.request.Request(url, headers={"User-Agent": UPDATE_UA})
+    got = 0
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        try:
+            total = int(r.headers.get("Content-Length") or 0)
+        except Exception:
+            total = 0
+        with open(dst, "wb") as f:
+            while True:
+                chunk = r.read(64 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if on_progress:
+                    on_progress(got, total)
+    return got
+
+
+def extract_new_exe(zip_path, out_dir):
+    """从发布包里挑出 exe 解到 out_dir，返回解出来的路径
+
+    发布包结构是「exe + README.md」平铺；万一以后加了子目录也能找得到。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as z:
+        cand = [n for n in z.namelist()
+                if n.lower().endswith(".exe") and not n.endswith("/")]
+        if not cand:
+            raise RuntimeError("压缩包里没找到 exe")
+        want = os.path.basename(sys.executable)
+        pick = next((n for n in cand if os.path.basename(n) == want), None)
+        if pick is None:
+            pick = min(cand, key=lambda n: n.count("/"))
+        z.extract(pick, out_dir)
+        return os.path.join(out_dir, *pick.split("/"))
+
+
+def _short_net_err(e):
+    """把 urllib/socket 的一堆英文异常翻成一句人话"""
+    msg = str(e) or type(e).__name__
+    low = msg.lower()
+    if "timed out" in low or "timeout" in low:
+        return "连不上 GitHub（超时），挂代理或换网络再试"
+    if "getaddrinfo" in low or "name or service" in low:
+        return "DNS 解析失败，检查网络"
+    if "certificate" in low:
+        return "证书校验失败（可能被代理拦截）"
+    if "connection" in low and ("refused" in low or "reset" in low or "aborted" in low):
+        return "连接被拒绝/中断"
+    return msg[:70]
+
+
+def pid_alive(pid):
+    try:
+        return any(p == int(pid) for p, _pp, _n in list_processes())
+    except Exception:
+        return False
+
+
+def apply_update_cli(args):
+    """--apply-update <目标exe> <旧进程pid> [--no-launch]
+
+    自己（新版的 exe）从 _update 目录跑起来，等旧进程退出后把自己复制过去。
+    为什么要这么绕：Windows 下正在运行的 exe 换不掉（文件被锁），
+    所以只能"另起一个进程等它退出，再替换"。
+    """
+    try:
+        i = args.index("--apply-update")
+        target = os.path.abspath(args[i + 1])
+        old_pid = int(args[i + 2])
+    except Exception:
+        return 2
+    no_launch = "--no-launch" in args
+    me = os.path.abspath(sys.executable)
+    if os.path.normcase(me) == os.path.normcase(target):
+        log_line("更新中止：更新程序和目标路径是同一个文件")
+        return 2
+
+    deadline = time.time() + 40
+    while time.time() < deadline and pid_alive(old_pid):
+        time.sleep(0.3)
+    time.sleep(0.5)                       # 让单实例锁、文件句柄彻底放开
+
+    bak = target + ".old"
+    try:
+        if os.path.isfile(bak):
+            os.remove(bak)
+    except Exception:
+        pass
+    try:
+        os.replace(target, bak)            # 老版本先改名留底，出问题能回滚
+    except Exception as e:
+        log_line("更新失败：老 exe 改不动（%s）" % e)
+        return 3
+    try:
+        shutil.copy2(me, target)
+    except Exception as e:
+        log_line("更新失败：新 exe 写不进去（%s），已回滚" % e)
+        try:
+            os.replace(bak, target)
+        except Exception:
+            pass
+        return 4
+    log_line("更新完成：已替换为新版 exe（老版本备份为 %s）"
+             % os.path.basename(bak))
+    if not no_launch:
+        try:
+            subprocess.Popen([target], close_fds=True)
+        except Exception:
+            try:
+                os.startfile(target)
+            except Exception as e:
+                log_line("更新后自动启动失败，请手动双击：%s" % e)
+    return 0
+
+
+def cleanup_update_leftovers():
+    """清掉上次更新留下的 _update 目录和 *.old 备份（删不掉就算了，下次再试）"""
+    try:
+        if os.path.isdir(UPDATE_DIR):
+            shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+    except Exception:
+        pass
+    try:
+        for name in os.listdir(APP_DIR):
+            if not name.lower().endswith(".exe.old"):
+                continue
+            try:
+                os.remove(os.path.join(APP_DIR, name))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -3347,15 +3633,24 @@ class App:
         self.prompt = None
         # 本次只跑这些 key（点「是」时设；只影响这一轮，不改勾选、不写 config.json）
         self.run_only = None
+        # 自动更新状态机：
+        #   idle / checking / uptodate / available / downloading / ready / error
+        # 只影响界面提示，不阻塞任何启动流程。
+        self.upd = {"state": "idle", "tag": "", "url": "", "page": "",
+                    "size": 0, "asset": "", "date": "", "pct": 0,
+                    "err": "", "path": ""}
+        self._upd_due = time.time() + 3.0      # 开机 3 秒后才开始查，别和启动抢
+        self._upd_tried = False
         # 路径还没指过（或中途被清空）：直接进设置页，绝不自动开跑。
         # 默认配置里没有任何真实路径，自动跑只会满屏「找不到 xxx.exe」。
         self.first_run = not config_ready(self.cfg)
         # 换新版 exe 后第一跑：记下上一版，日志里提示一句"配置沿用了"。
-        # （配置就在 exe 旁边，覆盖 exe 不会碰它，这里只是个凭据）
-        self.prev_version = str(self.cfg.get("last_run_version") or "")
+        # 这个版本号**不写 config.json**（那是用户的东西），
+        # 记在 launcher.state.json 里，用户改不到也不影响配置。
+        self.prev_version = str(STATE.get("last_run_version") or "")
         if self.prev_version != APP_VERSION:
-            self.cfg["last_run_version"] = APP_VERSION
-            save_config(self.cfg)
+            STATE["last_run_version"] = APP_VERSION
+            save_state()
         if self.first_run:
             self.page_stack.append("main")
             self.page = "settings"
@@ -3379,6 +3674,9 @@ class App:
         if not items:
             return
         for kind, args in items:
+            if kind == "upd":
+                self._upd_state(*args)
+                continue
             if kind == "log":
                 text = args[0]
                 color = "text2"
@@ -3523,6 +3821,11 @@ class App:
             "logcard": (pad, log_top, W - pad, log_bot),
             "statusbar": (pad, H - 34, W - pad, H - 12),
         }
+        # 有可用更新时，状态栏右侧那块是可点的（点了跳设置页）
+        if self.upd_hint():
+            _l, _t, _r, _b = rects["statusbar"]
+            _w = min(self.S(300), (_r - _l) // 2)
+            rects["upd_hint"] = (_r - _w, _t, _r, _b)
         for i, (key, bw) in enumerate(
                 (("start", 200), ("cancel", 118), ("shutdown", 118),
                  ("edit", 104), ("night", 110))):
@@ -3614,20 +3917,16 @@ class App:
     def about_blocks(self):
         """关于页要展示的几块内容：[(块标题, [(标签, 值, 链接), ...]), ...]
 
-        作者名/主页/仓库都从 config.json 的 about 里读，换地址不用重打包。
+        作者名 / 主页 / 仓库**只认代码里的 ABOUT_INFO**，不再读 config.json ——
+        这些是作者信息，放进配置文件等于谁都能改，改完界面上显示的就是假的了。
         """
-        ab = self.cfg.get("about")
-        if not isinstance(ab, dict):
-            ab = {}
+        def g(key):
+            return str(ABOUT_INFO.get(key) or "").strip()
 
-        def g(key, default=""):
-            v = ab.get(key)
-            return (default if v is None else str(v)).strip()
-
-        author = g("author", ABOUT_INFO["author"]) or "未填写"
-        author_page = g("author_page", ABOUT_INFO["author_page"])
-        project = g("project", ABOUT_INFO["project"])
-        issues = g("issues", ABOUT_INFO["issues"])
+        author = g("author") or "未填写"
+        author_page = g("author_page")
+        project = g("project")
+        issues = g("issues")
         group = g("group")
 
         lines = [("作者", author, None)]
@@ -3860,12 +4159,14 @@ class App:
             "sub": "一天要清两次日常的手游 · 现在是 %s" % self.night_desc(),
             "chip": "设置",
         })
+        u_sub, u_chip = self.upd_text()
         out.append({
-            "key": "config",
-            "icon": "cfg",
+            "key": "update",
+            "icon": "launcher",
             "h": 33,
-            "title": "config.json",
-            "sub": "点这一行用记事本打开（超时、实例名、开关都在这）",
+            "title": "检查更新",
+            "sub": u_sub,
+            "chip": u_chip,
         })
 
         out.append({
@@ -3874,8 +4175,8 @@ class App:
             "title": "④ 关于",
             "sub": "作者、项目主页、版本与使用声明",
         })
-        ab = cfg.get("about") if isinstance(cfg.get("about"), dict) else {}
-        author = (ab.get("author") or "").strip() or "未填写"
+        # 作者名只认代码里的常量，不从 config.json 读（那个谁都能改）
+        author = str(ABOUT_INFO.get("author") or "").strip() or "未填写"
         out.append({
             "key": "about_page",
             "icon": "launcher",
@@ -4226,7 +4527,19 @@ class App:
         self.draw_buttons(mem)
         if self.page != "about":          # 关于页占满整块，没有日志区
             self.draw_log(mem, R["logcard"])
-        self.text(mem, self.status, R["statusbar"], C["muted"], self.font(11))
+        _sb = R["statusbar"]
+        _hint = self.upd_hint()
+        if _hint:
+            # 右边那句话是可点的：左边状态文字让出一半，免得两行叠在一起
+            self.text(mem, self.status,
+                      (_sb[0], _sb[1], _sb[0] + (_sb[2] - _sb[0]) // 2, _sb[3]),
+                      C["muted"], self.font(11),
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS
+                      | DT_NOPREFIX)
+            self.text(mem, _hint, _sb, C["accent"], self.font(11, True),
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        else:
+            self.text(mem, self.status, _sb, C["muted"], self.font(11))
 
         if self.prompt:                     # 模态询问要盖在一切之上
             self.draw_prompt(mem, w, h)
@@ -4680,6 +4993,10 @@ class App:
                 if a <= y <= b:
                     return "expick_row:%d" % idx
             return "expick_mask"
+        # 状态栏右侧的「有新版本」提示：整块可点
+        r = R.get("upd_hint")
+        if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+            return "upd_goto"
         # 设置页 / 自定义页 / 关于页里只有「返回」可用，其余按钮是灰的，不参与命中
         keys = (("edit",) if self.page in ("settings", "custom", "night", "about")
                 else ("start", "cancel", "shutdown", "edit", "night",
@@ -5044,6 +5361,193 @@ class App:
         self.status = msg
         user32.InvalidateRect(self.hwnd, None, False)
 
+    # ---------- 自动更新 ----------
+    def _tick_update(self):
+        """开机 3 秒后悄悄查一次更新；查过就不再自动查（用户还能手动点）"""
+        if self._upd_tried or time.time() < self._upd_due:
+            return
+        self._upd_tried = True
+        if not self.cfg.get("check_update_on_launch", True):
+            return
+        # 自检截图 / 开发调试一律不联网，免得截图里出现"检查中"或者卡住
+        if self.no_auto or getattr(self, "no_mutex", False):
+            return
+        self.upd_check(auto=True)
+
+    def upd_hint(self):
+        """状态栏右边那句可点的提示；没有可更新的就返回空串"""
+        u = self.upd
+        st = u.get("state")
+        if st == "available" and u.get("tag"):
+            return "发现新版 %s · 点这里更新" % u["tag"]
+        if st == "downloading":
+            return "正在下载新版 %s（%.0f%%）· 点这里查看" % (u.get("tag"), u.get("pct") or 0)
+        if st == "ready":
+            return "新版 %s 已下载 · 点这里安装" % u.get("tag")
+        return ""
+
+    def upd_text(self):
+        """设置页「检查更新」那一行显示什么：(副标题, 右侧按钮文字)"""
+        u = self.upd
+        st = u.get("state")
+        if st == "checking":
+            return "正在查询 GitHub…（几秒就好）", "查询中"
+        if st == "downloading":
+            mb = (u.get("size") or 0) / 1048576.0
+            return ("正在下载 %s：%.0f%%%s（别关窗口）"
+                    % (u.get("tag"), u.get("pct") or 0,
+                       "（共 %.1f MB）" % mb if mb else "")), "下载中"
+        if st == "ready":
+            return ("新版 %s 已下载好，点右侧安装：程序会关闭、替换后自动重开"
+                    % u.get("tag")), "安装"
+        if st == "available":
+            mb = (u.get("size") or 0) / 1048576.0
+            extra = "（约 %.1f MB）" % mb if mb else ""
+            when = " · %s 发布" % u["date"] if u.get("date") else ""
+            return ("发现新版 %s%s，点右侧下载%s" % (u.get("tag"), when, extra)), "下载"
+        if st == "uptodate":
+            return "已经是最新（%s）· 点右侧再查一次" % APP_VERSION, "再查"
+        if st == "error":
+            return "检查失败：%s · 点右侧重试" % (u.get("err") or "未知错误"), "重试"
+        return "当前 %s · 点右侧去 GitHub 看看有没有新版" % APP_VERSION, "检查"
+
+    def _upd_state(self, st, info=None):
+        """worker 线程回传的状态落到界面（只在 UI 线程跑，由 drain 调用）"""
+        info = info or {}
+        u = self.upd
+        if st in ("available", "uptodate"):
+            u.update({"state": st, "tag": info.get("tag") or "",
+                      "url": info.get("url") or "", "page": info.get("page") or "",
+                      "size": info.get("size") or 0,
+                      "asset": info.get("asset") or "",
+                      "date": info.get("published") or "", "pct": 0})
+            if st == "available":
+                u["page"] = u["page"] or UPDATE_PAGE
+                self.ui_log("发现新版 %s（当前 %s）。设置 →「检查更新」可以直接下载安装，"
+                            "或者点状态栏右边那句。"
+                            % (u["tag"], APP_VERSION))
+            else:
+                self.ui_log("已经是最新版（%s）。" % APP_VERSION)
+        elif st == "downloading":
+            u["state"] = "downloading"
+            u["pct"] = info.get("pct") or 0
+        elif st == "ready":
+            u.update({"state": "ready", "pct": 100, "path": info.get("path") or ""})
+            self.ui_log("新版 %s 已下载完成。点设置页「安装」，或点状态栏右边那句。"
+                        % (u.get("tag") or ""))
+        elif st == "error":
+            u["state"] = "error"
+            u["err"] = info.get("err") or "未知错误"
+            self.ui_log("检查更新失败：%s" % u["err"])
+        user32.InvalidateRect(self.hwnd, None, False)
+
+    def upd_check(self, auto=False):
+        """查 GitHub 最新 Release（后台线程，不弹窗、不阻塞界面）"""
+        if self.upd.get("state") in ("checking", "downloading"):
+            return
+        self.upd["state"] = "checking"
+        self.upd["err"] = ""
+        user32.InvalidateRect(self.hwnd, None, False)
+        if not auto:
+            self.ui_log("正在查询 GitHub 上的最新版本…")
+
+        def work():
+            try:
+                rel = find_latest_release()
+                if not rel.get("tag"):
+                    raise RuntimeError("没拿到版本号")
+                if is_newer(rel["tag"]):
+                    self.emit("upd", "available", rel)
+                else:
+                    self.emit("upd", "uptodate", rel)
+            except urllib.error.HTTPError as e:
+                msg = ("GitHub 限流了，过一会儿再试" if e.code in (403, 429)
+                       else "GitHub 返回 %s" % e.code)
+                self.emit("upd", "error", {"err": msg})
+            except Exception as e:
+                self.emit("upd", "error", {"err": _short_net_err(e)})
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def upd_download(self):
+        """把新版 zip 下到 _update，再解出 exe（后台线程，带进度）"""
+        if self.upd.get("state") in ("checking", "downloading"):
+            return
+        url = self.upd.get("url") or ""
+        tag = self.upd.get("tag") or ""
+        if not url:
+            self.ui_log("这个版本没带可下载的附件，已打开 GitHub 页面让你手动下")
+            open_url(self.upd.get("page") or UPDATE_PAGE)
+            return
+        self.upd["state"] = "downloading"
+        self.upd["pct"] = 0
+        user32.InvalidateRect(self.hwnd, None, False)
+        asset = self.upd.get("asset") or ""
+        self.ui_log("开始下载 %s（%s）…" % (tag, asset or "发布包"))
+
+        def work():
+            try:
+                os.makedirs(UPDATE_DIR, exist_ok=True)
+                zpath = os.path.join(
+                    UPDATE_DIR, asset or ("daily-launcher-%s-windows-x64.zip" % tag))
+                last = [-5.0]
+
+                def prog(got, total):
+                    if total:
+                        pct = got * 100.0 / total
+                    else:
+                        pct = min(95.0, got * 100.0 / max(1, self.upd.get("size") or 1))
+                    if pct - last[0] >= 2:
+                        last[0] = pct
+                        self.emit("upd", "downloading", {"pct": pct})
+
+                download_file(url, zpath, prog)
+                exe = extract_new_exe(zpath, UPDATE_DIR)
+                self.emit("upd", "ready", {"path": exe})
+            except Exception as e:
+                self.emit("upd", "error", {"err": "下载失败：%s" % _short_net_err(e)})
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def upd_apply(self):
+        """启动新 exe 当"更新器"，它会等本进程退出后替换 exe 并重新打开"""
+        if self.busy:
+            self.ui_log("正在跑任务，等这一轮结束再装更新（或者先点「取消启动」）")
+            return
+        path = self.upd.get("path") or ""
+        if not path or not os.path.isfile(path):
+            self.ui_log("更新包不见了，请重新下载一次")
+            self.upd["state"] = "available"
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if not getattr(sys, "frozen", False):
+            self.ui_log("源码模式不支持自动替换 exe，请手动重新打包")
+            return
+        target = os.path.abspath(sys.executable)
+        self.ui_log("正在安装 %s：窗口会关闭，替换完成后自动重开…" % (self.upd.get("tag") or ""))
+        self.status = "正在安装更新，马上重开…"
+        user32.InvalidateRect(self.hwnd, None, False)
+        try:
+            subprocess.Popen([path, "--apply-update", target, str(os.getpid())],
+                             close_fds=True)
+        except Exception as e:
+            self.ui_log("启动更新程序失败：%s" % e)
+            return
+        time.sleep(0.3)
+        user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+
+    def upd_click(self):
+        """设置页点「检查更新」那一行：按当前状态决定做什么"""
+        st = self.upd.get("state")
+        if st == "available":
+            self.upd_download()
+        elif st == "ready":
+            self.upd_apply()
+        elif st in ("checking", "downloading"):
+            return                              # 正在忙，忽略连点
+        else:
+            self.upd_check()
+
     def pick_row(self, kind):
         """设置页点了一行：路径类弹文件夹选择框，选项类就地循环切换"""
         if self.busy:
@@ -5084,6 +5588,9 @@ class App:
             return
         if kind == "n_restore":
             self.restore_night()
+            return
+        if kind == "update":
+            self.upd_click()
             return
         if kind == "config":
             try:
@@ -5153,6 +5660,18 @@ class App:
                 self.status = "已在浏览器打开：%s" % self._short_url(url)
                 self.ui_log("打开链接：%s" % url)
                 user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if key == "upd_goto":
+            # 状态栏那句提示：跳到设置页，那一行就在 ③ 其它 里
+            if self.page != "settings":
+                self.page_stack.append(self.page)
+                self.page = "settings"
+                self.status = ("新版 %s 等着装：点「检查更新」那一行右边的按钮"
+                               % (self.upd.get("tag") or ""))
+                self.ui_log("已跳到设置页：③ 其它 →「检查更新」")
+            else:
+                self.status = self.upd_hint() or self.status
+            user32.InvalidateRect(self.hwnd, None, False)
             return
         if key == "start":
             if not self.busy:
@@ -5268,6 +5787,7 @@ class App:
             if msg == WM_TIMER:
                 self.drain()
                 self._tick_prompt()
+                self._tick_update()
                 if self._auto_pending and not self.busy and time.time() >= self._auto_at:
                     self._auto_pending = False
                     self.do("start")
@@ -5528,6 +6048,33 @@ def screenshot(path, rect=None):
 
 def main():
     args = sys.argv[1:]
+
+    # 更新器模式：新版 exe 被旧进程拉起来替自己换文件。跑完就退，绝不进界面。
+    # 必须在最前面处理 —— 否则它会走下面的提权/计划任务逻辑，又开一个窗口。
+    if "--apply-update" in args:
+        return apply_update_cli(args)
+
+    # 命令行查更新（排障 / 自检用）：结果同时写日志，窗口版 exe 也能查
+    if "--check-update" in args:
+        try:
+            rel = find_latest_release()
+        except Exception as e:
+            msg = "检查更新失败：%s" % _short_net_err(e)
+            print(msg)
+            log_line(msg)
+            return 1
+        msg = ("当前 %s，GitHub 最新 %s%s"
+               % (APP_VERSION, rel.get("tag") or "?",
+                  "" if is_newer(rel.get("tag")) else "（已是最新）"))
+        print(msg)
+        log_line(msg)
+        if rel.get("asset"):
+            msg2 = "发布包 %s（%.1f MB）：%s" % (
+                rel["asset"], (rel.get("size") or 0) / 1048576.0, rel.get("url"))
+            print(msg2)
+            log_line(msg2)
+        return 0
+
     shot = None
     if "--shot" in args:
         i = args.index("--shot")
@@ -5588,11 +6135,19 @@ def main():
     if not shot and is_admin() and "--no-task" not in args:
         ensure_task()
 
+    # 上次更新留下的 _update 目录 / *.exe.old，开机顺手清掉（删不掉就下次再说）
+    threading.Thread(target=cleanup_update_leftovers, daemon=True).start()
+
     app = App()
     if shot or "--no-auto" in args:
         app.no_auto = True
     if shot:
         app.no_mutex = True                # 自检截图不抢单实例锁
+    if shot and "--fake-update" in args:
+        # 自检用：假装查到了新版，好在截图里看状态栏提示和设置页那一行
+        app.upd.update({"state": "available", "tag": "v2.12.0", "pct": 0,
+                        "size": 8846816, "date": "2026-11-02",
+                        "url": "https://example.com/x.zip", "asset": "x.zip"})
     if shot and "--prompt" in args:
         # 自检用：--shot 会关掉自动启动，这里手动把询问卡摆出来截图
         app.prompt = {"until": time.time() + PROMPT_SECONDS, "left": PROMPT_SECONDS}
