@@ -17,3 +17,18 @@ DeepSeek交接_*.md
 GPT交接_*.md
 codex交接_*.md
 内部文档/
+
+# 运行时 / 本机状态（装完就有，跟源码无关）
+_internal/
+install.json
+launcher.state.json
+launcher.state.json.bak
+config.json.*.bak
+fix_env.py
+
+# 构建与调试产物
+ui_refresh_backup/
+design/
+源码/build/*.png
+源码/build/*.txt
+源码/build/_icon_src/
