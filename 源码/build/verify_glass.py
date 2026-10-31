@@ -104,7 +104,11 @@ try:
             else:image=Image.frombytes('RGB',(surf.width,surf.height),data,'raw','BGRX')
             image.save(out/(material+'-'+page+'.png'))
             if material!='solid' and page=='settings':
-                mask=Image.frombytes('RGB',(surf.width,surf.height),pixels(ui._glass_text_layers[0]),'raw','BGRX')
+                layer=ui._glass_text_layers[0]
+                # 文字层是超采样尺寸（TEXT_SS 倍），先缩回客户区尺寸再裁
+                mask=Image.frombytes('RGB',(layer.width,layer.height),pixels(layer),'raw','BGRX')
+                if (layer.width,layer.height)!=(surf.width,surf.height):
+                    mask=mask.reduce(max(1,layer.width//surf.width))
                 box=(ui.rects['edit'][2]+4,ui.rects['card'][3]+1,ui.rects['card'][2],ui.rects['logcard'][1])
                 assert mask.crop(box).getbbox() is None,('scrolling glyphs escaped clip',box)
 
