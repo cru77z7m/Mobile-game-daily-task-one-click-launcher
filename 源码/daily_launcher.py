@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.17.7"
+APP_VERSION = "v2.17.8"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -5904,6 +5904,13 @@ class App(VisualShell):
             self.draw_hero(mem)
             self.text(mem, "任务清单", (self.S(212),self.S(185),self.S(460),self.S(209)),
                       C["text2"], self.font(11, True))
+            # 顺序说明：和卡片上的序号角标呼应，省得用户自己数
+            _n = len(R.get("rows") or [])
+            if _n > 1:
+                self.text(mem, "按序号依次执行  1 → %d" % _n,
+                          (self.S(288), self.S(186), self.S(600), self.S(209)),
+                          C["muted"], self.font(9.5),
+                          DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
         if self.page != "main":
             cr = R["card"]
             self.fill_round(mem, (cr[0], cr[1] + self.S(3), cr[2], cr[3] + self.S(3)),
@@ -5930,7 +5937,7 @@ class App(VisualShell):
                 gdi32.IntersectClipRect(mem, card[0], card[1], card[2], card[3])
             for i, (item, y, rh) in enumerate(rows):
                 if self.page == "main":
-                    self.draw_task_tile(mem, item, R["tiles"][item["key"]])
+                    self.draw_task_tile(mem, item, R["tiles"][item["key"]], i + 1)
                 else:
                     self.draw_row(mem, item, y, R["card"][0], R["card"][2], rh)
                 if self.page != "main" and i < len(rows) - 1:

@@ -1002,11 +1002,24 @@ class SetupUI(object):
             ole32.CoInitialize(None)       # SHBrowseForFolder / IShellLink 都要
         except Exception:
             pass
+        # DPI 必须自己在代码里声明：manifest 里的 dpiAware 在 PyInstaller 产物里实测不生效
+        # （主程序是在 main() 里显式 SetProcessDpiAwareness(2) 才清晰的，安装器以前漏了这句）。
+        # 进程 unaware 时系统把 560x392 的窗口位图放大 1.75 倍显示 —— 字发虚；更糟的是
+        # 窗口尺寸按 96DPI 的逻辑算、标题栏边框却是系统按 168DPI 画的，客户区比绘制区
+        # 少一圈，右下角被裁，底部状态字"只露出上半截"。
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)      # PER_MONITOR_AWARE
+        except Exception:
+            try:
+                user32.SetProcessDPIAware()
+            except Exception:
+                pass
         hdc = user32.GetDC(None)
         try:
             self.dpi = float(gdi32.GetDeviceCaps(hdc, 88)) or 96.0   # LOGPIXELSX
         finally:
             user32.ReleaseDC(None, hdc)
+        log("界面 DPI = %.0f（缩放 %.0f%%）" % (self.dpi, self.dpi / 96.0 * 100))
 
         hinst = kernel32.GetModuleHandleW(None)
         hinst = wt.HINSTANCE(hinst)
@@ -1037,6 +1050,23 @@ class SetupUI(object):
             style, CW_USEDEFAULT, CW_USEDEFAULT, ww, wh, None, None, hinst, None)
         if not self.hwnd:
             raise OSError("创建窗口失败：%s" % ctypes.get_last_error())
+        # 客户区校正：AdjustWindowRectEx 是按**当前线程 DPI 上下文**估边框的，
+        # 而实际标题栏/边框是系统按真实 DPI（这里 168）画的。高缩放下两者的差
+        # 会让客户区比绘制区小（实测 966x669 vs 980x686）——右下角各裁掉十几像素，
+        # 底部那行状态字就"只露出上半截"。别去猜边框值，直接量出来再补。
+        cr = RECT()
+        user32.GetClientRect(self.hwnd, ctypes.byref(cr))
+        dw = W - (cr.right - cr.left)
+        dh = H - (cr.bottom - cr.top)
+        if dw or dh:
+            wr = RECT()
+            user32.GetWindowRect(self.hwnd, ctypes.byref(wr))
+            user32.SetWindowPos(self.hwnd, None, 0, 0,
+                                (wr.right - wr.left) + dw,
+                                (wr.bottom - wr.top) + dh,
+                                SWP_NOMOVE | SWP_NOZORDER)
+            log("客户区校正：%dx%d -> %dx%d（补 %+d, %+d）"
+                % (cr.right - cr.left, cr.bottom - cr.top, W, H, dw, dh))
         user32.ShowWindow(self.hwnd, SW_SHOW)
         user32.UpdateWindow(self.hwnd)
         msg = wt.MSG()
@@ -1062,6 +1092,10 @@ user32.ReleaseCapture.restype = wt.BOOL
 user32.SetCapture.argtypes = [wt.HWND]
 user32.InvalidateRect.argtypes = [wt.HWND, ctypes.c_void_p, wt.BOOL]
 user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
+user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_int, wt.UINT]
 user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
 user32.UpdateWindow.argtypes = [wt.HWND]
 gdi32.MoveToEx.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]

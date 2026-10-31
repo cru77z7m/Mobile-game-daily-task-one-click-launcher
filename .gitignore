@@ -32,3 +32,6 @@ design/
 源码/build/*.png
 源码/build/*.txt
 源码/build/_icon_src/
+
+# --diag-icon 的输出（排障用，不进仓库）
+icon_diag.txt

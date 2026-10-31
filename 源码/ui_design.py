@@ -341,7 +341,7 @@ class VisualShell:
             return self.chk_custom.get(key[7:], True)
         return getattr(self, key+'_on', True)
 
-    def draw_task_tile(self, dc, item, rect):
+    def draw_task_tile(self, dc, item, rect, step=0):
         a,S,C = self.api(), self.S, self.api().C
         l,t,r,b=rect
         key=item['key']
@@ -351,6 +351,18 @@ class VisualShell:
         self.fill_round(dc,rect,13,a.mix_color(C['card'],C['accent_l'],hot*.55),
                         a.rgb('#D9DCF6') if checked else C['border'])
         a.draw_icon(dc,item.get('icon'),l+S(16),t+S(16),S(38))
+        if step:
+            # 序号角标：执行顺序是这套流程最重要的信息，光靠"左上到右下"的网格
+            # 读不出来（左右两列很容易被看成两条独立的队列）。压在图标左上角，
+            # 不占额外版面；没勾选的那项转灰，但序号保留 —— 用户能看出"第 3 步这次跳过"。
+            d = S(17)
+            bx, by = l + S(9), t + S(9)
+            self.fill_round(dc, (bx, by, bx + d, by + d), 8.5,
+                            C['accent'] if checked else a.rgb('#C3CBDC'),
+                            a.rgb('#FFFFFF'), 1.6)
+            self.text(dc, str(step), (bx, by, bx + d, by + d), a.rgb('#FFFFFF'),
+                      self.font(9, True),
+                      a.DT_CENTER | a.DT_SINGLELINE | a.DT_VCENTER | a.DT_NOPREFIX)
         title=item['title'].replace('MuMu 实例 ','MuMu ')
         self.text(dc,title,(l+S(66),t+S(14),r-S(38),t+S(39)),
                   C['text'] if checked else C['text2'],self.font(12.5,True))
