@@ -11,4 +11,9 @@ payload.zip
 源码/payload.zip
 release/
 /*.zip
+# 开发内部文档，不上传 GitHub
 PROGRESS.md
+DeepSeek交接_*.md
+GPT交接_*.md
+codex交接_*.md
+内部文档/
