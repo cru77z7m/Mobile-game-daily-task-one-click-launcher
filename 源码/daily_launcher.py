@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.17.6"
+APP_VERSION = "v2.17.7"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -2369,6 +2369,84 @@ def load_icon(name, px=96):
     return h
 
 
+_ICON_DIAG_N = [0]
+
+
+def _write_icon_diag():
+    """--diag-icon：一次性把 Pillow 的真实状态写进 icon_diag.txt（排障专用）"""
+    import traceback
+    out = ["APP_DIR=%s" % APP_DIR,
+           "_MEIPASS=%s" % getattr(sys, "_MEIPASS", None)]
+    try:
+        import PIL
+        from PIL import Image
+        out.append("Pillow %s  file=%s" % (getattr(PIL, "__version__", "?"),
+                                           getattr(PIL, "__file__", "?")))
+        try:
+            Image.init()
+            out.append("init 后 .ico 注册为 %r" % (Image.registered_extensions().get(".ico"),))
+            out.append("Image.OPEN 里有 ICO: %r" % ("ICO" in Image.OPEN,))
+        except Exception:
+            out.append("init 失败: " + traceback.format_exc().replace("\n", " | "))
+        try:
+            import PIL.IcoImagePlugin as _ico
+            out.append("import IcoImagePlugin OK file=%s" % getattr(_ico, "__file__", "frozen"))
+            out.append("_accept 正常头 = %r" % (_ico._accept(b"\x00\x00\x01\x00"),))
+        except Exception:
+            out.append("import IcoImagePlugin 失败: " + traceback.format_exc().replace("\n", " | "))
+        src = assets_dir("icons", "launcher.ico")
+        if os.path.isfile(src):
+            with open(src, "rb") as f:
+                head = f.read(8)
+            out.append("src=%s size=%d head=%s" % (src, os.path.getsize(src), head.hex()))
+        else:
+            out.append("src 不存在: %s" % src)
+        try:
+            im = Image.open(src)
+            out.append("Image.open(路径) OK format=%s size=%s" % (im.format, im.size))
+        except Exception:
+            out.append("Image.open(路径) 失败: " + traceback.format_exc().replace("\n", " | "))
+        try:
+            with open(src, "rb") as f:
+                im = Image.open(f)
+            out.append("Image.open(文件对象) OK format=%s size=%s" % (im.format, im.size))
+        except Exception:
+            out.append("Image.open(文件对象) 失败: " + traceback.format_exc().replace("\n", " | "))
+    except Exception:
+        out.append("import PIL 失败: " + traceback.format_exc().replace("\n", " | "))
+    try:
+        with open(os.path.join(APP_DIR, "icon_diag.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(out))
+    except Exception:
+        pass
+
+
+def _icon_diag(msg):
+    """图标加载失败时留证据：正常路径不写；只记前 6 条，别刷屏"""
+    if _ICON_DIAG_N[0] >= 6:
+        return
+    _ICON_DIAG_N[0] += 1
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write("[%s] icon: %s\n" % (time.strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def _draw_icon_gdi(hdc, name, x, y, px):
+    """PIL 通道不可用时的退路：DrawIconEx（最近邻缩放，有锯齿，但至少不是空白）"""
+    h = load_icon(name, px)
+    if not h:
+        _icon_diag("%s: LoadImageW 失败 %s" % (name, assets_dir("icons", name + ".ico")))
+        return False
+    try:
+        return bool(user32.DrawIconEx(hdc, int(round(x)), int(round(y)), h,
+                                      px, px, 0, None, DI_NORMAL))
+    except Exception as e:
+        _icon_diag("%s: DrawIconEx %s: %s" % (name, type(e).__name__, e))
+        return False
+
+
 def draw_icon(hdc, name, x, y, size):
     """把图标画到 (x, y)，边长 size（都是物理像素）
 
@@ -2376,6 +2454,10 @@ def draw_icon(hdc, name, x, y, size):
     96px 的 ico 缩到 24px 时直接最近邻丢像素，侧边栏那排图标就是一片方块锯齿。
     现在改用 Pillow 的 LANCZOS 缩到目标尺寸、预乘 alpha 存进一张 32 位位图，
     再 AlphaBlend 贴上去 —— 缩放开销只在第一次（按 name+size 缓存）。
+
+    v2.17.7：Pillow 通道任何一步出错都会记一行 `icon:` 到 launcher.log 并退回
+    DrawIconEx。之前这里 `except: return False` 把异常整个吞掉，打包版里 17 个
+    图标一起消失却查不出原因（PYZ 里明明有 PIL）—— 兜底和证据都要留。
     """
     px = max(8, int(round(size)))
     key = (name, px)
@@ -2383,8 +2465,9 @@ def draw_icon(hdc, name, x, y, size):
     if surf is None:
         src = assets_dir("icons", name + ".ico")
         if not os.path.isfile(src):
+            _icon_diag("%s: 资源缺失 %s" % (name, src))
             _PIL_ICON_CACHE[key] = False
-            return False
+            return _draw_icon_gdi(hdc, name, x, y, px)
         try:
             from PIL import Image
             from ui_render import DibSurface
@@ -2394,17 +2477,22 @@ def draw_icon(hdc, name, x, y, size):
             surf = DibSurface(None, px, px)
             data = im.convert("RGBa").tobytes("raw", "BGRa")   # 预乘，AlphaBlend 要这个
             ctypes.memmove(surf.bits, data, len(data))
-        except Exception:
+        except Exception as e:
+            _icon_diag("%s: PIL 通道失败 %s: %s" % (name, type(e).__name__, e))
             _PIL_ICON_CACHE[key] = False
-            return False
+            return _draw_icon_gdi(hdc, name, x, y, px)
         _PIL_ICON_CACHE[key] = surf
     if surf is False:
-        return False
+        return _draw_icon_gdi(hdc, name, x, y, px)
     try:
-        return bool(msimg32.AlphaBlend(hdc, int(round(x)), int(round(y)), px, px,
+        ok = bool(msimg32.AlphaBlend(hdc, int(round(x)), int(round(y)), px, px,
                                      surf.dc, 0, 0, px, px,
                                      BLENDFUNCTION(0, 0, 255, 1)))
-    except Exception:
+        if not ok:
+            _icon_diag("%s: AlphaBlend 返回 0 err=%s" % (name, ctypes.get_last_error()))
+        return ok
+    except Exception as e:
+        _icon_diag("%s: AlphaBlend %s: %s" % (name, type(e).__name__, e))
         return False
 
 
@@ -7581,6 +7669,11 @@ def main():
             except Exception:
                 pass
         return 0 if ok else 1
+
+    # 排障：把 Pillow 在这台机器/这个打包产物里的真实状态写出来（--diag-icon）
+    if "--diag-icon" in args:
+        _write_icon_diag()
+        return 0
 
     # 命令行查更新（排障 / 自检用）：结果同时写日志，窗口版 exe 也能查
     if "--check-update" in args:

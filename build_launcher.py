@@ -44,8 +44,12 @@ MANIFEST_NAME = "app.manifest"
 
 # onefile / setup 都排掉这些：程序用不到，排掉省体积也省解包时间。
 # ssl/_ssl/_hashlib 最关键——它们会把 libcrypto(8MB)+libssl(1.6MB) 拖进来。
+# ⚠ decimal 不能排：Pillow 13 的 PngImagePlugin 顶部 `import fractions`，而 fractions
+#   依赖 decimal。排掉它 → IcoImagePlugin 导入失败 → Image.open(.ico) 抛
+#   UnidentifiedImageError → 全程序 17 个图标一起消失（v2.17.6 的真实事故）。
+#   代价只有 _decimal.pyd 约 300KB，别再"优化"掉。
 EXCLUDES = ("ssl", "_ssl", "_hashlib", "email", "http", "urllib", "xml", "xmlrpc",
-            "sqlite3", "_sqlite3", "decimal", "bz2", "lzma", "unittest", "doctest",
+            "sqlite3", "_sqlite3", "bz2", "lzma", "unittest", "doctest",
             "pydoc_data", "asyncio", "multiprocessing", "lib2to3", "setuptools",
             "pip", "unicodedata", "pickle", "_pickle", "argparse")
 
