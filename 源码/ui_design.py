@@ -83,7 +83,7 @@ class VisualShell:
         if getattr(self, 'hwnd', None):
             self.api().user32.KillTimer(self.hwnd, 3)
 
-    def present_scene(self, target, scene, w, h, patch=None):
+    def present_scene(self, target, scene, w, h, patch=None, text_rects=None):
         a = self.api()
         output = scene
         animation_progress=None
@@ -150,9 +150,13 @@ class VisualShell:
             cached = None
         if cached is None:
             cached = self._last_scene = Surface(target, w, h)
-        if not patch:
-            # 局部刷新时 output 只有那几块是画过的，整屏底下是空的，
-            # 不能拿它当「上一帧」（换页动画要用）；留着上一次整帧的。
+        if patch is not None:
+            # 局部刷新：只把那几块抄进「上一帧」，其余像素本来就没变。
+            # _last_scene 必须始终等于屏幕上这一帧的场景，否则下一次差分
+            # 会以为没变化，把补丁打到对不上的底图上。
+            for rect in patch:
+                cached.copy_rect(output, rect)
+        else:
             cached.copy(output)
         regions = [((0, 0, self.S(192), h), 218),
                    ((self.S(204), self.S(12), w-self.S(20), self.S(86)), 226)]
@@ -180,7 +184,8 @@ class VisualShell:
         ok = self._compositor.present(target, self._animation_scene.dc if animation and native_animation else output,
                                       w, h, regions, material_on,
                                       animation if material_on else None,
-                                      patch=patch if material_on and not animation else None)
+                                      patch=patch if (material_on and not animation) else None,
+                                      text_rects=text_rects if material_on and not animation else None)
         if not ok:
             self.frame_effect = a.apply_native_frame(self.hwnd, False)
             # 材质提交失败时退回不透明；这时同样要先把文字层合回场景

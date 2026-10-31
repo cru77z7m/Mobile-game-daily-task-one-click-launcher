@@ -46,6 +46,15 @@ class Surface:
     def copy(self, source):
         return gdi.BitBlt(self.dc, 0, 0, self.width, self.height, source, 0, 0, 0x00CC0020)
 
+    def copy_rect(self, source, rect):
+        """只拷一块区域（补丁帧更新「上一帧」用，省掉整屏 9MB）。"""
+        x0 = max(0, int(rect[0])); y0 = max(0, int(rect[1]))
+        x1 = min(self.width, int(rect[2])); y1 = min(self.height, int(rect[3]))
+        w, h = x1 - x0, y1 - y0
+        if w <= 0 or h <= 0:
+            return True
+        return gdi.BitBlt(self.dc, x0, y0, w, h, source, x0, y0, 0x00CC0020)
+
     def clone(self):
         out = Surface(self.dc, self.width, self.height)
         out.copy(self.dc)
@@ -104,6 +113,8 @@ class Compositor:
         # 文字层降采样缓存：(w,h,ss) -> (coverage L, ink RGB)
         self.text_cache=None
         self.text_cache_key=None
+        # 场景差分用的小画布（XOR 新旧两帧）
+        self._diff_surface=None
         try:
             dll = c.WinDLL('msimg32', use_last_error=True)
             self.alpha = dll.AlphaBlend
@@ -135,7 +146,8 @@ class Compositor:
         return bool(self.alpha(target, l+int(dx), t, r-l, b-t,
                                source, l, t, r-l, b-t, Blend(0, 0, int(alpha), int(source_alpha))))
 
-    def present(self, target, source, width, height, regions, mica, animation=None, patch=None):
+    def present(self, target, source, width, height, regions, mica, animation=None, patch=None,
+                text_rects=None):
         """Premultiply in native AlphaBlend, then copy ARGB buffer to DWM.
 
         First normalize legacy GDI pixels to opaque ARGB in a source DIB.
@@ -164,8 +176,9 @@ class Compositor:
             return False
         if animation and self.last_argb:
             return self.present_animation(target,source,width,height,animation)
-        if patch:
-            prepared = self.patch(source, width, height, patch)
+        if patch is not None:
+            # patch=[] 表示「画面没变」，直接复用缓存提交（窗口被遮住再露出来也能重画）
+            prepared = self.patch(source, width, height, patch, text_rects=text_rects)
         else:
             prepared = self.prepare(source, width, height, regions)
         if prepared is None:
@@ -322,11 +335,79 @@ class Compositor:
         c.memmove(bits + y0 * width * 4, data, len(data))
         return cov, ink
 
-    def patch(self, source, width, height, rects, reuse_text=True):
+    def _read_layer_rect(self, layer, width, height, ss, rect, channel=False):
+        """从 TEXT_SS 倍图层里抠一块并降采样成 1 倍。"""
+        from PIL import Image
+        x0 = max(0, int(rect[0])); y0 = max(0, int(rect[1]))
+        x1 = min(width, int(rect[2])); y1 = min(height, int(rect[3]))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        lw = layer.width
+        base = layer.bits.value
+        rows = [c.string_at(base + (y * lw + x0 * ss) * 4, (x1 - x0) * ss * 4)
+                for y in range(y0 * ss, y1 * ss)]
+        img = Image.frombytes('RGB', ((x1 - x0) * ss, (y1 - y0) * ss), b''.join(rows),
+                              'raw', 'BGRX')
+        if ss > 1:
+            img = img.reduce(ss)
+        return img.getchannel('R') if channel else img
+
+    def _refresh_text_cache(self, layers, width, height, rects):
+        """只把变化的文字块重新降采样，其余沿用缓存。"""
+        if self.text_cache is None:
+            return
+        cov, ink = self.text_cache
+        ss = 2 if layers[0].width == width * 2 else 1
+        for rect in rects:
+            sub_cov = self._read_layer_rect(layers[0], width, height, ss, rect, channel=True)
+            if sub_cov is None:
+                continue
+            sub_ink = self._read_layer_rect(layers[1], width, height, ss, rect)
+            cov.paste(sub_cov, (max(0, int(rect[0])), max(0, int(rect[1]))))
+            ink.paste(sub_ink, (max(0, int(rect[0])), max(0, int(rect[1]))))
+
+    def scene_diff_rects(self, new_dc, old_surface, width, height):
+        """XOR 新旧场景，返回真正变化的矩形（按横条扫，避免一个大 bbox 包住空白）。
+
+        这一步自己会说实话：不管谁改了界面，只要像素变了就一定能抓到，
+        不依赖 app 有没有记得某个状态字段。代价约 10ms。
+        """
+        from PIL import Image
+        d = self._diff_surface
+        if not d or (d.width, d.height) != (width, height):
+            if d:
+                d.close()
+            self._diff_surface = d = DibSurface(new_dc, width, height)
+        gdi.BitBlt(d.dc, 0, 0, width, height, new_dc, 0, 0, 0x00CC0020)
+        gdi.BitBlt(d.dc, 0, 0, width, height, old_surface.dc, 0, 0, 0x00660046)   # XOR
+        gdi.GdiFlush()
+        img = Image.frombytes('RGB', (width, height),
+                              c.string_at(d.bits, width * height * 4), 'raw', 'BGRX').convert('L')
+        step = 96
+        rects = []
+        for y in range(0, height, step):
+            y1 = min(height, y + step)
+            box = img.crop((0, y, width, y1)).getbbox()
+            if box:
+                rects.append((max(0, box[0] - 6), max(0, y + box[1] - 6),
+                              min(width, box[2] + 6), min(height, y + box[3] + 6)))
+        merged = []
+        for r in rects:
+            if merged and r[1] <= merged[-1][3] + 4:
+                m = merged[-1]
+                merged[-1] = (min(m[0], r[0]), m[1], max(m[2], r[2]), max(m[3], r[3]))
+            else:
+                merged.append(r)
+        return merged
+
+    def patch(self, source, width, height, rects, reuse_text=True, text_rects=None):
         """只重算给定矩形，其余沿用上一帧的 ARGB。
 
-        hover 动画里变化的只有鼠标下那颗按钮，整帧重算（~175ms）纯属浪费。
-        这里把每块矩形单独抠出来走一遍同样的 LUT / 文字合成，再写回缓存。
+        hover 动画里变化的只有鼠标下那颗按钮；状态刷新时变的往往只有状态栏
+        那行字 —— 整帧重算（~107ms）纯属浪费。这里把每块矩形单独抠出来走一遍
+        同样的 LUT / 文字合成，再写回缓存。
+
+        text_rects：这些块里的文字可能变了，先把 1 倍文字缓存局部刷新一遍。
         """
         from PIL import Image
         prepared = self.prepared
@@ -336,6 +417,8 @@ class Compositor:
         cov = ink = None
         if layers:
             cov, ink = self._text_images(layers, width, height, reuse_text)
+            if text_rects and cov is not None:
+                self._refresh_text_cache(layers, width, height, text_rects)
         base = prepared.bits.value
         for rect in rects:
             x0 = max(0, int(rect[0])); y0 = max(0, int(rect[1]))
@@ -461,6 +544,8 @@ class Compositor:
             self.last_argb.close();self.last_argb=None
         if self.prepared:
             self.prepared.close();self.prepared=None
+        if self._diff_surface:
+            self._diff_surface.close();self._diff_surface=None
         self.text_cache=None;self.text_cache_key=None
         if self.theme:
             self.theme.BufferedPaintUnInit()

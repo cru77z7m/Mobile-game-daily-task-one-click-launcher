@@ -91,11 +91,13 @@ for key in ('start', 'night', 'chk:vm0', 'nav:settings'):
     patch_px = frame_bytes()
     used_patch = ui._compositor.prepared is not None
 
-    # 3) 整帧路径（同一状态）
+    # 3) 整帧路径（同一状态）—— 强制整帧，别让它偷偷走自动补丁
     hover_on(key)
     ui._hover_patch = None
+    ui._force_full_paint = True
     t0 = time.monotonic()
     paint()
+    ui._force_full_paint = False
     t_full = (time.monotonic() - t0) * 1000
     full_px = frame_bytes()
 
@@ -159,5 +161,61 @@ fails += 0 if ok else 1
 print('%s %-14s 连续移动 A→B | 差异像素 %d (%.4f%%)'
       % ('PASS' if ok else 'FAIL', 'sequence', diff, diff * 100.0 / pix))
 
-print('\n%d 项检查，%d 项失败' % (len(cases)+1, fails))
+
+# ---- 自动补丁：状态文字变了，只有那一小块该重算 ----
+def state_patch_case(name, mutate):
+    hover_on(None)
+    ui._force_full_paint = False
+    ui._hover_patch = None
+    paint()                                   # 整帧底稿
+    mutate()
+    t0 = time.monotonic()
+    paint()                                   # 应走自动补丁
+    t_auto = (time.monotonic() - t0) * 1000
+    auto = frame_bytes()
+    mutate()
+    ui._force_full_paint = True
+    t0 = time.monotonic()
+    paint()
+    t_full = (time.monotonic() - t0) * 1000
+    full = frame_bytes()
+    ui._force_full_paint = False
+    p, f = auto[0], full[0]
+    diff = sum(1 for i in range(0, len(p), 4)
+               if abs(p[i]-f[i]) > 2 or abs(p[i+1]-f[i+1]) > 2 or abs(p[i+2]-f[i+2]) > 2)
+    pix = auto[1] * auto[2]
+    ok = diff <= pix * 0.0005
+    if not ok:
+        from PIL import Image, ImageChops
+        W, H = auto[1], auto[2]
+        ia = Image.frombytes('RGBA', (W, H), p, 'raw', 'BGRA').convert('RGB')
+        ib = Image.frombytes('RGBA', (W, H), f, 'raw', 'BGRA').convert('RGB')
+        ia.save(ROOT / ('design/auto-%s-auto.png' % name))
+        ib.save(ROOT / ('design/auto-%s-full.png' % name))
+        ImageChops.difference(ia, ib).point(lambda v: min(255, v*6)).save(
+            ROOT / ('design/auto-%s-diff.png' % name))
+    print('%s %-14s 自动补丁 %6.1f ms | 整帧 %6.1f ms | 差异像素 %d (%.4f%%)'
+          % ('PASS' if ok else 'FAIL', name, t_auto, t_full, diff, diff*100.0/pix))
+    return 0 if ok else 1
+
+
+fails += state_patch_case('status', lambda: setattr(ui, 'status', '正在启动 MAA…'))
+fails += state_patch_case('step', lambda: ui.steps.__setitem__('vm0', ('run', '进行中')))
+
+# ---- 什么都没变：不重算，但要复用缓存再提交一次（窗口被遮挡后重画靠它）----
+hover_on(None)
+ui._force_full_paint = False
+paint()
+ref0 = frame_bytes()
+t0 = time.monotonic()
+paint()
+t_idle = (time.monotonic() - t0) * 1000
+same = ref0[0] == frame_bytes()[0]
+ok = same and t_idle < 60
+fails += 0 if ok else 1
+print('%s %-14s 无变化复用缓存 %.1f ms（画面一致=%s）'
+      % ('PASS' if ok else 'FAIL', 'no-change', t_idle, same))
+
+
+print('\n%d 项检查，%d 项失败' % (len(cases)+3, fails))
 sys.exit(1 if fails else 0)

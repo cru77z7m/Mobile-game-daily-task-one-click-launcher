@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.17.1"
+APP_VERSION = "v2.17.2"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -4035,6 +4035,9 @@ class App(VisualShell):
         self._hover_patch_serial = -1
         self._paint_serial = 0
         self._patch_clip = None
+        # 这一帧画了哪些文字（用于和上一帧比对，只重算变化的块）
+        self._text_ops = []
+        self._prev_text_ops = None
         self.pressed = None
         self.busy = False
         self.steps = {k: ("idle", "") for k in STEP_KEYS}
@@ -4119,6 +4122,57 @@ class App(VisualShell):
 
     def motion_enabled(self):
         return self.motion_allowed and self.cfg.get("ui_motion", True)
+
+    def text_diff_rects(self):
+        """比较这一帧和上一帧的文字清单，返回变了的那些矩形。
+
+        跑任务时状态栏的字每次刷新都会变，但整屏其余部分一模一样；
+        知道只有那几行变了，就能只重算那几块。
+        """
+        cur = self._text_ops
+        prev = self._prev_text_ops
+        self._prev_text_ops = list(cur)
+        if prev is None:
+            return None
+        if len(prev) != len(cur):
+            return None                  # 行数都变了，整页重排，别抠了
+        rects = []
+        for old, new in zip(prev, cur):
+            if old != new:
+                rects.append(new[1])
+                rects.append(old[1])
+        return rects
+
+    def _decide_patch(self, mem, w, h):
+        """整帧画完之后再决定走不走补丁，返回 (patch_rects, text_rects)。
+
+        patch_rects 为 [] 表示画面一个像素都没变 → 连 present 都不用做；
+        返回 (None, None) 表示拿不准（换页/弹窗/变化太大）→ 老实用整帧。
+        """
+        if self.frame_effect not in ('mica', 'tabbed', 'acrylic'):
+            return None, None
+        if getattr(self, '_force_full_paint', False):     # 自检用：强制整帧
+            return None, None
+        if self._transition or self._modal_transition or self.prompt or self.exepick:
+            return None, None
+        if not self.motion_enabled():
+            return None, None
+        prev = self._last_scene
+        prepared = self._compositor.prepared
+        if (not prev or (prev.width, prev.height) != (w, h)
+                or not prepared or (prepared.width, prepared.height) != (w, h)):
+            return None, None
+        changed = self._compositor.scene_diff_rects(mem, prev, w, h)
+        text_rects = self.text_diff_rects()
+        if text_rects is None:
+            return None, None
+        rects = list(changed) + list(text_rects)
+        if not rects:
+            return [], []
+        area = sum(max(0, r[2] - r[0]) * max(0, r[3] - r[1]) for r in rects)
+        if area > w * h * 0.3:            # 变了一半屏还抠什么，整帧更快
+            return None, None
+        return rects, text_rects
 
     def _mark_hover_patch(self):
         """记下这一帧只需重算的矩形：hover 动画只改鼠标下那颗控件。
@@ -4258,6 +4312,8 @@ class App(VisualShell):
                 r = wt.RECT(*box)
                 user32.DrawTextW(layer.dc, s, -1, ctypes.byref(r), flags)
                 gdi32.RestoreDC(layer.dc, saved)
+            # 记一笔：下一帧比较这行字有没有变，没变就不重算它那块
+            self._text_ops.append((s, tuple(int(v) for v in rect), color, fnt))
             return
         gdi32.SelectObject(hdc, fnt)
         gdi32.SetTextColor(hdc, color)
@@ -5332,6 +5388,7 @@ class App(VisualShell):
 
         self._paint_dc = mem
         self._paint_w, self._paint_h = w, h
+        self._text_ops = []
         self._patch_clip = list(patch) if patch else None
         # 走补丁时场景只有那几块会被读走，干脆把画笔也裁到那几块，
         # GDI 少画一大片（整帧 25ms → 5ms）。前提是整帧缓存确实对得上，
@@ -5463,7 +5520,17 @@ class App(VisualShell):
         if self._modal_transition:
             old, started, opening, dialog = self._modal_transition
             self._modal_transition = (old, started + render_elapsed, opening, dialog)
-        self.present_scene(target, mem, w, h, patch=patch)
+        if patch:
+            self.present_scene(target, mem, w, h, patch=patch)
+        else:
+            rects, text_rects = self._decide_patch(mem, w, h)
+            if rects == []:
+                # 一个像素都没变：不重算，但仍然要提交一次（窗口被遮挡后重画要靠它）
+                self.present_scene(target, mem, w, h, patch=[])
+            elif rects:
+                self.present_scene(target, mem, w, h, patch=rects, text_rects=text_rects)
+            else:
+                self.present_scene(target, mem, w, h)
         self._patch_clip = None
         self._paint_serial += 1
         if DEBUG_TIMING:
