@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.16.2"
+APP_VERSION = "v2.16.3"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -3898,6 +3898,23 @@ gdi32.SetTextColor.argtypes = [wt.HDC, wt.DWORD]
 gdi32.SetTextColor.restype = wt.DWORD
 gdi32.SetBkMode.argtypes = [wt.HDC, ctypes.c_int]
 gdi32.SetBkMode.restype = ctypes.c_int
+
+
+class XFORM(ctypes.Structure):
+    """世界变换矩阵（GDI）。文字超采样靠它把图层放大 2 倍渲染再缩回去。"""
+    _fields_ = [("eM11", ctypes.c_float), ("eM12", ctypes.c_float),
+                ("eM21", ctypes.c_float), ("eM22", ctypes.c_float),
+                ("eDx", ctypes.c_float), ("eDy", ctypes.c_float)]
+
+
+GM_ADVANCED = 2
+# 文字层超采样倍数：1 = 不超采样。GDI 的灰度抗锯齿只有 16 级，
+# 26px 以上的中文标题能明显看出台阶；放大 2 倍渲染再用 BOX 缩回去能有 100+ 级。
+TEXT_SS = 2
+gdi32.SetGraphicsMode.argtypes = [wt.HDC, ctypes.c_int]
+gdi32.SetGraphicsMode.restype = ctypes.c_int
+gdi32.SetWorldTransform.argtypes = [wt.HDC, ctypes.POINTER(XFORM)]
+gdi32.SetWorldTransform.restype = wt.BOOL
 gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
 gdi32.CreateCompatibleDC.restype = wt.HDC
 gdi32.DeleteDC.argtypes = [wt.HDC]
@@ -4013,6 +4030,7 @@ class App(VisualShell):
         self.qlock = threading.Lock()
         self.runner = Runner(self.cfg, self.emit)
         self._fonts = {}
+        self._fonts2 = {}          # HFONT -> 2 倍字号（超采样文字层用）
         self.rects = {}
         self.no_auto = False        # 调试/截图时关掉自动启动
         self._auto_pending = False
@@ -4167,6 +4185,14 @@ class App(VisualShell):
             f = gdi32.CreateFontW(h, 0, 0, 0, weight, False, False, False,
                                   134, 0, 0, 4, 0, "Microsoft YaHei")
         self._fonts[key] = f
+        if TEXT_SS > 1:
+            twin = gdi32.CreateFontW(h * TEXT_SS, 0, 0, 0, weight, False, False,
+                                     False, 134, 0, 0, 4, 0, face)
+            if not twin:
+                twin = gdi32.CreateFontW(h * TEXT_SS, 0, 0, 0, weight, False, False,
+                                         False, 134, 0, 0, 4, 0, "Microsoft YaHei")
+            if twin:
+                self._fonts2[f] = twin
         return f
 
     def text(self, hdc, s, rect, color, fnt,
@@ -4176,13 +4202,23 @@ class App(VisualShell):
             clip = wt.RECT()
             gdi32.GetClipBox.argtypes = [wt.HDC, ctypes.POINTER(wt.RECT)]
             gdi32.GetClipBox(hdc, ctypes.byref(clip))
+            # 图层是 TEXT_SS 倍尺寸：字号、矩形、裁剪框统统乘 ss 直接画成大图，
+            # 合成时再 Box 降采样 —— 等于给文字做超采样。
+            # （不要用 SetWorldTransform 偷懒：DrawText 的排版/省略号/裁剪在变换下
+            #   行为不一致，会整段文字消失，踩过。）
+            ss = getattr(self, '_text_ss', 1)
+            big = self._fonts2.get(fnt, fnt) if ss != 1 else fnt
+            box = (int(rect[0]) * ss, int(rect[1]) * ss,
+                   int(rect[2]) * ss, int(rect[3]) * ss)
+            cl, ct = clip.left * ss, clip.top * ss
+            cr, cb = clip.right * ss, clip.bottom * ss
             for layer, ink in zip(layers, (0xffffff, color)):
                 saved = gdi32.SaveDC(layer.dc)
-                gdi32.IntersectClipRect(layer.dc, clip.left, clip.top, clip.right, clip.bottom)
-                gdi32.SelectObject(layer.dc, fnt)
+                gdi32.IntersectClipRect(layer.dc, cl, ct, cr, cb)
+                gdi32.SelectObject(layer.dc, big)
                 gdi32.SetTextColor(layer.dc, ink)
                 gdi32.SetBkMode(layer.dc, 1)
-                r = wt.RECT(*rect)
+                r = wt.RECT(*box)
                 user32.DrawTextW(layer.dc, s, -1, ctypes.byref(r), flags)
                 gdi32.RestoreDC(layer.dc, saved)
             return
@@ -4209,8 +4245,12 @@ class App(VisualShell):
             r = wt.RECT(int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
         gdi32.PatBlt.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int,
                                  ctypes.c_int, ctypes.c_int, wt.DWORD]
+        # 图层是 TEXT_SS 倍尺寸且带缩放变换；PatBlt 在变换下不可靠，
+        # 先临时恢复单位矩阵、按物理坐标擦，再装回去。
         for layer in layers:
-            gdi32.PatBlt(layer.dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+            ss = getattr(self, '_text_ss', 1)
+            gdi32.PatBlt(layer.dc, r.left * ss, r.top * ss,
+                         (r.right - r.left) * ss, (r.bottom - r.top) * ss,
                          0x00000042)          # BLACKNESS = 全 0，等于没画过
 
     def fill_round(self, hdc, rect, radius, fill, border=None, bwidth=1):
@@ -5193,11 +5233,25 @@ class App(VisualShell):
         for layer in getattr(self, '_glass_text_layers', ()) or ():
             layer.close()
         self._glass_text_layers = None
+        self._text_ss = 1
         self._paint_dc = mem
         self._paint_w, self._paint_h = w, h
         if self.frame_effect in ('mica', 'tabbed', 'acrylic'):
             from ui_render import DibSurface
-            self._glass_text_layers = (DibSurface(mem,w,h), DibSurface(mem,w,h))
+            # 图层的绘制坐标仍是逻辑像素：靠世界变换放大 TEXT_SS 倍渲染，
+            # 合成时再 BOX 缩回去 —— 等于给文字做超采样，把 GDI 那 16 级灰度
+            # 抗锯齿变成 100 多级（锯齿主要就来自这 16 级）。
+            try:
+                self._glass_text_layers = (
+                    DibSurface(mem, w * TEXT_SS, h * TEXT_SS),
+                    DibSurface(mem, w * TEXT_SS, h * TEXT_SS))
+            except OSError:
+                # 2 倍图层比窗口大 4 倍内存，极端情况下（显存/内存吃紧）退回 1 倍，
+                # 宁可少点抗锯齿也不能画不出来
+                self._glass_text_layers = (DibSurface(mem, w, h), DibSurface(mem, w, h))
+                self._text_ss = 1
+            else:
+                self._text_ss = TEXT_SS
             for layer in self._glass_text_layers:
                 layer.clear()
         self.layout(w, h)
