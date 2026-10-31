@@ -33,7 +33,9 @@ import sys
 import time
 import zipfile
 
-DEFAULT_SRC = r"D:\tools\一键日常启动器"
+# 默认就按脚本自己所在位置当工程根（本文件就放在仓库根），换台机器克隆下来也能直接跑；
+# 想指定别的目录用 --src。
+DEFAULT_SRC = os.path.dirname(os.path.abspath(__file__))
 EXE_NAME = "一键日常启动器"
 PY_NAME = "daily_launcher.py"
 SETUP_PY = "installer.py"
@@ -58,10 +60,16 @@ PAYLOAD_SKIP_EXT = (".png", ".jpg", ".old", ".log", ".bak")
 
 
 def find_python():
-    """优先用本机的托管 Python（已装 pyinstaller/pillow）"""
-    cands = [r"C:\Users\Cru77z7M\.workbuddy\binaries\python\versions\3.13.12\python.exe"]
+    """找装了 pyinstaller/pillow 的 Python：环境变量 LAUNCHER_PYTHON > 当前解释器 > PATH"""
+    cands = []
+    env = os.environ.get("LAUNCHER_PYTHON")
+    if env:
+        cands.append(env)
+    cands.append(sys.executable)
+    for name in ("python.exe", "python3.exe", "python", "python3"):
+        cands.append(shutil.which(name))
     for c in cands:
-        if os.path.isfile(c):
+        if c and os.path.isfile(c):
             return c
     return sys.executable
 
