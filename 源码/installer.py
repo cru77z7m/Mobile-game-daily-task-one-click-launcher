@@ -12,6 +12,12 @@
     3. 在 HKCU 写卸载登记项（不需要管理员权限）
     4. 升级安装时不动 config.json —— 用户的路径和勾选全保住
 
+出错时：
+    动手之前先体检（目标目录能写、要覆盖的文件没被占用），有问题当场说清楚
+    "请先退出程序"，目录保持原样；铺文件时单个文件失败也会重试 3 次。
+    以前是直接报 `PermissionError: [WinError 32] VCRUNTIME140.dll` 并撒手，
+    留下一个新旧混杂、install.json 还写着旧版本的目录 —— 比没装更糟。
+
 用法：
     双击                      图形界面安装
     /S                        静默安装（默认装到上次的目录，没有就用默认目录）
@@ -53,6 +59,11 @@ MEIPASS = getattr(sys, "_MEIPASS", HERE)
 PAYLOAD = os.path.join(MEIPASS, "payload.zip")
 
 LOG_PATH = os.path.join(os.environ.get("TEMP") or HERE, "daily-launcher-setup.log")
+
+# 单个文件写不进去时的重试次数与间隔。杀毒软件、搜索索引、资源管理器预览
+# 都会在文件刚被关掉的瞬间短暂持有句柄，等一下再来基本就过了。
+FILE_TRIES = 3
+FILE_RETRY_DELAY = 0.15
 
 
 def log(msg):
@@ -400,6 +411,44 @@ def unregister_uninstall():
 # ----------------------------------------------------------------------------
 # 安装动作
 # ----------------------------------------------------------------------------
+class InstallError(Exception):
+    """带「一句话说明」的安装错误。
+
+    short 会显示在界面上，必须短到一眼能读完、并且能照做（例如「请先退出
+    正在运行的程序」）；detail 只写日志，放具体哪个文件、Windows 原始错误。
+
+    以前失败直接把 `PermissionError: [WinError 32] ...` 甩到界面上：用户看不懂，
+    而且那时已经把一部分文件覆盖掉了 —— 目录里新旧混杂，install.json 还停在
+    旧版本，比"没装"更糟。现在改为「先体检、再动文件」。
+    """
+
+    def __init__(self, short, detail=""):
+        Exception.__init__(self, short)
+        self.short = short
+        self.detail = detail
+
+
+def _why(e, path=""):
+    """把 OSError 翻成人话（用于日志）。"""
+    win = getattr(e, "winerror", None)
+    if win in (32, 33):
+        return "文件被占用（程序可能还在运行）"
+    if win == 5:
+        return "没有写入权限"
+    if win == 112 or getattr(e, "errno", 0) == 28:
+        return "磁盘空间不足"
+    if isinstance(e, PermissionError):
+        return "被占用或没有权限"
+    if isinstance(e, NotADirectoryError):
+        return "路径被同名文件挡住"
+    return "%s: %s" % (type(e).__name__, e)
+
+
+def _names(paths, limit=3):
+    names = [os.path.basename(p) for p in paths[:limit]]
+    return "、".join(names) + ("　等 %d 个" % len(paths) if len(paths) > limit else "")
+
+
 class Installer(object):
     def __init__(self, target, want_shortcut=True, want_run=False, restart=False,
                  wait_pid=0):
@@ -421,6 +470,11 @@ class Installer(object):
     def run(self):
         try:
             self._install()
+        except InstallError as e:
+            self.error = e.short
+            log("安装失败：%s" % e.short)
+            if e.detail:
+                log("详情：\n%s" % e.detail)
         except Exception as e:
             self.error = "%s: %s" % (type(e).__name__, e)
             log("安装失败：%s" % self.error)
@@ -435,6 +489,85 @@ class Installer(object):
         time.sleep(0.4)                 # 单实例锁/文件句柄彻底松开
         log("旧进程 %s 已退出" % self.wait_pid)
 
+    def _preflight(self, items):
+        """不动任何文件，先确认这次装得进去。
+
+        两件事必须提前查出来，否则会出现"铺到一半报错、目录里新旧混杂"：
+          1. 安装目录能不能新建文件（ACL 保护、只读盘、路径被同名文件占）
+          2. payload 要覆盖的每个已有文件能不能以写方式打开 —— 正在运行的
+             程序会把 exe 和 _internal 下的 dll 映射成 image section，这时
+             打开写入直接 PermissionError（典型现象：报 VCRUNTIME140.dll）。
+        """
+        self.stage = "检查安装目录"
+        self.pct = 0
+        probe = os.path.join(self.target, ".setup-write-test")
+        try:
+            with open(probe, "wb") as f:
+                f.write(b"ok")
+            os.remove(probe)
+        except OSError as e:
+            raise InstallError("安装目录不可写：%s" % _why(e, self.target),
+                               "目录：%s\n%s" % (self.target, _why(e, self.target)))
+
+        locked = []
+        for item in items:
+            if item.filename == "version.txt":
+                continue
+            dst = os.path.join(self.target, *item.filename.split("/"))
+            if not os.path.isfile(dst):
+                continue
+            try:
+                with open(dst, "r+b"):
+                    pass
+            except OSError as e:
+                locked.append((dst, _why(e, dst)))
+        if locked:
+            raise InstallError(
+                "请先退出正在运行的「%s」再装" % APP_NAME,
+                "被占用的文件：\n" + "\n".join("  %s  <- %s" % (p, w)
+                                              for p, w in locked[:12]))
+
+    def _extract(self, z, items):
+        """把 payload 铺到安装目录；单个文件失败会重试，最后才报错。"""
+        total = max(1, len(items))
+        failures = []
+        for idx, item in enumerate(items):
+            if self.cancel_request:
+                raise InstallError("已取消安装")
+            if item.filename == "version.txt":
+                self.pct = (idx + 1) * 100.0 / total
+                continue
+            dst = os.path.join(self.target, *item.filename.split("/"))
+            self.stage = "正在解压 %s" % os.path.basename(item.filename)
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+            except OSError as e:
+                failures.append((dst, _why(e, dst)))
+                self.pct = (idx + 1) * 100.0 / total
+                continue
+            last = None
+            for attempt in range(FILE_TRIES):
+                try:
+                    with z.open(item) as src, open(dst, "wb") as out:
+                        shutil.copyfileobj(src, out, 262144)
+                    last = None
+                    break
+                except OSError as e:
+                    last = e
+                    if attempt + 1 < FILE_TRIES:
+                        log("写入 %s 失败（%s），第 %d 次重试"
+                            % (os.path.basename(dst), _why(e, dst), attempt + 2))
+                        time.sleep(FILE_RETRY_DELAY * (attempt + 1))
+            if last is not None:
+                failures.append((dst, _why(last, dst)))
+                log("写入失败：%s（%s）" % (dst, _why(last, dst)))
+            self.pct = (idx + 1) * 100.0 / total
+        if failures:
+            raise InstallError(
+                "%d 个文件没写进去，请退出程序后重试" % len(failures),
+                "\n".join("  %s  <- %s" % (p, w) for p, w in failures[:12]))
+        log("文件铺完（%d 个）" % len(items))
+
     def _install(self):
         log("开始安装：%s -> %s（升级=%s）"
             % (payload_version(), self.target, self.upgrade))
@@ -445,18 +578,10 @@ class Installer(object):
 
         with zipfile.ZipFile(PAYLOAD) as z:
             items = [i for i in z.infolist() if not i.filename.endswith("/")]
-            total = max(1, len(items))
-            for idx, item in enumerate(items):
-                if item.filename == "version.txt":
-                    self.pct = (idx + 1) * 100.0 / total
-                    continue
-                dst = os.path.join(self.target, *item.filename.split("/"))
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                with z.open(item) as src, open(dst, "wb") as out:
-                    shutil.copyfileobj(src, out, 262144)
-                self.stage = "正在解压 %s" % os.path.basename(item.filename)
-                self.pct = (idx + 1) * 100.0 / total
-        log("文件铺完（%d 个）" % len(items))
+            # 先体检：这一步只读，不碰任何文件。有问题就在这里停住，
+            # 目录还是原样，用户关掉程序再装一次就行。
+            self._preflight(items)
+            self._extract(z, items)
 
         # 安装标记：程序里用它判断"这是装出来的"（卸载时会看）
         try:
@@ -691,7 +816,7 @@ class SetupUI(object):
                           box=(W - S(90), S(284), W - S(28), S(306)))
             busy = inst.thread is not None and not inst.done and not inst.error
             self.button(hdc, b["install"],
-                        "安装中…" if busy else "安装",
+                        "安装中…" if busy else ("重试" if inst.error else "安装"),
                         "install", "primary", enabled=not busy)
             self.button(hdc, b["cancel"],
                         "取消" if not inst.done else "关闭",
@@ -975,6 +1100,27 @@ def parse_args(argv):
     return opt
 
 
+def _fail_box(reason):
+    """静默安装失败时弹一次窗。
+
+    静默安装通常是程序自己更新时调的：旧程序已经退出，如果没有这个弹窗，
+    用户只会看到"点了一下，程序没了"，不知道发生了什么、也不知道文件还在。
+    """
+    if os.environ.get("DL_SETUP_NO_UI"):
+        log("（DL_SETUP_NO_UI 已设置，不弹窗）")
+        return
+    try:
+        user32.MessageBoxW(
+            None,
+            "安装没有成功：%s\n\n"
+            "原来的程序没有被破坏，重新打开就能用。\n"
+            "想再试一次，可以手动运行安装包。\n\n"
+            "日志：%s" % (reason, LOG_PATH),
+            "安装 " + APP_NAME, 0x10)
+    except Exception as e:
+        log("弹窗失败：%s" % e)
+
+
 def main():
     global LOG_PATH
     opt = parse_args(sys.argv[1:])
@@ -996,9 +1142,14 @@ def main():
         inst.run()
         if inst.error:
             log("安装失败：%s" % inst.error)
+            # 静默安装一般是程序自己更新时调的：这时旧程序已退出，界面上
+            # 什么都不会发生，用户只会觉得"点了一下就没反应了"。所以失败
+            # 必须弹一次，至少告诉他程序没坏、可以重新装。
+            _fail_box(inst.error)
             return 1
         if not inst.done:
             log("安装没有完成（原因未知）")
+            _fail_box("安装没有完成")
             return 1
         return 0
 
