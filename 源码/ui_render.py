@@ -207,17 +207,45 @@ class Compositor:
         return result
 
     def overlay_text(self,rgb,width,height):
-        """把独立文字层合到场景图上（已经是 RGBA，返回 RGBA）。"""
-        from PIL import Image
+        """把独立文字层合到场景图上（已经是 RGBA，返回 RGBA）。
+
+        文字当"印在面板上的墨"，**像素一律不透明**。
+
+        为什么不能直接 alpha_composite：面板本身是半透明的（alpha≈168），
+        如果把字也做成半透明，笔画边缘的过渡像素就会让壁纸透进来 —— 边缘一像素
+        壁纸色、一像素面板色，看上去就是毛刺/锯齿（实色模式没有这个问题，因为
+        面板不透明，边缘只跟面板色混合）。所以这里把字的覆盖率只用来跟面板色混合，
+        合成后的 alpha 直接拉满，等于"字印在磨砂玻璃上"。
+
+        数学：ink 是"文字色 × 覆盖率"（GDI 在黑底上画的），于是
+            out = 文字色*覆盖率 + 面板色*(1-覆盖率) = ink + 面板色*(1-覆盖率)
+        两次 LUT + 一次 add，全在 C 层做，单帧只有毫秒级。
+        """
+        from PIL import Image, ImageChops
         layers=getattr(self,'text_layers',None)
         if not layers:
             return rgb
-        coverage=Image.frombytes('RGB',(width,height),c.string_at(layers[0].bits,width*height*4),'raw','BGRX').getchannel('R')
-        ink=Image.frombytes('RGB',(width,height),c.string_at(layers[1].bits,width*height*4),'raw','BGRX')
-        ink.putalpha(coverage)
-        # Text was drawn over black: its RGB is already premultiplied.
-        ink=Image.frombytes('RGBa',ink.size,ink.tobytes()).convert('RGBA')
-        return Image.alpha_composite(rgb,ink)
+        sw,sh=layers[0].width,layers[0].height
+        coverage=Image.frombytes('RGB',(sw,sh),c.string_at(layers[0].bits,sw*sh*4),'raw','BGRX').getchannel('R')
+        ink=Image.frombytes('RGB',(sw,sh),c.string_at(layers[1].bits,sw*sh*4),'raw','BGRX')
+        # 文字层是超采样尺寸（见 daily_launcher.TEXT_SS），先缩回原尺寸。
+        # reduce(Box) 正好等于「2x2 四个像素取平均」，也就是标准的超采样降采样。
+        factor=max(1,sw//width) if width else 1
+        if factor>1 and (sw,sh)!=(width,height):
+            coverage=coverage.reduce(factor)
+            ink=ink.reduce(factor)
+        base=rgb.convert('RGB')
+        # 面板色按 (1-覆盖率) 衰减，再叠上墨色
+        inv=coverage.point(lambda v: 255-v)
+        inv=Image.merge('RGB',(inv,inv,inv))
+        out=ImageChops.add(ink,ImageChops.multiply(base,inv))
+        # 有字的地方 alpha 拉满；没字的地方保留场景原来的透明度（磨砂玻璃）
+        inked=coverage.point(lambda v: 255 if v else 0)
+        out_alpha=Image.composite(Image.new('L',coverage.size,255),
+                                  rgb.getchannel('A'),inked)
+        result=out.convert('RGBA')
+        result.putalpha(out_alpha)
+        return result
 
     def flatten(self,source,width,height):
         """合成一张不透明画面：场景 + 文字层。给模态弹窗/实色回退用。"""
