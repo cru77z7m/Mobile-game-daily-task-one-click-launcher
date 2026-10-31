@@ -96,6 +96,7 @@
 | 10-31 15:52 | `flatten()` 输出 alpha=0 | 窗口整屏白（`BitBlt` 后 DWM 认为全透明） | 改为输出 `RGBA` + `alpha=255` |
 | 10-31 15:56 | `Image.alpha_composite` 报 `image has wrong mode` | 弹窗画不出来（异常被 wndproc 吞掉，画面停在旧帧） | `flatten()` 里先把 RGB 转 `RGBA` 再合成 |
 | 10-31 15:50 | 测试时探针配置没清空 ok-ww 路径，弹窗超时后真拉起了 ok-ww | 启动了一个无关脚本（已确认进程随后退出，未进游戏） | 以后测自动启动一律把 `okww/maa/maaend/maafgo/mumu_root` 全清空；`--shot` 本身会关自动启动，优先用它 |
+| 10-31 16:32 | `git push` 走代理失败：`CONNECT tunnel failed, response 502`（`schannel: server closed abruptly`），重试 7 次都不行；同一时刻 `gh api` 正常 | 源码改动推不上去 | 改用 **GitHub Contents API** 提交（`gh api repos/.../contents/<path> --method PUT`，路径中文要 `quote`，取 sha 时必须显式 `--method GET`，否则 `-f` 会把请求变成 POST → 404）。远端 main 现为 `3c304197`，内容与本地一致 |
 
 ---
 
