@@ -25,6 +25,10 @@ import tempfile
 import threading
 import time
 import traceback
+from ui_effects import system_preferences, apply_native_frame, mix_color, AnimationClock
+from ui_design import VisualShell
+from ui_render import Compositor
+
 import zipfile        # 只给"从发布包里挑 exe"用，见 extract_new_exe()
 
 _T_IMP = _boot_time.time()          # 导入全部完成
@@ -34,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.14.1"
+APP_VERSION = "v2.16.2"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -167,6 +171,9 @@ ABOUT_INFO = {
 }
 
 DEFAULT_CONFIG = {
+    "ui_material": "mica",
+    "ui_mica": True,        # Full-client Win11 material; Win10 uses opaque rendering.
+    "ui_motion": True,      # Also respects SPI_GETCLIENTAREAANIMATION.
     # 首次运行时是空的：靠「首次使用向导」让用户点设置页选目录。
     # 这里绝不能写死作者机器上的路径——把程序发给别人时，那些路径根本不存在，
     # 打开就是满屏「找不到 xxx.exe」，看起来像程序坏了。
@@ -2615,7 +2622,7 @@ def maa_apply_config(maa_exe, port, instance_index, auto_run, fix_connect, note)
 
         # 「启动后直接运行任务」两个方向都要写：
         #   开  → RunDirectly = true（和以前一样）
-        #   关  → RunDirectly = false（用户在「各项目的自动任务」里关了它，
+        #   关  → RunDirectly = false（用户在「安排自动任务」里关了它，
         #         就真的别让 MAA 自己跑起来）
         startup = gui.setdefault("StartUpSettings", {})
         want_run = bool(auto_run)
@@ -3721,16 +3728,16 @@ class BITMAPINFOHEADER(ctypes.Structure):
 
 
 RAINBOW = {
-    "bg": "#F4F6F9",
+    "bg": "#F1F3FB",
     "card": "#FFFFFF",
-    "border": "#E4E8EE",
+    "border": "#E1E5F0",
     "line": "#F0F2F6",
-    "text": "#1B1F26",
-    "text2": "#5A6373",
-    "muted": "#98A1B0",
-    "accent": "#2F6BFF",
-    "accent_d": "#245BE0",
-    "accent_l": "#EAF0FF",
+    "text": "#20263D",
+    "text2": "#59647D",
+    "muted": "#75819A",
+    "accent": "#6264E8",
+    "accent_d": "#4C4ECC",
+    "accent_l": "#EDEEFF",
     "ok": "#17B26A",
     "err": "#F04438",
     "run": "#F79009",
@@ -3741,8 +3748,8 @@ RAINBOW = {
     "err_bg_h": "#FFE6E4",
     "err_border": "#F6C9C4",
     "disabled": "#B7BEC9",
-    "logbg": "#FBFCFD",
-    "iconbg": "#EEF2F8",     # 行图标背后的圆角底板
+    "logbg": "#FAFBFF",
+    "iconbg": "#F1F2FC",     # 行图标背后的圆角底板
     "panel": "#F7F8FA",      # 关于页里的信息块底色
     "panel_line": "#EDF0F5",  # 信息块的描边
 }
@@ -3845,6 +3852,8 @@ user32.InvalidateRect.argtypes = [wt.HWND, wt.LPVOID, wt.BOOL]
 user32.InvalidateRect.restype = wt.BOOL
 user32.SetTimer.argtypes = [wt.HWND, wt.UINT_PTR, wt.UINT, wt.LPVOID]
 user32.SetTimer.restype = wt.UINT_PTR
+user32.KillTimer.argtypes = [wt.HWND, wt.UINT_PTR]
+user32.KillTimer.restype = wt.BOOL
 try:                                    # Win10+ 才有 GetDpiForSystem
     user32.GetDpiForSystem.argtypes = []
     user32.GetDpiForSystem.restype = wt.UINT
@@ -3972,12 +3981,25 @@ DT_WORDBREAK, DT_END_ELLIPSIS, DT_NOPREFIX = 0x0010, 0x00008000, 0x00000800
 STEP_KEYS = ["maaend", "vm0", "vm1", "maa", "maafgo", "okww"]
 
 
-class App:
+class App(VisualShell):
     def __init__(self):
         self.cfg = load_config()
         _TMARK["cfg"] = _boot_time.time()
         self.hwnd = None
+        self._animation_scene = None
+        self._blend_surface = None
+        self._visual_generation = 0
+        self._animation_generation = -1
+        self._animation_clock = AnimationClock()
+        self._compositor = Compositor()
+        self._last_scene = None
+        self._transition = None
+        self._modal_transition = None
         self.dpi = 96.0
+        self.motion_allowed, self.transparency_allowed = system_preferences()
+        self.frame_effect = "solid"
+        self._hover_from = None
+        self._hover_at = 0.0
         self.hover = None
         self.pressed = None
         self.busy = False
@@ -4047,6 +4069,36 @@ class App:
             self.no_auto = True
             self.status = "还没配置：请在「① 选择各实例的路径」里逐行点「选择」"
 
+    def refresh_effects(self):
+        self.finish_transition()
+        self.finish_modal_transition()
+        self.motion_allowed, self.transparency_allowed = system_preferences()
+        self.frame_effect = apply_native_frame(
+            self.hwnd, self.cfg.get("ui_mica", True) and self.transparency_allowed and self._compositor.available,
+            material=self.cfg.get("ui_material", "mica"))
+        if not self.motion_enabled():
+            user32.KillTimer(self.hwnd, 2)
+            self._hover_at = 0.0
+            self.finish_transition()
+            self.finish_modal_transition()
+
+    def motion_enabled(self):
+        return self.motion_allowed and self.cfg.get("ui_motion", True)
+
+    def hover_amount(self, key):
+        if not self.motion_enabled() or not self._hover_at:
+            return float(self.hover == key)
+        t = min(1.0, (time.monotonic() - self._hover_at) / 0.18)
+        t = 1.0 - (1.0 - t) ** 3
+        if key == self.hover:
+            return t
+        return 1.0 - t if key == self._hover_from else 0.0
+
+    def row_highlight(self, hdc, key, rect):
+        a = self.hover_amount(key)
+        if a > 0:
+            self.fill_round(hdc, rect, 9, mix_color(C["card"], C["accent_l"], a))
+
     # ---------- 消息 ----------
     def ui_log(self, msg):
         """界面日志 + 文件日志（按钮直接触发的动作用这个）"""
@@ -4110,20 +4162,56 @@ class App:
         h = -max(8, self.S(px))
         weight = 700 if bold else 400
         f = gdi32.CreateFontW(h, 0, 0, 0, weight, False, False, False,
-                              134, 0, 0, 5, 0, face)
+                              134, 0, 0, 4, 0, face)
         if not f:
             f = gdi32.CreateFontW(h, 0, 0, 0, weight, False, False, False,
-                                  134, 0, 0, 5, 0, "Microsoft YaHei")
+                                  134, 0, 0, 4, 0, "Microsoft YaHei")
         self._fonts[key] = f
         return f
 
     def text(self, hdc, s, rect, color, fnt,
              flags=DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX):
+        layers = getattr(self, '_glass_text_layers', None)
+        if layers and hdc == getattr(self, '_paint_dc', None):
+            clip = wt.RECT()
+            gdi32.GetClipBox.argtypes = [wt.HDC, ctypes.POINTER(wt.RECT)]
+            gdi32.GetClipBox(hdc, ctypes.byref(clip))
+            for layer, ink in zip(layers, (0xffffff, color)):
+                saved = gdi32.SaveDC(layer.dc)
+                gdi32.IntersectClipRect(layer.dc, clip.left, clip.top, clip.right, clip.bottom)
+                gdi32.SelectObject(layer.dc, fnt)
+                gdi32.SetTextColor(layer.dc, ink)
+                gdi32.SetBkMode(layer.dc, 1)
+                r = wt.RECT(*rect)
+                user32.DrawTextW(layer.dc, s, -1, ctypes.byref(r), flags)
+                gdi32.RestoreDC(layer.dc, saved)
+            return
         gdi32.SelectObject(hdc, fnt)
         gdi32.SetTextColor(hdc, color)
         gdi32.SetBkMode(hdc, 1)
         r = wt.RECT(*rect)
         user32.DrawTextW(hdc, s, -1, ctypes.byref(r), flags)
+
+    def text_layer_cover(self, rect=None):
+        """把已经画进文字层的字擦掉。
+
+        材质模式下文字单独存在两个覆盖层里，最后统一合成到场景上 —— 也就是说
+        「后画的实色面板」盖不住「先画的字」。模态弹窗的遮罩、卡片就是这种面板，
+        不擦就会变成：主界面的字浮在弹窗上面（v2.16.1 的毛病）。
+        rect 传客户区矩形即整屏擦掉；不给 rect 就擦全部。
+        """
+        layers = getattr(self, '_glass_text_layers', None)
+        if not layers:
+            return
+        if rect is None:
+            r = wt.RECT(0, 0, self._paint_w, self._paint_h)
+        else:
+            r = wt.RECT(int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+        gdi32.PatBlt.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, wt.DWORD]
+        for layer in layers:
+            gdi32.PatBlt(layer.dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                         0x00000042)          # BLACKNESS = 全 0，等于没画过
 
     def fill_round(self, hdc, rect, radius, fill, border=None, bwidth=1):
         """rect 已是物理像素；radius 是逻辑值"""
@@ -4167,17 +4255,51 @@ class App:
         gdi32.SelectObject(hdc, op)
         gdi32.DeleteObject(pen)
 
+    def fit_work_area(self):
+        """窗口被任务栏/分辨率变化挤到工作区外时，把它拉回来。
+
+        只在真的越界时才动 —— 用户自己拖过的位置要保住。
+        """
+        if not self.hwnd:
+            return
+        work = wt.RECT()
+        user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0)
+        if work.right <= work.left or work.bottom <= work.top:
+            return
+        r = wt.RECT()
+        user32.GetWindowRect(self.hwnd, ctypes.byref(r))
+        ww, wh = r.right - r.left, r.bottom - r.top
+        x, y = r.left, r.top
+        if x + ww > work.right:
+            x = work.right - ww
+        if y + wh > work.bottom:
+            y = work.bottom - wh
+        if x < work.left:
+            x = work.left
+        if y < work.top:
+            y = work.top
+        # 窗口比工作区还大的话，上面几条会互相打架（改分辨率变小的情况）
+        if ww > work.right - work.left or wh > work.bottom - work.top:
+            log_line("窗口比工作区大（%dx%d vs %dx%d），保持不动"
+                     % (ww, wh, work.right - work.left, work.bottom - work.top))
+            return
+        if (x, y) != (r.left, r.top):
+            user32.SetWindowPos(self.hwnd, None, x, y, 0, 0, 0x0001 | 0x0004)
+            log_line("窗口越界，已挪回工作区：(%d,%d) -> (%d,%d)"
+                     % (r.left, r.top, x, y))
+
     # ---------- 布局 ----------
     def layout(self, w, h):
         """w,h 是客户区物理像素；内部先排逻辑坐标，最后统一乘 DPI 系数"""
         kk = self.dpi / 96.0
-        pad = 26
+        pad = 28
+        left = 212
         W = int(round(w / kk))
         H = int(round(h / kk))
-        card_t = 82
+        card_t = 216 if self.page == "main" else 96
         # 子页面（设置 / 自定义 / 夜间）行数多，用矮一点的行高，日志区才不会被挤没。
         # 三个子页面统一行高，各分组内部密度才一致（之前 ①组 38、②③组 32，看着参差）。
-        row_h = {"settings": 34, "custom": 34, "night": 34, "tasks": 34}.get(self.page, 58)
+        row_h = {"settings": 42, "custom": 42, "night": 42, "tasks": 42}.get(self.page, 58)
         self.row_h_logical = row_h
         self.sub_page = self.page in ("settings", "custom", "night", "about", "tasks")
         items = self.current_rows()
@@ -4199,16 +4321,19 @@ class App:
                 rh = int(it.get("h") or row_h)
             rows.append([it, y, rh])
             y += rh
+        if self.page == "main":
+            rows = [[it, (i//2)*104, 98] for i,(it,_,_) in enumerate(rows)]
+            y = ((len(rows)+1)//2)*104
         content_h = y + 6                  # 底部内边距
         view_top = card_t + 6
 
         # 卡片最高到哪儿：底下要留出按钮行 + 至少 3 行日志
-        card_cap = H - 36 - b_h - 20 - 54
+        card_cap = H - 36 - b_h - 20 - 82
         card_b = min(view_top + content_h, max(view_top + 80, card_cap))
         if self.page == "about":
             # 关于页是自绘的整块，占满到按钮行之前，不留日志区
             card_b = H - 40 - 46 - 14
-            content_h = card_b - view_top
+            content_h = self.about_geom((left, card_t, W-pad, card_b))[0]["bottom"] - view_top
 
         # 内容比可视区高就滚动（子页面才滚；主界面行少，用不到）
         self._scroll_max = max(0, content_h - (card_b - view_top))
@@ -4221,15 +4346,15 @@ class App:
 
         by = card_b + 10
         # 按钮从左到右排：宽 200 / 118 / 118 / 104 / 110，间距 12 或 10
-        x = pad
+        x = left
         log_top = by + b_h + 10
         log_bot = max(log_top, H - 36)      # 子页面行多，日志区可能被压成 0 高
         rects = {
-            "title": (pad, 16, W - pad, 46),
-            "sub": (pad, 46, W - pad, 68),
-            "card": (pad, card_t, W - pad, card_b),
-            "logcard": (pad, log_top, W - pad, log_bot),
-            "statusbar": (pad, H - 34, W - pad, H - 12),
+            "title": (left, 19, W - pad, 52),
+            "sub": (left, 57, W - pad, 78),
+            "card": (left, card_t, W - pad, card_b),
+            "logcard": (left, log_top, W - pad, log_bot),
+            "statusbar": (left, H - 34, W - pad, H - 12),
         }
         # 有可用更新时，状态栏右侧那块是可点的（点了跳设置页）
         if self.upd_hint():
@@ -4242,29 +4367,41 @@ class App:
             rects[key] = (x, by, x + bw, by + b_h)
             x += bw + (12 if i == 0 else 10)
 
+        if self.page == "main":
+            rects["hero"] = (left, 94, W-pad, 178)
+            button_widths = (("start", 242), ("night", 142), ("cancel", 120), ("shutdown", 150))
+            x = left
+            for name, width in button_widths:
+                width = int((W-pad-left-36)*width/654)
+                rects[name] = (x, by, x+width, by+b_h)
+                x += width+12
+            # Kept as a valid return anchor for layout tooling; navigation is in the sidebar.
+            rects["edit"] = (left, by, left+140, by+b_h)
+        else:
+            rects["edit"] = (left, by, left+140, by+b_h)
         # 标题右侧的「全选」（只占标题行右边，不加高窗口）
-        chip_t, chip_b = 18, 44
+        chip_t, chip_b = (185, 209) if self.page == "main" else (18, 44)
         all_w = 96
         xr = W - pad
         rects["all"] = (xr - all_w, chip_t, xr, chip_b)
 
         # 关于页：自绘整块，顺手把可点的链接矩形登记进来（逻辑坐标，后面统一乘 kk）
         if self.page == "about":
-            self._about = self.about_geom((pad, card_t, W - pad, card_b))
+            self._about = self.about_geom((left, card_t-self.scroll, W - pad, card_b))
             for i, (url, lr) in enumerate(self._about[2]):
                 rects["about_link:%d" % i] = tuple(lr)
 
         # 「夜间启动」询问卡片：模态盖住整个客户区，居中一块卡片 + 两个按钮
         if self.prompt:
-            cw, chh = 480, 216
-            cx = (W - cw) // 2
-            cy = max(card_t + 10, (H - chh) // 2)
-            rects["prompt"] = (cx, cy, cx + cw, cy + chh)
-            bw, bh, gap = 132, 42, 26
-            bx = cx + (cw - (bw * 2 + gap)) // 2
-            by = cy + chh - 76
-            rects["prompt_night"] = (bx, by, bx + bw, by + bh)
-            rects["prompt_cancel"] = (bx + bw + gap, by, bx + bw + gap + bw, by + bh)
+            cw, chh = 620, 246
+            cx = (W-cw)//2
+            cy = max(card_t+10,(H-chh)//2)
+            rects["prompt"]=(cx,cy,cx+cw,cy+chh)
+            bx=cx+33
+            by=cy+chh-70
+            for key,bw in (("prompt_all",190),("prompt_night",226),("prompt_cancel",112)):
+                rects[key]=(bx,by,bx+bw,by+42)
+                bx+=bw+12
 
         # 「选 exe」卡片：同样盖在主界面之上
         if self.exepick:
@@ -4302,6 +4439,16 @@ class App:
         R["rows"] = [(item, int(round(y * kk)), int(round(h * kk)))
                      for item, y, h in rows]
         R["row_h"] = int(round(row_h * kk))
+        R["disabled_rows"]={it["key"] for it,_,_ in rows if not it["key"].startswith("sec:")
+                            and self.page != "main" and not self.setting_button(it)[2]}
+        R["tiles"] = {}
+        if self.page == "main":
+            cl,ct,cr,cb=R["card"]
+            tilew=(cr-cl-self.S(12))//2
+            for i,(it,yy,hh) in enumerate(R["rows"]):
+                xx=cl+(i%2)*(tilew+self.S(12))
+                R["tiles"][it["key"]]=(xx,yy,xx+tilew,yy+hh)
+
 
     def current_rows(self):
         if self.page == "about":
@@ -4366,42 +4513,34 @@ class App:
         ]
 
     def about_geom(self, card):
-        """关于页排版（逻辑像素）：返回 (头部矩形, 各块, 可点链接)
-
-        绘制和命中都吃这一份数字，避免"看着在这儿却点不着"。
-        """
-        x1, y1, x2, y2 = card
-        cx = (x1 + x2) / 2.0
-        pad = 26
-        av = 64
-        g = {"avatar": (cx - av / 2.0, y1 + 22, cx + av / 2.0, y1 + 22 + av)}
-        g["name"] = (x1 + pad, g["avatar"][3] + 10, x2 - pad, g["avatar"][3] + 40)
-        g["ver"] = (x1 + pad, g["name"][3], x2 - pad, g["name"][3] + 18)
-        g["tag"] = (x1 + pad, g["ver"][3], x2 - pad, g["ver"][3] + 20)
-
-        bx1, bx2 = x1 + pad, x2 - pad
-        y = g["tag"][3] + 14
-        blocks, links = [], []
-        for title, lines in self.about_blocks():
-            h = 28 + len(lines) * 21 + 12
-            rect = (bx1, y, bx2, y + h)
-            rows = []
-            ly = y + 28
-            for label, value, url in lines:
-                lr = (bx1 + 20, ly, bx2 - 16, ly + 21)
-                rows.append((label, value, url, lr))
+        """Flow layout shared by drawing, scrolling, and link hit-testing."""
+        x1,y1,x2,y2=card
+        pad=24
+        g={"avatar":(x1+pad,y1+22,x1+pad+52,y1+74)}
+        g["name"]=(x1+pad+70,y1+20,x2-pad,y1+49)
+        g["ver"]=(x1+pad+70,y1+50,x2-pad,y1+74)
+        g["tag"]=(x1+pad,y1+88,x2-pad,y1+112)
+        bx1,bx2=x1+pad,x2-pad
+        y=y1+130
+        blocks,links=[],[]
+        for title,lines in self.about_blocks():
+            height=40+len(lines)*26+14
+            rect=(bx1,y,bx2,y+height)
+            rows=[]
+            ly=y+40
+            for label,value,url in lines:
+                lr=(bx1+20,ly,bx2-18,ly+26)
+                rows.append((label,value,url,lr))
                 if url:
-                    links.append((url, lr))
-                ly += 21
-            blocks.append((title, rect, rows))
-            y += h + 12
-
-        # 底部一行：配置文件真实路径（点一下打开）。
-        # 顺便在界面上把"覆盖 exe 升级不丢配置"这件事讲明白。
-        fy = y2 - 32
-        g["cfg"] = (x1 + pad, fy - 4, x2 - pad, fy + 20)
-        links.append(("file:" + CONFIG_PATH, g["cfg"]))
-        return g, blocks, links
+                    links.append((url,lr))
+                ly+=26
+            blocks.append((title,rect,rows))
+            y+=height+14
+        g["cfg"]=(bx1,y+4,bx2,y+30)
+        g["hint"]=(bx1,y+34,bx2,y+56)
+        g["bottom"]=y+74
+        links.append(("file:"+CONFIG_PATH,g["cfg"]))
+        return g,blocks,links
 
     def draw_about(self, hdc, card):
         """关于页：头像 + 名字 + 版本 + 一句话 + 几块说明（自绘，跟行列表无关）"""
@@ -4416,19 +4555,19 @@ class App:
                         16, rgb("#DCE2EC"))
         self.fill_round(hdc, (S(ax1), S(ay1), S(ax2), S(ay2)), 14,
                         C["card"], C["border"], 1.2)
-        draw_icon(hdc, "launcher", S(ax1 + 9), S(ay1 + 9), S(46))
+        draw_icon(hdc, "launcher", S(ax1 + 6), S(ay1 + 6), S(40))
 
         self.text(hdc, APP_TITLE, tuple(S(v) for v in g["name"]),
                   C["text"], self.font(19, True),
-                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX)
         _variant = ("文件夹版 · 秒开 · 更新走安装程序" if ONEDIR
                     else "单文件版 · 双击即用 · 换 exe 即升级")
         self.text(hdc, "%s · %s" % (APP_VERSION, _variant),
                   tuple(S(v) for v in g["ver"]), C["muted"], self.font(10.5),
-                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX)
         self.text(hdc, "按顺序拉起 MaaEnd → MuMu 实例 → MAA → MaaFgo → ok-ww，全程不弹 UAC",
                   tuple(S(v) for v in g["tag"]), C["text2"], self.font(11),
-                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX)
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX)
 
         for title, rect, rows in blocks:
             self.fill_round(hdc, tuple(S(v) for v in rect), 10,
@@ -4472,15 +4611,15 @@ class App:
                       C["muted"], self.font(10.5),
                       DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
             hint = "（就在 exe 旁边，覆盖 exe 升级不会丢）"
-            self.text(hdc, CONFIG_PATH, (S(cr[0] + 68), S(cr[1]), S(cr[2] - 190), S(cr[3])),
+            self.text(hdc, CONFIG_PATH, (S(cr[0] + 68), S(cr[1]), S(cr[2]), S(cr[3])),
                       C["accent_d"] if hot else C["accent"], self.font(10.5),
                       DT_LEFT | DT_SINGLELINE | DT_VCENTER
                       | DT_END_ELLIPSIS | DT_NOPREFIX)
-            self.text(hdc, hint, (S(cr[2] - 186), S(cr[1]), S(cr[2]), S(cr[3])),
+            self.text(hdc, hint, tuple(S(v) for v in g["hint"]),
                       C["muted"], self.font(9.5),
-                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX)
 
-    # ---------- 各项目的自动任务 ----------
+    # ---------- 安排自动任务 ----------
     MXU_CFG = {"maaend": "mxu-MaaEnd.json", "maafgo": "mxu-MaaFgo.json"}
     TASK_DEFAULTS = {
         "maaend.instance": "全套日常",
@@ -4533,7 +4672,7 @@ class App:
         c = self.cfg
         out = [{
             "key": "t_hint",
-            "icon": "cfg",
+            "icon": "ui_info",
             "title": "改这里 = 改它们启动后自动做什么",
             "sub": "只影响「启动后要不要自动开始」；具体勾了哪些子任务，在各脚本自己的界面里",
             "chip": "说明",
@@ -4607,7 +4746,7 @@ class App:
 
         out.append({
             "key": "t_reset",
-            "icon": "cfg",
+            "icon": "ui_update",
             "title": "恢复全部默认",
             "sub": "MaaEnd「全套日常」+ 自动开始 · MAA 自动运行 · ok-ww 每日任务",
             "chip": "恢复",
@@ -4667,10 +4806,10 @@ class App:
         save_config(self.cfg)
         self.ui_log("已恢复默认：MaaEnd「全套日常」+ 自动开始 · MAA 自动运行 · "
                     "MaaFgo「默认设置」+ 自动开始 · ok-ww 每日任务")
-        self.status = "各项目的自动任务已恢复默认"
+        self.status = "安排自动任务已恢复默认"
 
     def settings_rows(self):
-        """设置页：三大块 —— ① 各脚本/模拟器路径 ② 模拟器实例与版本 ③ 其它
+        """设置页：路径、连接与版本、软件更新、界面偏好；模块入口统一在侧栏
 
         每块前面插一行分组标题（key 以 "sec:" 开头，绘制时特殊处理），
         这样用户一眼能看出"这块是干什么的"，不用对着 11 行平铺猜。
@@ -4685,7 +4824,7 @@ class App:
         out.append({
             "key": "mumu",
             "icon": "mumu",
-            "h": 34,
+            "h": 42,
             "title": "MuMu 模拟器目录",
             "sub": cfg.get("mumu_root") or "未设置（点右侧「选择」）",
         })
@@ -4697,7 +4836,7 @@ class App:
             out.append({
                 "key": key,
                 "icon": key,
-                "h": 34,
+                "h": 42,
                 "title": "%s · %s" % (name, game),
                 "sub": p or "未设置（点右侧「选择」）",
             })
@@ -4738,64 +4877,26 @@ class App:
             "chip": label,
         })
 
-        out.append({
-            "key": "sec:more",
-            "h": 22,
-            "title": "③ 其它",
-            "sub": "主界面项目、每日手游清单、原始配置文件",
-        })
-        n_cus = len(cfg.get("custom_items", []) or [])
-        n_hid = len(cfg.get("hidden_items", []) or [])
-        out.append({
-            "key": "custom_page",
-            "icon": "cfg",
-            "title": "主界面项目（自定义 / 删除）",
-            "sub": "加自己想跑的游戏 · 删掉不用的行 · 恢复默认%s"
-                   % (("（已加 %d 个、隐藏 %d 行）" % (n_cus, n_hid))
-                      if (n_cus or n_hid) else ""),
-            "chip": "管理",
-        })
-        out.append({
-            "key": "night_page",
-            "icon": "cfg",
-            "title": "《今晚的手游日常》包含哪些",
-            "sub": "一天要清两次日常的手游 · 现在是 %s" % self.night_desc(),
-            "chip": "设置",
-        })
-        out.append({
-            "key": "task_page",
-            "icon": "cfg",
-            "h": 34,
-            "title": "各项目的自动任务",
-            "sub": "启动后自动跑什么：%s" % self.task_summary(),
-            "chip": "设置",
-        })
+        out.append({"key": "sec:update", "h": 22, "title": "③ 软件更新", "sub": ""})
         u_sub, u_chip = self.upd_text()
         out.append({
             "key": "update",
-            "icon": "launcher",
-            "h": 34,
+            "icon": "ui_update",
+            "h": 42,
             "title": "检查更新",
             "sub": u_sub,
             "chip": u_chip,
         })
 
-        out.append({
-            "key": "sec:about",
-            "h": 22,
-            "title": "④ 关于",
-            "sub": "作者、项目主页、版本与使用声明",
-        })
-        # 作者名只认代码里的常量，不从 config.json 读（那个谁都能改）
-        author = str(ABOUT_INFO.get("author") or "").strip() or "未填写"
-        out.append({
-            "key": "about_page",
-            "icon": "launcher",
-            "h": 34,
-            "title": "关于本软件",
-            "sub": "%s · 免费使用 · 非商业用途 · 作者 %s" % (APP_VERSION, author),
-            "chip": "查看",
-        })
+        out.extend([
+            {"key": "sec:appearance", "h": 22, "title": "④ 界面与动效", "sub": ""},
+            {"key": "ui_material", "icon": "ui_sparkle", "title": "窗口背景材质",
+             "sub": "Mica / Tabbed（Mica Alt）/ 亚克力 / 实色 · 不支持时自动回退",
+             "chip": self.material_name()},
+            {"key": "ui_motion", "icon": "ui_sliders", "title": "轻量动画",
+             "sub": "页面淡入与滑移 · 跟随 Windows 的动画偏好",
+             "chip": "开启" if cfg.get("ui_motion", True) else "关闭"},
+        ])
         return out
 
     def instance_rows(self):
@@ -4854,7 +4955,7 @@ class App:
                 continue
             out.append({
                 "key": "custom:%s" % cid,
-                "icon": None,
+                "icon": "ui_apps",
                 "title": it.get("name") or "自定义",
                 "sub": self._custom_sub(it),
                 "custom": True,
@@ -4876,7 +4977,7 @@ class App:
         """自定义页：加新实例 / 逐个删除·恢复 / 恢复默认"""
         out = [{
             "key": "c_add",
-            "icon": None,
+            "icon": "ui_apps",
             "title": "+ 增加自定义实例",
             "sub": "选一个脚本 exe，再选一个游戏启动 exe（最多 %d 个）" % MAX_CUSTOM,
             "chip": "添加",
@@ -4900,7 +5001,7 @@ class App:
                                         key in hid, custom=it))
         out.append({
             "key": "c_restore",
-            "icon": "cfg",
+            "icon": "ui_update",
             "title": "恢复默认主界面",
             "sub": "清掉自定义项、把删掉的行都放回来（4 个脚本 + 所有实例）",
             "chip": "恢复",
@@ -4920,7 +5021,7 @@ class App:
         else:
             sub = "主界面上正显示这一项 —— 点「删除」隐藏它"
             chip = "删除"
-        return {"key": "c_del:" + key, "icon": icon, "title": label,
+        return {"key": "c_del:" + key, "icon": icon or "ui_apps", "title": label,
                 "sub": sub, "chip": chip}
 
     # ---------- 《今晚的手游日常》 ----------
@@ -5002,9 +5103,9 @@ class App:
         items = set(self.night_items())
         out = [{
             "key": "n_hint",
-            "icon": "cfg",
+            "icon": "ui_moon",
             "title": "一天要清两次日常的手游",
-            "sub": "勾上的算《今晚的手游日常》—— 开机弹窗点「否」，或主界面按「夜间启动」，都只跑它们",
+            "sub": "勾上的算《今晚的手游日常》—— 开机弹窗点「只启动今晚的手游日常」，或主界面按「夜间启动」，都只跑它们",
             "chip": "说明",
         }]
         for k, label in self.NIGHT_SCRIPTS:
@@ -5022,14 +5123,14 @@ class App:
             on = k in items
             out.append({
                 "key": "n_toggle:" + k,
-                "icon": None,
+                "icon": "ui_apps",
                 "title": it.get("name") or "自定义",
                 "sub": "自定义项目（未适配，只帮你打开，不自动跑任务）",
                 "chip": "算" if on else "不算",
             })
         out.append({
             "key": "n_restore",
-            "icon": "cfg",
+            "icon": "ui_update",
             "title": "恢复默认",
             "sub": "回到「明日方舟（MAA）+ FGO（MaaFgo）」",
             "chip": "恢复",
@@ -5073,60 +5174,55 @@ class App:
         rc = wt.RECT()
         user32.GetClientRect(self.hwnd, ctypes.byref(rc))
         w, h = rc.right, rc.bottom
+        cached = self._animation_scene
+        if ((self._transition or self._modal_transition) and cached
+                and self._animation_generation == self._visual_generation
+                and (cached.width,cached.height) == (w,h)):
+            self.present_scene(target,cached.dc,w,h)
+            return
+        render_started = time.monotonic()
         mem = gdi32.CreateCompatibleDC(target)
         bmp = gdi32.CreateCompatibleBitmap(target, w, h)
-        gdi32.SelectObject(mem, bmp)
+        old_bmp = gdi32.SelectObject(mem, bmp)
 
         bg = gdi32.CreateSolidBrush(C["bg"])
         full = wt.RECT(0, 0, w, h)
         user32.FillRect(mem, ctypes.byref(full), bg)
         gdi32.DeleteObject(bg)
 
+        for layer in getattr(self, '_glass_text_layers', ()) or ():
+            layer.close()
+        self._glass_text_layers = None
+        self._paint_dc = mem
+        self._paint_w, self._paint_h = w, h
+        if self.frame_effect in ('mica', 'tabbed', 'acrylic'):
+            from ui_render import DibSurface
+            self._glass_text_layers = (DibSurface(mem,w,h), DibSurface(mem,w,h))
+            for layer in self._glass_text_layers:
+                layer.clear()
         self.layout(w, h)
         R = self.rects
 
-        # 标题行左侧放本程序图标，标题与副标题一起右移对齐
-        tsz = self.S(22)
-        tx0 = R["title"][0]
-        draw_icon(mem, "launcher", tx0, R["title"][1] + self.S(4), tsz)
-        tdx = tsz + self.S(10)
-
-        self.text(mem, APP_TITLE,
-                  (tx0 + tdx, R["title"][1], R["title"][2], R["title"][3]),
-                  C["text"], self.font(21, True))
-        if self.page == "settings":
-            if self.first_run:
-                sub = "%s · 还没配置：先在「① 选择各实例的路径」里逐行点「选择」指路径" % APP_VERSION
-            else:
-                sub = "%s · 设置页：① 选路径 ② 换实例/版本 ③ 其它 ④ 关于" % APP_VERSION
-        elif self.page == "custom":
-            sub = "%s · 二级 · 主界面项目：加自定义实例 / 删掉不用的行 / 恢复默认" % APP_VERSION
-        elif self.page == "night":
-            sub = "%s · 二级 · 《今晚的手游日常》= 一天要清两次日常的手游，勾在这里" % APP_VERSION
-        elif self.page == "tasks":
-            sub = "%s · 二级 · 每个项目启动后自动跑什么任务" % APP_VERSION
-        elif self.page == "about":
-            sub = "%s · 二级 · 关于本软件：作者、项目主页、使用声明" % APP_VERSION
-        else:
-            # 副标题按当前可见的项生成（用户可能删过行）
-            hid = self.hidden()
-            parts = []
-            if "maaend" not in hid:
-                parts.append("MaaEnd")
-            n_vm = len([i for i in self.cfg.get("instances", []) or []
-                        if ("vm%d" % int(i.get("index", -1))) not in hid])
-            if n_vm:
-                parts.append("MuMu×%d" % n_vm)
-            for k, label in (("maa", "MAA"), ("maafgo", "MaaFgo"), ("okww", "ok-ww")):
-                if k not in hid:
-                    parts.append(label)
-            sub = "%s · %s" % (APP_VERSION, " → ".join(parts) or "就绪")
-        self.text(mem, sub, (R["sub"][0] + tdx, R["sub"][1], R["sub"][2], R["sub"][3]),
-                  C["muted"], self.font(12))
-
-        self.fill_round(mem, R["card"], 12, C["card"], C["border"])
+        self.draw_shell(mem, w, h)
+        if self.page == "main":
+            self.draw_hero(mem)
+            self.text(mem, "任务清单", (self.S(212),self.S(185),self.S(460),self.S(209)),
+                      C["text2"], self.font(11, True))
+        if self.page != "main":
+            cr = R["card"]
+            self.fill_round(mem, (cr[0], cr[1] + self.S(3), cr[2], cr[3] + self.S(3)),
+                            14, rgb("#E6E9F4"))
+            self.fill_round(mem, cr, 14, C["card"], C["border"])
+            self.fill_round(mem, (cr[0] + self.S(20), cr[1], cr[0] + self.S(64), cr[1] + self.S(3)),
+                            1.5, C["accent"])
         if self.page == "about":
-            self.draw_about(mem, R["card"])
+            clip=gdi32.SaveDC(mem)
+            card=R["card"]
+            gdi32.IntersectClipRect(mem,card[0],card[1]+self.S(6),card[2],card[3]-self.S(4))
+            self.draw_about(mem, card)
+            gdi32.RestoreDC(mem,clip)
+            if self._scroll_max:
+                self.draw_scrollbar(mem,card,card[1]+self.S(6),card[3]-self.S(6),self.scroll,self._scroll_max)
         else:
             rows = R["rows"]
             # 内容能滚动时，超出卡片的部分必须裁掉，否则会画到按钮/日志区上
@@ -5137,8 +5233,11 @@ class App:
                 card = R["card"]
                 gdi32.IntersectClipRect(mem, card[0], card[1], card[2], card[3])
             for i, (item, y, rh) in enumerate(rows):
-                self.draw_row(mem, item, y, R["card"][0], R["card"][2], rh)
-                if i < len(rows) - 1:
+                if self.page == "main":
+                    self.draw_task_tile(mem, item, R["tiles"][item["key"]])
+                else:
+                    self.draw_row(mem, item, y, R["card"][0], R["card"][2], rh)
+                if self.page != "main" and i < len(rows) - 1:
                     self.hline(mem, R["card"][0] + self.S(22), R["card"][2] - self.S(22),
                                y + rh - self.S(3), C["line"])
             if scrolling:
@@ -5171,7 +5270,15 @@ class App:
         if self.exepick:                   # 「选 exe」卡片也在最上层
             self.draw_exe_picker(mem, w, h)
 
-        gdi32.BitBlt(target, 0, 0, w, h, mem, 0, 0, 0x00CC0020)
+        render_elapsed = time.monotonic() - render_started
+        if self._transition:
+            old, started, direction = self._transition
+            self._transition = (old, started + render_elapsed, direction)
+        if self._modal_transition:
+            old, started, opening, dialog = self._modal_transition
+            self._modal_transition = (old, started + render_elapsed, opening, dialog)
+        self.present_scene(target, mem, w, h)
+        gdi32.SelectObject(mem, old_bmp)
         gdi32.DeleteObject(bmp)
         gdi32.DeleteDC(mem)
 
@@ -5216,6 +5323,7 @@ class App:
         mask = gdi32.CreateSolidBrush(rgb("#E7ECF3"))
         user32.FillRect(hdc, ctypes.byref(wt.RECT(0, 0, w, h)), mask)
         gdi32.DeleteObject(mask)
+        self.text_layer_cover()          # 同上：遮罩也要擦掉文字层里的旧字
 
         self.fill_round(hdc, (card[0] + S(1), card[1] + S(4),
                               card[2] + S(1), card[3] + S(4)),
@@ -5294,7 +5402,7 @@ class App:
         kk = max(0.01, self.dpi / 96.0)
         key = item["key"]
         is_cfg = key == "config"
-        btn_w = 78
+        btn_w = 180
         # 进来的全是物理像素，先换算成逻辑像素统一排版
         y = y / kk
         cx1 = cx1 / kk
@@ -5314,6 +5422,9 @@ class App:
                       DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
             return
 
+        self.row_highlight(hdc, "set:" + key,
+                           (S(cx1 + 8), S(y), S(cx2 - 8), S(y + rh - 3)))
+
         # 文字块：标题带 + 副标题带，整体在行内垂直居中
         blk = min(self.SET_TEXT_BLOCK, rh)
         top = y + (rh - blk) / 2.0
@@ -5321,9 +5432,9 @@ class App:
 
         # 左侧图标：跟「标题」这一行的中线对齐（不是跟整块居中），
         # 才会跟标题看起来在同一行上。行高不够放不下就自动缩小。
-        isz = min(22, max(14, th + 2))
+        isz = min(28, max(18, rh - 10))
         ix = cx1 + 20
-        iy = top + th / 2.0 - isz / 2.0
+        iy = y + (rh - isz) / 2.0
         self.fill_round(hdc, (S(ix), S(iy), S(ix + isz), S(iy + isz)), 8, C["iconbg"])
         if not draw_icon(hdc, item.get("icon"), S(ix), S(iy), S(isz)):
             ch = (item.get("title") or "?")[:1]
@@ -5342,34 +5453,23 @@ class App:
 
         bx2 = cx2 - 22
         bx1 = bx2 - btn_w
-        bh = 23
-        by1 = y + (rh - bh) / 2.0
-        by2 = by1 + bh
-        hot = self.hover == "set:" + key
-        chip = item.get("chip")
-        if is_cfg:
-            bgc = C["ghost_bg_h"] if hot else C["ghost_bg"]
-            txt, col = "打开", C["text2"]
-        elif chip:
-            # 可切换的选项（实例号 / FGO 版本 / 删除 / 恢复）：点一下换下一个
-            bgc = C["accent_l"] if hot else C["ghost_bg"]
-            txt = chip
-            if chip == "删除":
-                col = C["err"]
-                bgc = C["err_bg_h"] if hot else C["err_bg"]
-            elif chip == "说明":
-                col = C["muted"]
-                bgc = C["ghost_bg"]
-            elif chip in ("恢复", "添加", "管理", "设置"):
-                col = C["accent"]
-            else:
-                col = C["accent"] if hot else C["text2"]
-        else:
-            bgc = C["accent_l"] if hot else C["ghost_bg"]
-            txt, col = "选择", C["accent"] if hot else C["text2"]
-        self.fill_round(hdc, (S(bx1), S(by1), S(bx2), S(by2)), 8, bgc, C["border"], 1.1)
-        self.text(hdc, txt, (S(bx1), S(by1), S(bx2), S(by2)), col, self.font(11, True),
-                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        bh = 34
+        by1 = y + (rh-bh)/2.0
+        by2 = by1+bh
+        hot=self.hover == "set:"+key
+        current,action,enabled=self.setting_button(item)
+        if not enabled and not action:
+            self.text(hdc,current,(S(bx1),S(by1),S(bx2),S(by2)),C["muted"],self.font(9.5),
+                      DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX)
+            return
+        danger=item.get("chip")=="删除"
+        bg=C["err_bg_h"] if danger and hot else C["err_bg"] if danger else C["accent_l"] if hot else C["ghost_bg"]
+        self.fill_round(hdc,(S(bx1),S(by1),S(bx2),S(by2)),8,bg,C["border"])
+        self.text(hdc,current,(S(bx1+5),S(by1+2),S(bx2-5),S(by1+16)),C["text2"],self.font(9),
+                  DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX)
+        self.text(hdc,action,(S(bx1+5),S(by1+16),S(bx2-5),S(by2-1)),
+                  C["muted"] if not enabled else C["err"] if danger else C["accent"],self.font(9.5,True),
+                  DT_CENTER|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX)
 
     def draw_row(self, hdc, item, y, cx1, cx2, rh=None):
         if self.sub_page:
@@ -5391,6 +5491,8 @@ class App:
             checked = self.maafgo_on
 
         S = self.S
+        self.row_highlight(hdc, "chk:" + key,
+                           (cx1 + S(8), y, cx2 - S(8), y + S(55)))
         # 左侧图标（28 逻辑像素），行高 58，垂直居中
         isz = S(28)
         ix = cx1 + S(20)
@@ -5423,7 +5525,11 @@ class App:
         self.text(hdc, label, (cx2 - S(220), y + S(18), cx2 - S(40), y + S(42)), color,
                   self.font(11.5, state != "idle"),
                   DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-        self.dot(hdc, cx2 - S(26), y + S(30), 4.5, dotc)
+        radius = 4.5
+        if state == "run" and self.motion_enabled():
+            import math
+            radius += 1.2 * (0.5 + 0.5 * math.sin(time.monotonic() * 4))
+        self.dot(hdc, cx2 - S(26), y + S(30), radius, dotc)
 
     def draw_shortcuts(self, hdc):
         """标题右侧的一键开关：全选"""
@@ -5466,6 +5572,7 @@ class App:
         mask = gdi32.CreateSolidBrush(rgb("#E7ECF3"))
         user32.FillRect(hdc, ctypes.byref(wt.RECT(0, 0, w, h)), mask)
         gdi32.DeleteObject(mask)
+        self.text_layer_cover()          # 材质模式：遮罩要连文字层一起擦，否则露出后面的字
 
         self.fill_round(hdc, (card[0] + S(1), card[1] + S(4),
                               card[2] + S(1), card[3] + S(4)),
@@ -5488,14 +5595,15 @@ class App:
                   (x1, y1 + S(18), card[2] - S(78), y1 + S(44)),
                   C["text"], self.font(15.5, True))
 
-        self.text(hdc, "否 = 只启动《今晚的手游日常》：%s" % self.night_desc(),
+        self.text(hdc, "夜间清单：%s" % self.night_desc(),
                   (x1, y1 + S(50), x2, y1 + S(70)), C["text2"], self.font(11.5))
-        self.text(hdc, "《今晚的手游日常》= 一天要清两次日常的手游（可在设置里改）",
+        self.text(hdc, "每日需清两次的手游，可在左侧「夜间清单」修改。",
                   (x1, y1 + S(70), x2, y1 + S(90)), C["text2"], self.font(11.5))
         self.text(hdc, "不操作就等 %d 秒，按上次的勾选全部启动" % PROMPT_SECONDS,
                   (x1, y1 + S(92), x2, y1 + S(112)), C["muted"], self.font(10.5))
 
-        for key, label, primary in (("prompt_night", "否", True),
+        for key, label, primary in (("prompt_all", "是，立即全部启动", True),
+                                    ("prompt_night", "只启动今晚的手游日常", False),
                                     ("prompt_cancel", "取消启动", False)):
             r = R.get(key)
             if not r:
@@ -5513,72 +5621,15 @@ class App:
                       DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
 
     def draw_buttons(self, hdc):
-        R = self.rects
-        r = R["start"]
-        if self.sub_page:
-            f, txtc, label = C["accent_l"], C["disabled"], "▶  一键启动"
-        elif self.busy:
-            f, txtc, label = C["accent_l"], C["accent"], "启动中…"
-        elif self.hover == "start":
-            f, txtc, label = C["accent_d"], rgb("#FFFFFF"), "▶  一键启动"
+        if self.page == "main":
+            self.draw_main_actions(hdc)
         else:
-            f, txtc, label = C["accent"], rgb("#FFFFFF"), "▶  一键启动"
-        self.fill_round(hdc, r, 9, f)
-        self.text(hdc, label, r, txtc, self.font(13.5, True),
-                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-
-        # 取消启动：仅启动过程中可用，可用时红字
-        r = R["cancel"]
-        if self.busy:
-            bgc = C["err_bg_h"] if self.hover == "cancel" else C["err_bg"]
-            self.fill_round(hdc, r, 9, bgc, C["err_border"], 1.2)
-            self.text(hdc, "■  取消启动", r, C["err"], self.font(12, True),
+            r = self.rects["edit"]
+            self.fill_round(hdc, r, 10, C["card"], C["border"])
+            self.text(hdc, "← 返回设置" if self.page_stack and self.page_stack[-1] == "settings" else "← 返回控制台", r,
+                      C["accent"], self.font(12, True),
                       DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-        else:
-            self.fill_round(hdc, r, 9, C["card"], C["border"], 1.2)
-            self.text(hdc, "取消启动", r, C["disabled"], self.font(12),
-                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-
-        # 关闭模拟器（启动中禁用，避免和启动流程抢 MuMu 控制权）
-        r = R["shutdown"]
-        if self.busy or self.sub_page:
-            self.fill_round(hdc, r, 9, C["card"], C["border"], 1.2)
-            self.text(hdc, "关闭模拟器", r, C["disabled"], self.font(12),
-                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-        else:
-            bgc = C["ghost_bg_h"] if self.hover == "shutdown" else C["ghost_bg"]
-            self.fill_round(hdc, r, 9, bgc, C["border"], 1.2)
-            self.text(hdc, "关闭模拟器", r, C["text2"], self.font(12),
-                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-
-        r = R["edit"]
-        in_set = self.sub_page
-        if in_set:
-            # 二级页的返回目标是「一级设置页」，一级设置页的返回目标是主界面
-            blabel = ("← 返回设置" if self.page in ("custom", "night", "about", "tasks")
-                      else "← 返回")
-            bgc = C["accent_l"] if self.hover == "edit" else C["ghost_bg"]
-            self.fill_round(hdc, r, 9, bgc, C["accent"], 1.2)
-            self.text(hdc, blabel, r, C["accent"], self.font(12, True),
-                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-        else:
-            bgc = C["ghost_bg_h"] if self.hover == "edit" else C["ghost_bg"]
-            self.fill_round(hdc, r, 9, bgc, C["border"], 1.2)
-            self.text(hdc, "设置", r, C["text2"], self.font(12),
-                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-
-        # 夜间启动：等价于开机弹窗里点「否」——只跑《今晚的手游日常》。
-        # 启动中 / 二级页里不可用（灰掉）。
-        r = R["night"]
-        if self.busy or self.sub_page:
-            self.fill_round(hdc, r, 9, C["card"], C["border"], 1.2)
-            self.text(hdc, "夜间启动", r, C["disabled"], self.font(12),
-                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
-        else:
-            bgc = C["accent_l"] if self.hover == "night" else C["ghost_bg"]
-            self.fill_round(hdc, r, 9, bgc, C["accent"], 1.2)
-            self.text(hdc, "夜间启动", r, C["accent"], self.font(12, True),
-                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+        return
 
     def draw_scrollbar(self, hdc, card, top, bot, offset, max_offset):
         """卡片右侧那条细滚动条：只有内容比可视区高时才出现"""
@@ -5600,12 +5651,13 @@ class App:
         S = self.S
         pad = S(14)
         line_h = S(18)
+        self.text(hdc, "运行记录", (l+pad,t+S(10),r-pad,t+S(30)), C["text2"], self.font(10.5,True))
         gdi32.SaveDC(hdc)
-        gdi32.IntersectClipRect(hdc, l + pad - S(2), t + S(10), r - pad + S(4), b - S(8))
-        fnt = self.font(11.5, False, "Consolas")
-        avail = max(1, int((b - t - S(22)) // line_h))
+        gdi32.IntersectClipRect(hdc, l + pad - S(2), t + S(36), r - pad + S(4), b - S(8))
+        fnt = self.font(10.5)
+        avail = max(1, int((b - t - S(46)) // line_h))
         lines = self.logs[-avail:]
-        yy = t + S(12)
+        yy = t + S(36)
         for text, ckey in lines:
             self.text(hdc, text, (l + pad, yy, r - pad, yy + line_h),
                       C.get(ckey, C["text2"]), fnt)
@@ -5615,9 +5667,15 @@ class App:
     # ---------- 命中 ----------
     def hit(self, x, y):
         R = self.rects
+        if self._modal_transition:
+            return "modal_transition"
+        if not self.prompt and not self.exepick:
+            for page, rect in self.nav_rects():
+                if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                    return "nav:" + page
         if self.prompt:
             # 询问卡是模态的：只认卡片上的两个按钮，别的一律吞掉
-            for key in ("prompt_night", "prompt_cancel"):
+            for key in ("prompt_all", "prompt_night", "prompt_cancel"):
                 r = R.get(key)
                 if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
                     return key
@@ -5647,16 +5705,23 @@ class App:
         # 关于页的链接行：整行都能点，比只点文字好点
         if self.page == "about":
             for k, r in R.items():
-                if k.startswith("about_link:") and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                if k.startswith("about_link:") and R["card"][1]+self.S(6) <= y <= R["card"][3]-self.S(4) and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
                     return k
+        if self.page == "main":
+            card = R.get("card")
+            if card and card[1] <= y <= card[3]:
+                for key, rect in R.get("tiles", {}).items():
+                    if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                        return "chk:"+key
+            return None
         # 行列表只算卡片可视区里那部分（滚动后上半截可能被挡住了）
         card = R.get("card")
-        if card and not (card[1] <= y <= card[3]):
+        if card and not (card[0] <= x <= card[2] and card[1] <= y <= card[3]):
             return None
         rh = R.get("row_h", self.S(56))
         prefix = "chk:" if self.page == "main" else "set:"
         for item, ry, rowh in R.get("rows", []):
-            if item["key"].startswith("sec:"):
+            if item["key"].startswith("sec:") or item["key"] in R.get("disabled_rows",set()):
                 continue                       # 分组标题行不可点
             if ry - 2 <= y <= ry + rowh - 2:
                 return prefix + item["key"]
@@ -5735,7 +5800,7 @@ class App:
         keys = self.night_keep()
         if not keys:
             self.status = "《今晚的手游日常》里一个项目都没选"
-            self.ui_log("「夜间启动」没跑：设置 → ③ 其它 →《今晚的手游日常》里"
+            self.ui_log("「夜间启动」没跑：请在左侧「夜间清单」中"
                         "先勾上要跑的项目。")
             return
         self.run_only = set(keys)
@@ -5744,7 +5809,7 @@ class App:
         self.ui_log("《今晚的手游日常》：只启动 %s；其余项本次跳过（勾选未改动）"
                     % "、".join(self._night_label(k) for k in keys))
 
-    def answer_prompt(self, night):
+    def answer_prompt(self, night, all_selected=False):
         """回答开机的「按上次的勾选全部一键启动吗」
 
         night=True  → 回答"否"：不按上次勾选全跑，只启动《今晚的手游日常》，
@@ -5753,6 +5818,10 @@ class App:
         """
         self.prompt = None
         user32.InvalidateRect(self.hwnd, None, False)
+        if all_selected:
+            self.ui_log("立即按上次的勾选全部一键启动。")
+            self.do("start")
+            return
         if not night:
             self.status = "已取消：这次不启动任何东西"
             self.ui_log("已取消启动：什么都没开。下次打开还会再问一次。")
@@ -6220,6 +6289,21 @@ class App:
         """设置页点了一行：路径类弹文件夹选择框，选项类就地循环切换"""
         if self.busy:
             return
+        if kind == "ui_material":
+            choices=["mica","tabbed","acrylic","solid"]
+            current=self.cfg.get("ui_material","mica") if self.cfg.get("ui_mica",True) else "solid"
+            nxt=choices[(choices.index(current)+1)%len(choices)] if current in choices else "mica"
+            self.cfg.update(ui_material=nxt,ui_mica=nxt!="solid")
+            save_config(self.cfg)
+            self.refresh_effects()
+            user32.InvalidateRect(self.hwnd,None,False)
+            return
+        if kind in ("ui_mica", "ui_motion"):
+            self.cfg[kind] = not self.cfg.get(kind, True)
+            save_config(self.cfg)
+            self.refresh_effects()
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
         if kind in ("maa_instance", "fgo_instance", "fgo_ver"):
             self.cycle_setting(kind)
             user32.InvalidateRect(self.hwnd, None, False)
@@ -6239,7 +6323,7 @@ class App:
         if kind == "task_page":
             self.page_stack.append("settings")
             self.page = "tasks"
-            self.status = "二级 · 各项目的自动任务：启动后自动跑什么"
+            self.status = "二级 · 安排自动任务：启动后自动跑什么"
             user32.InvalidateRect(self.hwnd, None, False)
             return
         if kind.startswith("t_mx:"):
@@ -6314,8 +6398,15 @@ class App:
         user32.InvalidateRect(self.hwnd, None, False)
 
     def do(self, key):
-        if key in ("prompt_night", "prompt_cancel"):
-            self.answer_prompt(key == "prompt_night")
+        if key.startswith("nav:"):
+            target = key[4:]
+            if target in {row[0] for row in self.NAV} and target != self.page and not self.busy:
+                self.page_stack = [] if target == "main" else ["main"]
+                self.page = target
+                self.status = "就绪" if target == "main" else "设置改动会自动保存"
+            return
+        if key in ("prompt_all", "prompt_night", "prompt_cancel"):
+            self.answer_prompt(key == "prompt_night", key == "prompt_all")
             return
         if key == "prompt_mask":       # 点在询问卡外面：什么也不做
             return
@@ -6357,13 +6448,13 @@ class App:
                 user32.InvalidateRect(self.hwnd, None, False)
             return
         if key == "upd_goto":
-            # 状态栏那句提示：跳到设置页，那一行就在 ③ 其它 里
+            # 状态栏那句提示：跳到设置页，更新入口位于 ③ 软件更新
             if self.page != "settings":
                 self.page_stack.append(self.page)
                 self.page = "settings"
                 self.status = ("新版 %s 等着装：点「检查更新」那一行右边的按钮"
                                % (self.upd.get("tag") or ""))
-                self.ui_log("已跳到设置页：③ 其它 →「检查更新」")
+                self.ui_log("已跳到设置页：③ 软件更新 →「检查更新」")
             else:
                 self.status = self.upd_hint() or self.status
             user32.InvalidateRect(self.hwnd, None, False)
@@ -6432,13 +6523,19 @@ class App:
                 y = ctypes.c_short((lp >> 16) & 0xFFFF).value
                 h = self.hit(x, y)
                 if h != self.hover:
+                    self._hover_from = self.hover
+                    self._hover_at = time.monotonic()
                     self.hover = h
+                    if self.motion_enabled():
+                        user32.SetTimer(hwnd, 2, 16, None)
                     user32.InvalidateRect(hwnd, None, False)
                 return 0
             if msg == WM_LBUTTONDOWN:
                 x = ctypes.c_short(lp & 0xFFFF).value
                 y = ctypes.c_short((lp >> 16) & 0xFFFF).value
                 self.pressed = self.hit(x, y)
+                if self._transition and not (self.pressed or "").startswith("nav:"):
+                    self.pressed = None
                 return 0
             if msg == WM_LBUTTONUP:
                 x = ctypes.c_short(lp & 0xFFFF).value
@@ -6496,7 +6593,27 @@ class App:
                 if self.hover:
                     user32.SetCursor(load_cursor(32649))
                     return 1
+            if msg in (0x031A, 0x001A, 0x031E):  # theme / system preferences changed
+                self.refresh_effects()
+                if msg == 0x001A:                # WM_SETTINGCHANGE：任务栏挪位置也走这里
+                    self.fit_work_area()
+                user32.InvalidateRect(hwnd, None, False)
             if msg == WM_TIMER:
+                if wp == 4:
+                    if user32.IsIconic(hwnd):
+                        self.finish_modal_transition()
+                    user32.InvalidateRect(hwnd, None, False)
+                    return 0
+                if wp == 3:
+                    user32.InvalidateRect(hwnd, None, False)
+                    return 0
+                if wp == 2:
+                    user32.InvalidateRect(hwnd, None, False)
+                    if time.monotonic() - self._hover_at >= 0.18:
+                        user32.KillTimer(hwnd, 2)
+                    return 0
+                if self.busy and self.motion_enabled() and user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+                    user32.InvalidateRect(hwnd, None, False)
                 self.drain()
                 self._tick_prompt()
                 self._tick_update()
@@ -6505,10 +6622,27 @@ class App:
                     self.do("start")
                 return 0
             if msg == WM_KEYDOWN:
-                if wp == 0x0D and not self.busy:
+                if (wp == 0x0D and not self.busy and self.page == "main"
+                        and not self._transition and not self._modal_transition
+                        and not self.prompt and not self.exepick):
                     self.do("start")
                     return 0
             if msg == WM_DESTROY:
+                for layer in getattr(self, "_glass_text_layers", ()) or ():
+                    layer.close()
+                self._glass_text_layers = None
+                self.finish_modal_transition()
+                self.finish_transition()
+                if self._last_scene:
+                    self._last_scene.close()
+                    self._last_scene = None
+                for surface in (self._animation_scene,self._blend_surface):
+                    if surface:
+                        surface.close()
+                self._animation_clock.stop()
+                self._compositor.close()
+                user32.KillTimer(hwnd, 1)
+                user32.KillTimer(hwnd, 2)
                 user32.PostQuitMessage(0)
                 return 0
         except Exception:
@@ -6629,18 +6763,29 @@ class App:
         style = 0x00CF0000 & ~0x00010000 & ~0x00040000  # 去掉最大化/可调边框
         # 设置页现在有 14 行（3 个分组标题 + 11 行内容），比主界面高不少，
         # 窗口要留够高度，否则子页面的日志区会被压扁。
-        cw, ch = self.S(760), self.S(780)
+        cw, ch = self.S(960), self.S(780)
+        # Fit the work area at high DPI; overflowing task tiles remain scrollable.
+        work = wt.RECT()
+        user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0)
+        if work.right > work.left and work.bottom > work.top:
+            cw = min(cw, work.right-work.left-self.S(24))
+            ch = min(ch, work.bottom-work.top-self.S(56))
         rect = wt.RECT(0, 0, cw, ch)
         user32.AdjustWindowRectEx(ctypes.byref(rect), style, False, 0)
         w = rect.right - rect.left
         h = rect.bottom - rect.top
-        x = (user32.GetSystemMetrics(0) - w) // 2
-        y = (user32.GetSystemMetrics(1) - h) // 3
+        # 必须在**工作区**里居中，不能用整块屏幕：把任务栏挪到顶部之后
+        # (GetSystemMetrics 仍报整屏高度)，窗口标题栏就会被任务栏压住，拽都拽不出来。
+        if not (work.right > work.left and work.bottom > work.top):
+            work = wt.RECT(0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
+        x = work.left + max(0, (work.right - work.left - w) // 2)
+        y = work.top + max(0, (work.bottom - work.top - h) // 3)
         hwnd = user32.CreateWindowExW(0, cls, APP_NAME, style, x, y, w, h,
                                       None, None, hInst, None)
         if not hwnd:
             raise ctypes.WinError(ctypes.get_last_error())
         self.hwnd = hwnd
+        self.refresh_effects()
 
         try:
             self.apply_icon(hwnd)
@@ -6927,7 +7072,7 @@ def main():
             elif _pg.startswith("nig"):
                 app.page = "night"             # 自检时截《今晚的手游日常》页
             elif _pg.startswith("tas"):
-                app.page = "tasks"             # 自检时截「各项目的自动任务」页
+                app.page = "tasks"             # 自检时截「安排自动任务」页
                 app.page_stack.append("settings")
             elif _pg.startswith("abo"):
                 app.page = "about"             # 自检时截「关于」页

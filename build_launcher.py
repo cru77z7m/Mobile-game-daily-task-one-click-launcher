@@ -45,7 +45,7 @@ MANIFEST_NAME = "app.manifest"
 EXCLUDES = ("ssl", "_ssl", "_hashlib", "email", "http", "urllib", "xml", "xmlrpc",
             "sqlite3", "_sqlite3", "decimal", "bz2", "lzma", "unittest", "doctest",
             "pydoc_data", "asyncio", "multiprocessing", "lib2to3", "setuptools",
-            "pip", "unicodedata", "pickle", "_pickle", "logging", "argparse")
+            "pip", "unicodedata", "pickle", "_pickle", "argparse")
 
 # payload 里不该有的东西：运行时产物 / 用户配置 / 调试截图
 # ⚠ 只在**顶层**按这个规则过滤。_internal 里绝不能动 —— 那里有
