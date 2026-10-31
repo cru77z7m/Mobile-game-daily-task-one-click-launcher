@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.17.3"
+APP_VERSION = "v2.17.4"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -500,6 +500,46 @@ def save_config(cfg):
 
 
 _log_lock = threading.Lock()
+
+
+def merge_rects(rects, gap=2):
+    """把一堆 (l,t,r,b) 合成尽量少的几块，重叠或挨着的直接并起来。
+
+    局部刷新是按矩形重算的，矩形越少越省：同一行被拆成七八条小条，
+    每条都要走一遍抠图 + LUT + 文字合成，比整块慢得多。
+    """
+    out = []
+    for r in sorted(rects, key=lambda v: (v[1], v[0])):
+        l, t, rr, b = r
+        for o in out:
+            if (l <= o[2] + gap and o[0] <= rr + gap
+                    and t <= o[3] + gap and o[1] <= b + gap):
+                o[0] = min(o[0], l)
+                o[1] = min(o[1], t)
+                o[2] = max(o[2], rr)
+                o[3] = max(o[3], b)
+                break
+        else:
+            out.append([l, t, rr, b])
+    # 并完一轮可能又能跟前面的并上，重复到稳定为止（数量是几十的量级，很快）
+    changed = True
+    while changed and len(out) > 1:
+        changed = False
+        for i in range(len(out)):
+            for j in range(i + 1, len(out)):
+                a, b2 = out[i], out[j]
+                if (a[0] <= b2[2] + gap and b2[0] <= a[2] + gap
+                        and a[1] <= b2[3] + gap and b2[1] <= a[3] + gap):
+                    a[0] = min(a[0], b2[0])
+                    a[1] = min(a[1], b2[1])
+                    a[2] = max(a[2], b2[2])
+                    a[3] = max(a[3], b2[3])
+                    out.pop(j)
+                    changed = True
+                    break
+            if changed:
+                break
+    return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in out]
 
 
 def log_line(msg):
@@ -4155,8 +4195,8 @@ class App(VisualShell):
             return None, None
         if self._transition or self._modal_transition or self.prompt or self.exepick:
             return None, None
-        if not self.motion_enabled():
-            return None, None
+        # 注意：这里不检查 motion_enabled。关掉动画只是不做过渡，场景照样只变了
+        # 一小块；不放行就会退回整帧重算（150ms），鼠标一扫就卡成幻灯片。
         prev = self._last_scene
         prepared = self._compositor.prepared
         if (not prev or (prev.width, prev.height) != (w, h)
@@ -4177,11 +4217,16 @@ class App(VisualShell):
     def _mark_hover_patch(self):
         """记下这一帧只需重算的矩形：hover 动画只改鼠标下那颗控件。
 
-        材质模式整帧合成要 175ms 左右，而 hover 只动了按钮底色这一小块，
+        材质模式整帧合成要 150ms 左右，而 hover 只动了控件底色这一小块，
         按矩形打补丁能到 ~30ms/帧。算不出矩形（命中在奇怪位置）就置 None，
         退回整帧重算 —— 宁可慢一点，也不能画错。
+
+        **必须累计，不能覆盖**：鼠标扫得快时，一个消息循环里会连着来好几个
+        WM_MOUSEMOVE，每次都把 _hover_patch 换掉的话，中间扫过的那几行就
+        再也没机会被重画 —— 屏幕上留下一串擦不掉的高亮底色（v2.17.4 修的
+        就是这个）。所以这里跟已有的待办矩形求并集，等这一帧一起提交。
         """
-        if (not self.motion_enabled() or self.prompt or self.exepick
+        if (self.prompt or self.exepick
                 or self.frame_effect not in ('mica', 'tabbed', 'acrylic')):
             self._hover_patch = None
             return
@@ -4190,7 +4235,19 @@ class App(VisualShell):
             self._hover_patch = None
             return
         pad = self.S(8)          # 圆角/描边/阴影外扩一点，别留毛边
-        self._hover_patch = [(r[0] - pad, r[1] - pad, r[2] + pad, r[3] + pad) for r in rects]
+        fresh = [(r[0] - pad, r[1] - pad, r[2] + pad, r[3] + pad) for r in rects]
+        # 上一帧已经提交过的话，旧矩形是陈的，别带过来
+        if getattr(self, '_hover_patch_serial', -1) != self._paint_serial:
+            self._hover_patch = None
+        pending = merge_rects((self._hover_patch or []) + fresh)
+        area = sum(max(0, r[2] - r[0]) * max(0, r[3] - r[1]) for r in pending)
+        w = getattr(self, '_paint_w', 0) or 1
+        h = getattr(self, '_paint_h', 0) or 1
+        if not pending or area > w * h * 0.45:
+            # 扫过太多行，补丁已经不比整帧省了；整帧重画一次，顺便把尾巴擦干净
+            self._hover_patch = None
+            return
+        self._hover_patch = pending
         self._hover_patch_serial = self._paint_serial
 
     def hover_amount(self, key):

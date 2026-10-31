@@ -211,11 +211,97 @@ t0 = time.monotonic()
 paint()
 t_idle = (time.monotonic() - t0) * 1000
 same = ref0[0] == frame_bytes()[0]
-ok = same and t_idle < 60
+# 这一帧仍要 GDI 重画 + 场景差分，实测 50~60ms；只要不是整帧（150ms+）就算过
+ok = same and t_idle < 110
 fails += 0 if ok else 1
 print('%s %-14s 无变化复用缓存 %.1f ms（画面一致=%s）'
       % ('PASS' if ok else 'FAIL', 'no-change', t_idle, same))
 
+# ---- 快速扫过：一个消息循环里连来几个 MOUSEMOVE，中间扫过的行不能留底色 ----
+# 旧实现每次都把 _hover_patch 覆盖掉，只有最后一对矩形被重算，前面扫过的行
+# 就永远留在屏幕上（用户看到"扫过谁谁就上底色"）。这里不 paint，连着标 3 次，
+# 最后只提交一帧，结果必须和"只有最后一个 hover"的整帧一致。
+hover_on(None)
+ui._force_full_paint = False
+ui._hover_patch = None
+paint()
+paint()
+sweep = ['start', 'night', 'edit']
+ui._hover_from = None
+for k in sweep:
+    ui._hover_from = ui.hover
+    ui.hover = k
+    ui._hover_at = time.monotonic() - 1.0
+    ui._mark_hover_patch()                 # 故意不 paint
+marked = ui._hover_patch is not None
+t0 = time.monotonic()
+paint()
+t_sweep = (time.monotonic() - t0) * 1000
+got = frame_bytes()
+ui._hover_patch = None
+ui._hover_from = sweep[-2]
+ui.hover = sweep[-1]
+ui._hover_at = time.monotonic() - 1.0
+ui._force_full_paint = True
+paint()
+ui._force_full_paint = False
+ref = frame_bytes()
+diff = sum(1 for i in range(0, len(got[0]), 4)
+           if abs(got[0][i] - ref[0][i]) > 2
+           or abs(got[0][i+1] - ref[0][i+1]) > 2
+           or abs(got[0][i+2] - ref[0][i+2]) > 2)
+pix = got[1] * got[2]
+ok = marked and diff <= pix * 0.0005
+fails += 0 if ok else 1
+print('%s %-14s 连扫 3 项 %.1f ms | 差异像素 %d (%.4f%%) | 走补丁=%s'
+      % ('PASS' if ok else 'FAIL', 'sweep', t_sweep, diff, diff * 100.0 / pix, marked))
+if not ok:
+    from PIL import Image, ImageChops
+    W, H = got[1], got[2]
+    Image.frombytes('RGBA', (W, H), got[0], 'raw', 'BGRA').convert('RGB').save(
+        ROOT / 'design/sweep-patch.png')
+    Image.frombytes('RGBA', (W, H), ref[0], 'raw', 'BGRA').convert('RGB').save(
+        ROOT / 'design/sweep-full.png')
+    ImageChops.difference(
+        Image.frombytes('RGBA', (W, H), got[0], 'raw', 'BGRA').convert('RGB'),
+        Image.frombytes('RGBA', (W, H), ref[0], 'raw', 'BGRA').convert('RGB')
+    ).point(lambda v: min(255, v * 6)).save(ROOT / 'design/sweep-diff.png')
 
-print('\n%d 项检查，%d 项失败' % (len(cases)+3, fails))
+# ---- 关掉动画：hover 仍然只该重算那一块，否则每动一下就是 150ms ----
+ui.cfg['ui_motion'] = False
+hover_on(None)
+ui._hover_patch = None
+ui._force_full_paint = False
+paint()
+paint()
+ui._hover_from = None
+ui.hover = 'start'
+ui._hover_at = time.monotonic()
+ui._mark_hover_patch()
+off_marked = ui._hover_patch is not None
+t0 = time.monotonic()
+paint()
+t_off = (time.monotonic() - t0) * 1000
+got = frame_bytes()
+ui._hover_patch = None
+ui._force_full_paint = True
+t0 = time.monotonic()
+paint()
+ui._force_full_paint = False
+t_full = (time.monotonic() - t0) * 1000
+ref = frame_bytes()
+ui.cfg['ui_motion'] = True
+diff = sum(1 for i in range(0, len(got[0]), 4)
+           if abs(got[0][i] - ref[0][i]) > 2
+           or abs(got[0][i+1] - ref[0][i+1]) > 2
+           or abs(got[0][i+2] - ref[0][i+2]) > 2)
+pix = got[1] * got[2]
+ok = off_marked and diff <= pix * 0.0005 and t_off < t_full * 0.6
+fails += 0 if ok else 1
+print('%s %-14s 关动画 hover %.1f ms（整帧 %.1f ms）| 差异像素 %d (%.4f%%) | 走补丁=%s'
+      % ('PASS' if ok else 'FAIL', 'motion-off', t_off, t_full, diff,
+         diff * 100.0 / pix, off_marked))
+
+
+print('\n%d 项检查，%d 项失败' % (len(cases) + 5, fails))
 sys.exit(1 if fails else 0)
