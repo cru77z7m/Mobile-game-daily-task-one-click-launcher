@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.17.5"
+APP_VERSION = "v2.17.6"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -2338,6 +2338,7 @@ IMAGE_ICON = 1
 DI_NORMAL = 0x0003
 
 _ICON_CACHE = {}
+_PIL_ICON_CACHE = {}
 
 
 def assets_dir(*parts):
@@ -2371,21 +2372,38 @@ def load_icon(name, px=96):
 def draw_icon(hdc, name, x, y, size):
     """把图标画到 (x, y)，边长 size（都是物理像素）
 
-    96px 的 ico 缩到 40 左右一定会有点糊，用 HALFTONE 让 GDI 做平滑降采样，
-    比默认的 COLORONCOLOR（直接丢像素）好看不少。画完恢复原模式，
-    免得影响后面别的位图操作。
+    以前用 DrawIconEx + HALFTONE，但 **DrawIconEx 会忽略 SetStretchBltMode**：
+    96px 的 ico 缩到 24px 时直接最近邻丢像素，侧边栏那排图标就是一片方块锯齿。
+    现在改用 Pillow 的 LANCZOS 缩到目标尺寸、预乘 alpha 存进一张 32 位位图，
+    再 AlphaBlend 贴上去 —— 缩放开销只在第一次（按 name+size 缓存）。
     """
-    h = load_icon(name)
-    if not h:
+    px = max(8, int(round(size)))
+    key = (name, px)
+    surf = _PIL_ICON_CACHE.get(key)
+    if surf is None:
+        src = assets_dir("icons", name + ".ico")
+        if not os.path.isfile(src):
+            _PIL_ICON_CACHE[key] = False
+            return False
+        try:
+            from PIL import Image
+            from ui_render import DibSurface
+            im = Image.open(src).convert("RGBA")
+            if im.size != (px, px):
+                im = im.resize((px, px), Image.LANCZOS)
+            surf = DibSurface(None, px, px)
+            data = im.convert("RGBa").tobytes("raw", "BGRa")   # 预乘，AlphaBlend 要这个
+            ctypes.memmove(surf.bits, data, len(data))
+        except Exception:
+            _PIL_ICON_CACHE[key] = False
+            return False
+        _PIL_ICON_CACHE[key] = surf
+    if surf is False:
         return False
     try:
-        old = gdi32.SetStretchBltMode(hdc, 4)      # HALFTONE
-        ok = user32.DrawIconEx(hdc, int(round(x)), int(round(y)), h,
-                               int(round(size)), int(round(size)),
-                               0, None, DI_NORMAL)
-        if old:
-            gdi32.SetStretchBltMode(hdc, old)
-        return bool(ok)
+        return bool(msimg32.AlphaBlend(hdc, int(round(x)), int(round(y)), px, px,
+                                     surf.dc, 0, 0, px, px,
+                                     BLENDFUNCTION(0, 0, 255, 1)))
     except Exception:
         return False
 
@@ -3998,6 +4016,118 @@ gdi32.CombineRgn.restype = ctypes.c_int
 gdi32.SelectClipRgn.argtypes = [wt.HDC, wt.HRGN]
 gdi32.SelectClipRgn.restype = ctypes.c_int
 
+# ---------------------------------------------------------------------------
+# GDI+：圆角矩形 / 圆 / 折线的抗锯齿
+# ---------------------------------------------------------------------------
+# GDI 的 RoundRect 和 Ellipse 不做抗锯齿：100% 缩放下还能忍，175% 下按钮、
+# 勾选框、侧边栏高亮的圆角全是硬台阶（"控件有锯齿"）。GDI+ 用
+# SmoothingModeAntiAlias 画同一条路径，边缘按覆盖率混合，才像现代 UI。
+#
+# 成本（1680×1365 的 DDB 实测）：
+#   小控件 180×40 填充+描边        0.06 ms / 个，38 个 2.5 ms  → 小块一律 GDI+
+#   整张卡片 1600×1200 纯填充      16 ms                      → 大块 GDI 铺底 + GDI+ 描边
+#   大块带 GDI+ 裁剪区时填充       0.17 ms                    → 补丁帧里大块也走 GDI+
+GP_AA_FILL_MAX = 120000        # 超过这么多像素的圆角块，填充改用 GDI（阈值见上）
+GP_SMOOTH_AA = 4               # SmoothingModeAntiAlias
+GP_PIXEL_HALF = 4              # PixelOffsetModeHalf
+# GpUnit：UnitPixel 是 **2**，不是 1（1 是 UnitDisplay，画笔不接受 ——
+# GdipCreatePen1 会返回 2=InvalidParameter，而且画不出来，边框整个消失。踩过。）
+GP_UNIT_PIXEL = 2
+
+
+class _GpStartupInput(ctypes.Structure):
+    _fields_ = [("GdiplusVersion", ctypes.c_uint32),
+                ("DebugEventCallback", ctypes.c_void_p),
+                ("SuppressBackgroundThread", ctypes.c_int),
+                ("SuppressExternalCodecs", ctypes.c_int)]
+
+
+_gp_lib = None
+
+
+def gp_lib():
+    """懒加载 gdiplus.dll 并声明原型；不可用返回 None（调用方退回纯 GDI）。"""
+    global _gp_lib
+    if _gp_lib is not None:
+        return _gp_lib or None
+    try:
+        lib = ctypes.WinDLL("gdiplus")
+        token = ctypes.c_void_p()
+        inp = _GpStartupInput(1, None, 0, 0)
+        if lib.GdiplusStartup(ctypes.byref(token), ctypes.byref(inp), None) != 0:
+            raise OSError("GdiplusStartup 失败")
+    except Exception:
+        log_line("GDI+ 不可用，圆角退回 GDI 绘制（会有锯齿）")
+        _gp_lib = False
+        return None
+    P = ctypes.c_void_p
+    proto = {
+        "GdipCreateFromHDC": [P, ctypes.POINTER(P)],
+        "GdipDeleteGraphics": [P],
+        "GdipSetSmoothingMode": [P, ctypes.c_int],
+        "GdipSetPixelOffsetMode": [P, ctypes.c_int],
+        "GdipCreateRegion": [ctypes.POINTER(P)],
+        "GdipCombineRegionRectI": [P, ctypes.POINTER(wt.RECT), ctypes.c_int],
+        "GdipSetClipRegion": [P, P, ctypes.c_int],
+        "GdipDeleteRegion": [P],
+        "GdipCreatePath": [ctypes.c_int, ctypes.POINTER(P)],
+        "GdipAddPathArc": [P] + [ctypes.c_float] * 6,
+        "GdipClosePathFigure": [P],
+        "GdipDeletePath": [P],
+        "GdipCreateSolidFill": [ctypes.c_uint32, ctypes.POINTER(P)],
+        "GdipDeleteBrush": [P],
+        "GdipFillPath": [P, P, P],
+        "GdipFillEllipse": [P, P] + [ctypes.c_float] * 4,
+        "GdipCreatePen1": [ctypes.c_uint32, ctypes.c_float, ctypes.c_int, ctypes.POINTER(P)],
+        "GdipDeletePen": [P],
+        "GdipDrawPath": [P, P, P],
+        "GdipDrawLinesI": [P, P, ctypes.POINTER(ctypes.c_int), ctypes.c_int],
+        "GdipSetPenStartCap": [P, ctypes.c_int],
+        "GdipSetPenEndCap": [P, ctypes.c_int],
+        "GdipSetPenLineJoin": [P, ctypes.c_int],
+    }
+    for fname, args in proto.items():
+        fn = getattr(lib, fname)
+        fn.argtypes = args
+        fn.restype = ctypes.c_int
+    _gp_lib = lib
+    return lib
+
+
+def gp_argb(colorref, alpha=255):
+    """COLORREF（0x00BBGGRR）→ GDI+ 的 ARGB（0xAARRGGBB）"""
+    v = int(colorref)
+    return (((alpha & 0xFF) << 24) | ((v & 0xFF) << 16)
+            | (((v >> 8) & 0xFF) << 8) | ((v >> 16) & 0xFF))
+
+
+def gp_round_path(x, y, w, h, r):
+    """圆角矩形路径。四条 90° 圆弧拼起来，和 GDI RoundRect 的几何一致。"""
+    lib = gp_lib()
+    path = ctypes.c_void_p()
+    lib.GdipCreatePath(0, ctypes.byref(path))          # FillModeAlternate
+    d = float(r) * 2.0
+    for sx, sy, start in ((x, y, 180.0),
+                          (x + w - d, y, 270.0),
+                          (x + w - d, y + h - d, 0.0),
+                          (x, y + h - d, 90.0)):
+        lib.GdipAddPathArc(path, float(sx), float(sy), d, d, start, 90.0)
+    lib.GdipClosePathFigure(path)
+    return path
+
+
+class BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [("BlendOp", ctypes.c_ubyte), ("BlendFlags", ctypes.c_ubyte),
+                ("SourceConstantAlpha", ctypes.c_ubyte), ("AlphaFormat", ctypes.c_ubyte)]
+
+
+# AlphaBlend 在 msimg32 里，不在 gdi32（记错过一次，报 "function not found"）
+msimg32 = ctypes.WinDLL("msimg32", use_last_error=True)
+msimg32.AlphaBlend.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               BLENDFUNCTION]
+msimg32.AlphaBlend.restype = wt.BOOL
+
 kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wt.HINSTANCE
 user32.MessageBoxW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.UINT]
@@ -4079,6 +4209,13 @@ class App(VisualShell):
         # 可能还停在 0.8 的浓度上，必须继续重画，直到它彻底淡到 0。
         self._hover_tinted = set()
         self._hover_keys = set()
+        # 排队 hover 补丁那一刻的画面指纹（提交前核对，见 _paint_sig）
+        self._hover_sig = None
+        # 本帧的动画时钟（paint 开始时冻结，见 hover_amount）
+        self._frame_t = None
+        # 当前帧的 GDI+ Graphics（懒建，paint 结束前必须释放）
+        self._gp_gfx = None
+        self._gp_dc = None
         # 这一帧画了哪些文字（用于和上一帧比对，只重算变化的块）
         self._text_ops = []
         self._prev_text_ops = None
@@ -4269,6 +4406,26 @@ class App(VisualShell):
         self._hover_patch = pending
         self._hover_keys = keys
         self._hover_patch_serial = self._paint_serial
+        # 记下"排队这一刻画面里除 hover 之外的东西"，提交前再核对一遍
+        self._hover_sig = self._paint_sig()
+
+    def _paint_sig(self):
+        """画面里除 hover 之外，所有会影响像素的状态。
+
+        hover 补丁的前提是「只有鼠标下那颗控件变了」。但鼠标移动、滚轮、状态刷新
+        常常落在同一个消息循环里：先排了 hover 补丁，紧接着 scroll 变了，这一帧
+        就只重画了鼠标那一块，其余部分停在旧的滚动位置 —— 用户看到的就是
+        「滑动设置页时画面错乱」（v2.17.6）。补丁排队时记一份指纹、提交前再算一遍，
+        对不上就老实走整帧。`cfg` 用 repr 一起算，省得漏掉某个字段。
+        """
+        steps = tuple(sorted((self.steps or {}).items()))
+        ep = self.exepick
+        return (self.page, self.scroll, self._scroll_max,
+                getattr(self, '_paint_w', 0), getattr(self, '_paint_h', 0),
+                self.status, self.upd_hint(), bool(self.busy), self.pressed,
+                len(self.logs), steps, bool(self.prompt),
+                (len(ep["items"]), ep["sel"]) if ep else None,
+                repr(self.cfg))
 
     def _settle_hover_tint(self):
         """一帧提交之后结账：哪些行的底色浓度还没归零，下一帧还得继续画。
@@ -4283,9 +4440,15 @@ class App(VisualShell):
         self._hover_tinted = {k for k in keys if self.hover_amount(k) > 0.004}
 
     def hover_amount(self, key):
+        # 一帧之内所有行必须用**同一个时间点**：一帧要画 70~190ms，而 hover 动画
+        # 只有 0.18s。如果每行都取实时时钟，同一帧里先画的行和后画的行会差好几级
+        # 浓度；更糟的是 `_settle_hover_tint()` 在帧末结算时动画早已跑完，于是把
+        # 明明还带着底色的行当成"已经归零"划掉，下一帧不再重画它 —— 屏幕上就是
+        # 擦不掉的残留（v2.17.6）。所以 paint 开始时把时钟冻住，帧末再解冻。
+        now = getattr(self, '_frame_t', None) or time.monotonic()
         if not self.motion_enabled() or not self._hover_at:
             return float(self.hover == key)
-        t = min(1.0, (time.monotonic() - self._hover_at) / 0.18)
+        t = min(1.0, (now - self._hover_at) / 0.18)
         t = 1.0 - (1.0 - t) ** 3
         if key == self.hover:
             return t
@@ -4487,10 +4650,52 @@ class App(VisualShell):
                     return [(l, ry - 2, rr, ry + rowh - 2)]
         return []
 
-    def fill_round(self, hdc, rect, radius, fill, border=None, bwidth=1):
-        """rect 已是物理像素；radius 是逻辑值"""
+    # ---- GDI+ 句柄（每帧一支 DC 一个，画完就放） ----
+    def _gp(self, hdc):
+        """取（或新建）这支 DC 对应的 GDI+ Graphics，带抗锯齿和补丁裁剪。"""
+        lib = gp_lib()
+        if lib is None:
+            return None
+        if getattr(self, '_gp_gfx', None) and self._gp_dc == int(hdc):
+            return self._gp_gfx
+        self._gp_release()
+        gfx = ctypes.c_void_p()
+        if lib.GdipCreateFromHDC(ctypes.c_void_p(int(hdc)), ctypes.byref(gfx)) != 0 or not gfx:
+            self._gp_dc = int(hdc)
+            return None
+        lib.GdipSetSmoothingMode(gfx, GP_SMOOTH_AA)
+        lib.GdipSetPixelOffsetMode(gfx, GP_PIXEL_HALF)
+        rects = getattr(self, '_patch_clip', None)
+        if rects:
+            # 补丁帧必须给 GDI+ 自己的裁剪区：GDI 的裁剪区对它几乎不起作用
+            # （整张卡片填充 16ms → 13ms），GDI+ 的裁剪区才真的省（→ 0.2ms）。
+            rgn = ctypes.c_void_p()
+            if lib.GdipCreateRegion(ctypes.byref(rgn)) == 0:
+                for r in rects:
+                    box = wt.RECT(int(r[0]), int(r[1]),
+                                  int(r[2] - r[0]), int(r[3] - r[1]))
+                    lib.GdipCombineRegionRectI(rgn, ctypes.byref(box), 2)   # Union
+                lib.GdipSetClipRegion(gfx, rgn, 0)                         # Replace
+                lib.GdipDeleteRegion(rgn)
+        self._gp_dc, self._gp_gfx = int(hdc), gfx
+        return gfx
+
+    def _gp_release(self):
+        """释放 GDI+ 句柄。必须在 BitBlt/合成之前调用 —— GDI+ 有内部批处理，
+        不删 Graphics 的话最后几笔可能还没落到 DIB 上。"""
+        gfx = getattr(self, '_gp_gfx', None)
+        if gfx:
+            lib = gp_lib()
+            if lib is not None:
+                lib.GdipDeleteGraphics(gfx)
+        self._gp_gfx = None
+        self._gp_dc = None
+
+    def _fill_round_gdi(self, hdc, rect, radius, fill, border, bwidth):
+        """GDI 回退路径（GDI+ 不可用时；也是大块面板铺底用的）"""
         br = gdi32.CreateSolidBrush(fill)
-        pen = gdi32.CreatePen(0, max(1, self.S(bwidth)), border) if border else gdi32.GetStockObject(8)
+        pen = (gdi32.CreatePen(0, max(1, self.S(bwidth)), border) if border
+               else gdi32.GetStockObject(8))                 # 8 = NULL_PEN
         ob = gdi32.SelectObject(hdc, br)
         op = gdi32.SelectObject(hdc, pen)
         gdi32.RoundRect(hdc, int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]),
@@ -4502,17 +4707,64 @@ class App(VisualShell):
         if border and pen:
             gdi32.DeleteObject(pen)
 
+    def fill_round(self, hdc, rect, radius, fill, border=None, bwidth=1):
+        """圆角矩形：rect 已是物理像素，radius 是逻辑值。
+
+        走 GDI+ 的 AntiAlias 路径。大块（整张卡片/日志卡）纯 GDI+ 填充要 16ms，
+        所以先用 GDI 铺满，再用 GDI+ 描一圈 —— 描边本来就是抗锯齿的，
+        顺带把 GDI 铺底留下的硬边盖掉；没有边框时用填充色描边，只为抗锯齿。
+        """
+        l, t, r, b = (int(round(float(v))) for v in rect[:4])
+        w, h = r - l, b - t
+        if w <= 0 or h <= 0:
+            return
+        gfx = self._gp(hdc)
+        if gfx is None:
+            return self._fill_round_gdi(hdc, rect, radius, fill, border, bwidth)
+        lib = gp_lib()
+        rad = max(0.0, min(float(self.S(radius)), w / 2.0, h / 2.0))
+        bw = max(1.0, float(self.S(bwidth)))
+        stroke = border
+        path = gp_round_path(l, t, w, h, max(rad, 0.5))
+        if rad < 0.5 or w * h <= GP_AA_FILL_MAX or getattr(self, '_patch_clip', None):
+            # 小块（或补丁帧里被裁剪过的大块）直接用 GDI+ 填充：几十微秒
+            br = ctypes.c_void_p()
+            lib.GdipCreateSolidFill(gp_argb(fill), ctypes.byref(br))
+            lib.GdipFillPath(gfx, br, path)
+            lib.GdipDeleteBrush(br)
+        else:
+            self._fill_round_gdi(hdc, (l, t, r, b), radius, fill, None, 1)
+            if stroke is None:
+                stroke = fill          # 没有边框也要描，否则铺底的硬边留着
+        if stroke is not None:
+            pen = ctypes.c_void_p()
+            lib.GdipCreatePen1(gp_argb(stroke), ctypes.c_float(bw), GP_UNIT_PIXEL,
+                               ctypes.byref(pen))
+            lib.GdipDrawPath(gfx, pen, path)
+            lib.GdipDeletePen(pen)
+        lib.GdipDeletePath(path)      # 每帧画 30~40 个圆角，不删就是每秒泄几百个路径对象
+
     def dot(self, hdc, cx, cy, r, color):
         rr = self.S(r)
-        br = gdi32.CreateSolidBrush(color)
-        ob = gdi32.SelectObject(hdc, br)
-        op = gdi32.SelectObject(hdc, gdi32.GetStockObject(8))
-        gdi32.Ellipse(hdc, int(cx - rr), int(cy - rr), int(cx + rr), int(cy + rr))
-        gdi32.SelectObject(hdc, ob)
-        gdi32.SelectObject(hdc, op)
-        gdi32.DeleteObject(br)
+        gfx = self._gp(hdc)
+        if gfx is None:
+            br = gdi32.CreateSolidBrush(color)
+            ob = gdi32.SelectObject(hdc, br)
+            op = gdi32.SelectObject(hdc, gdi32.GetStockObject(8))
+            gdi32.Ellipse(hdc, int(cx - rr), int(cy - rr), int(cx + rr), int(cy + rr))
+            gdi32.SelectObject(hdc, ob)
+            gdi32.SelectObject(hdc, op)
+            gdi32.DeleteObject(br)
+            return
+        lib = gp_lib()
+        br = ctypes.c_void_p()
+        lib.GdipCreateSolidFill(gp_argb(color), ctypes.byref(br))
+        lib.GdipFillEllipse(gfx, br, ctypes.c_float(cx - rr), ctypes.c_float(cy - rr),
+                            ctypes.c_float(rr * 2), ctypes.c_float(rr * 2))
+        lib.GdipDeleteBrush(br)
 
     def hline(self, hdc, x1, x2, y, color):
+        # 水平/垂直直线没有斜边，GDI 就够；保留原实现，省一次 GDI+ 调用
         pen = gdi32.CreatePen(0, 1, color)
         op = gdi32.SelectObject(hdc, pen)
         gdi32.MoveToEx(hdc, int(x1), int(y), None)
@@ -4521,13 +4773,31 @@ class App(VisualShell):
         gdi32.DeleteObject(pen)
 
     def check_mark(self, hdc, x, y, color):
-        pen = gdi32.CreatePen(0, max(1, self.S(1.6)), color)
-        op = gdi32.SelectObject(hdc, pen)
-        gdi32.MoveToEx(hdc, int(x), int(y), None)
-        gdi32.LineTo(hdc, int(x + self.S(3)), int(y + self.S(3)))
-        gdi32.LineTo(hdc, int(x + self.S(8)), int(y - self.S(3)))
-        gdi32.SelectObject(hdc, op)
-        gdi32.DeleteObject(pen)
+        """对勾：两段折线。GDI 的 LineTo 是硬边，折线的斜边台阶很明显，
+        交给 GDI+ 并给圆头圆角，白勾才干净。"""
+        pts = [(x, y), (x + self.S(3), y + self.S(3)), (x + self.S(8), y - self.S(3))]
+        gfx = self._gp(hdc)
+        lib = gp_lib()
+        if gfx is None or lib is None:
+            pen = gdi32.CreatePen(0, max(1, self.S(1.6)), color)
+            op = gdi32.SelectObject(hdc, pen)
+            gdi32.MoveToEx(hdc, int(pts[0][0]), int(pts[0][1]), None)
+            gdi32.LineTo(hdc, int(pts[1][0]), int(pts[1][1]))
+            gdi32.LineTo(hdc, int(pts[2][0]), int(pts[2][1]))
+            gdi32.SelectObject(hdc, op)
+            gdi32.DeleteObject(pen)
+            return
+        pen = ctypes.c_void_p()
+        lib.GdipCreatePen1(gp_argb(color), ctypes.c_float(max(1.0, self.S(1.6))),
+                           2, ctypes.byref(pen))
+        lib.GdipSetPenStartCap(pen, 2)      # LineCapRound
+        lib.GdipSetPenEndCap(pen, 2)
+        lib.GdipSetPenLineJoin(pen, 2)      # LineJoinRound
+        arr = (ctypes.c_int * 6)(int(pts[0][0]), int(pts[0][1]),
+                                 int(pts[1][0]), int(pts[1][1]),
+                                 int(pts[2][0]), int(pts[2][1]))
+        lib.GdipDrawLinesI(gfx, pen, arr, 3)
+        lib.GdipDeletePen(pen)
 
     def fit_work_area(self):
         """窗口被任务栏/分辨率变化挤到工作区外时，把它拉回来。
@@ -5465,10 +5735,16 @@ class App(VisualShell):
         if (hp and getattr(self, '_hover_patch_serial', -1) == self._paint_serial
                 and not self._transition and not self._modal_transition
                 and not self.prompt and not self.exepick
-                and self.frame_effect in ('mica', 'tabbed', 'acrylic')):
+                and self.frame_effect in ('mica', 'tabbed', 'acrylic')
+                and self._hover_sig == self._paint_sig()):
+            # 最后那个指纹比较是关键：排补丁之后又滚了页/改了状态的话，
+            # 只重画鼠标那一块会把整屏其余部分留在旧内容上（见 _paint_sig）
             patch = hp
         self._hover_patch = None
+        self._hover_sig = None
         self._patch_serial_seen = self._paint_serial
+        # 冻结动画时钟：这一帧里所有 hover 浓度都以帧首为基准（见 hover_amount）
+        self._frame_t = frame_started
 
         render_started = time.monotonic()
         mem = gdi32.CreateCompatibleDC(target)
@@ -5602,6 +5878,10 @@ class App(VisualShell):
         if self.exepick:                   # 「选 exe」卡片也在最上层
             self.draw_exe_picker(mem, w, h)
 
+        # GDI+ 有内部批处理：不在这里收尾，最后画的圆角可能还没落到位图上，
+        # 后面 BitBlt 出去的画面就会缺一块
+        self._gp_release()
+
         render_elapsed = time.monotonic() - render_started
         if self._transition:
             old, started, direction = self._transition
@@ -5622,6 +5902,7 @@ class App(VisualShell):
                 self.present_scene(target, mem, w, h)
         self._patch_clip = None
         self._settle_hover_tint()
+        self._frame_t = None
         self._paint_serial += 1
         if DEBUG_TIMING:
             log_line("frame: gdi %.0f ms, present %.0f ms, %dx%d%s"

@@ -317,8 +317,14 @@ ui._hover_from = None
 ui.hover = None
 ui._hover_at = 0.0
 ui._force_full_paint = False
+# 上一轮用例可能留下没跑完的换页过渡：那会让 paint() 直接吐缓存帧、根本不进
+# 绘制流程（本用例就白测了）。这里清干净，并要求 serial 真的在前进。
+ui._transition = None
+ui._modal_transition = None
 paint()
 paint()
+assert ui.motion_enabled(), '本用例要在开动画的状态下跑'
+serial0 = ui._paint_serial
 rows2 = [it['key'] for it, _ry, _rh in ui.rects.get('rows', [])
          if not it['key'].startswith('sec:')][:4]
 sweep2 = ['set:' + k for k in rows2]
@@ -328,6 +334,7 @@ for k in sweep2:
     ui._hover_at = time.monotonic()        # 动画刚开始：上一行还是满色
     ui._mark_hover_patch()
     paint()                                # 一次 MOUSEMOVE + 一次 WM_PAINT
+assert ui._paint_serial > serial0, 'paint() 走了动画缓存捷径，本用例无效'
 mid = frame_bytes()
 
 # 再让鼠标离开、动画跑完，确认不会换个方式留尾巴
@@ -392,5 +399,41 @@ if not ok:
     ).point(lambda v: min(255, v * 8)).save(ROOT / 'design/sweep-anim-diff.png')
 
 
-print('\n%d 项检查，%d 项失败' % (len(cases) + 6, fails))
+# ---- hover 补丁排队后紧接着滚轮：不许只重画鼠标那一块 ----
+# 真机上一个消息循环里可能先来 WM_MOUSEMOVE（排上了 hover 补丁），紧接着来
+# WM_MOUSEWHEEL。这时"只有鼠标下那颗控件变了"的前提已经破了：只重画那一块的话，
+# 屏幕上其余部分会停在旧的滚动位置 —— 用户截到的"滚设置页时整页错位、文字叠在一起"。
+# 修法是给补丁配一份状态指纹（_paint_sig），提交前再核对一次。
+ui.page = 'settings'
+ui._transition = None
+ui._modal_transition = None
+ui.scroll = 0
+ui._hover_patch = None
+ui._hover_tinted = set()
+ui._force_full_paint = False
+paint()
+paint()
+keys3 = [it['key'] for it, _ry, _rh in ui.rects.get('rows', [])
+         if not it['key'].startswith('sec:')][:3]
+sc_bad = 0
+for k in keys3:
+    ui.hover = 'set:' + k
+    ui._hover_from = None
+    ui._hover_at = time.monotonic() - 1.0
+    ui._mark_hover_patch()                                        # 先排补丁
+    ui.scroll = min(ui._scroll_max, ui.scroll + int(ui.S(48)))     # 再滚动
+    paint()
+    got = frame_bytes()
+    ui._force_full_paint = True
+    paint()
+    ui._force_full_paint = False
+    ref = frame_bytes()
+    sc_bad += ndiff(got, ref)
+ok = sc_bad <= 50
+fails += 0 if ok else 1
+print('%s %-14s hover 排队后立刻滚动 %d 次 | 差异像素 %d'
+      % ('PASS' if ok else 'FAIL', 'hover+scroll', len(keys3), sc_bad))
+
+
+print('\n%d 项检查，%d 项失败' % (len(cases) + 7, fails))
 sys.exit(1 if fails else 0)
