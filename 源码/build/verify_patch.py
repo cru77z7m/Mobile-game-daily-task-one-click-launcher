@@ -303,5 +303,94 @@ print('%s %-14s 关动画 hover %.1f ms（整帧 %.1f ms）| 差异像素 %d (%.
          diff * 100.0 / pix, off_marked))
 
 
-print('\n%d 项检查，%d 项失败' % (len(cases) + 5, fails))
+# ---- 动画进行中扫过，然后离开：一行底色都不许剩 ----
+# 真机时序：MOUSEMOVE 与 WM_PAINT 交替，画的时候动画才刚开始（t≈0），于是
+# "上一行"是按 1-t≈1 的**满色**画出来的。鼠标紧接着走到第三行，第二行就既不是
+# hover 也不是 from，没人再重画它 —— 屏幕上留下一串擦不掉的底色，也就是用户
+# 截图里"扫过谁谁就上底色"（v2.17.5 修的）。
+# 两条断言：①扫描过程中，补丁帧必须和"同一状态的整帧重画"逐像素一致（漏一行就露）
+#          ②鼠标离开、动画跑完，必须回到完全没有悬停的样子
+ui.page = 'settings'
+ui._hover_patch = None
+ui._hover_tinted = set()
+ui._hover_from = None
+ui.hover = None
+ui._hover_at = 0.0
+ui._force_full_paint = False
+paint()
+paint()
+rows2 = [it['key'] for it, _ry, _rh in ui.rects.get('rows', [])
+         if not it['key'].startswith('sec:')][:4]
+sweep2 = ['set:' + k for k in rows2]
+for k in sweep2:
+    ui._hover_from = ui.hover
+    ui.hover = k
+    ui._hover_at = time.monotonic()        # 动画刚开始：上一行还是满色
+    ui._mark_hover_patch()
+    paint()                                # 一次 MOUSEMOVE + 一次 WM_PAINT
+mid = frame_bytes()
+
+# 再让鼠标离开、动画跑完，确认不会换个方式留尾巴
+ui._hover_from = ui.hover
+ui.hover = None
+ui._hover_at = time.monotonic()
+settle_end = time.monotonic() + 0.30
+while time.monotonic() < settle_end:
+    time.sleep(0.016)
+    ui._mark_hover_patch()
+    paint()
+after = frame_bytes()
+ui._hover_patch = None
+ui._hover_from = None
+ui._hover_at = 0.0
+ui._force_full_paint = True
+paint()
+ui._force_full_paint = False
+clean = frame_bytes()
+
+W2, H2 = mid[1], mid[2]
+pix2 = W2 * H2
+
+
+def ndiff(A, B):
+    return sum(1 for i in range(0, len(A[0]), 4)
+               if abs(A[0][i] - B[0][i]) > 2
+               or abs(A[0][i+1] - B[0][i+1]) > 2
+               or abs(A[0][i+2] - B[0][i+2]) > 2)
+
+
+# 扫描过程中：被丢下的那几行（既不是 hover 也不是 from）此刻必须是干净的。
+# 跟"完全没有悬停"的整帧比 —— 那些行在两帧里都该是同一张纯底色。
+stale = 0
+for k in sweep2[:-2]:
+    for r in ui.hover_rects(k):
+        l, t = max(0, int(r[0]) + 6), max(0, int(r[1]) + 6)
+        rr, bb = min(mid[1], int(r[2]) - 6), min(mid[2], int(r[3]) - 6)
+        for y in range(t, bb, 2):
+            base_i = (y * mid[1]) * 4
+            for x in range(l, rr, 2):
+                i = base_i + x * 4
+                if (abs(mid[0][i] - clean[0][i]) > 3
+                        or abs(mid[0][i+1] - clean[0][i+1]) > 3
+                        or abs(mid[0][i+2] - clean[0][i+2]) > 3):
+                    stale += 1
+d2 = ndiff(after, clean)       # 离开之后：不许留底色
+d1 = stale
+ok = d1 <= 50 and d2 <= pix2 * 0.0005
+fails += 0 if ok else 1
+print('%s %-14s 动画中扫过 %d 行 | 漏画 %d (%.4f%%) | 离开后残留 %d (%.4f%%)'
+      % ('PASS' if ok else 'FAIL', 'sweep-anim', len(sweep2), d1,
+         d1 * 100.0 / pix2, d2, d2 * 100.0 / pix2))
+if not ok:
+    from PIL import Image, ImageChops
+    for tag, buf in (('mid', mid), ('same', same), ('after', after), ('clean', clean)):
+        Image.frombytes('RGBA', (W2, H2), buf[0], 'raw', 'BGRA').convert('RGB').save(
+            ROOT / ('design/sweep-anim-%s.png' % tag))
+    ImageChops.difference(
+        Image.frombytes('RGBA', (W2, H2), mid[0], 'raw', 'BGRA').convert('RGB'),
+        Image.frombytes('RGBA', (W2, H2), same[0], 'raw', 'BGRA').convert('RGB')
+    ).point(lambda v: min(255, v * 8)).save(ROOT / 'design/sweep-anim-diff.png')
+
+
+print('\n%d 项检查，%d 项失败' % (len(cases) + 6, fails))
 sys.exit(1 if fails else 0)

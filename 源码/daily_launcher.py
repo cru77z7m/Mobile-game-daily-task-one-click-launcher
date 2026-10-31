@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.17.4"
+APP_VERSION = "v2.17.5"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -4075,6 +4075,10 @@ class App(VisualShell):
         self._hover_patch_serial = -1
         self._paint_serial = 0
         self._patch_clip = None
+        # 屏幕上"还留着底色"的行：动画淡出是渐进的，鼠标已经移走的那一行
+        # 可能还停在 0.8 的浓度上，必须继续重画，直到它彻底淡到 0。
+        self._hover_tinted = set()
+        self._hover_keys = set()
         # 这一帧画了哪些文字（用于和上一帧比对，只重算变化的块）
         self._text_ops = []
         self._prev_text_ops = None
@@ -4221,18 +4225,32 @@ class App(VisualShell):
         按矩形打补丁能到 ~30ms/帧。算不出矩形（命中在奇怪位置）就置 None，
         退回整帧重算 —— 宁可慢一点，也不能画错。
 
-        **必须累计，不能覆盖**：鼠标扫得快时，一个消息循环里会连着来好几个
-        WM_MOUSEMOVE，每次都把 _hover_patch 换掉的话，中间扫过的那几行就
-        再也没机会被重画 —— 屏幕上留下一串擦不掉的高亮底色（v2.17.4 修的
-        就是这个）。所以这里跟已有的待办矩形求并集，等这一帧一起提交。
+        两个坑（都是真机复现出来的，别改回去）：
+
+        1. **必须累计，不能覆盖**：鼠标扫得快时，一个消息循环里会连着来好几个
+           WM_MOUSEMOVE，每次覆盖掉的话，中间扫过的那几行就再没机会被重画。
+        2. **必须带上"正在淡出"的行**：`hover_amount()` 给 `_hover_from` 的是
+           `1-t`，鼠标刚落到新行的那一瞬间旧行是**满色**（t≈0 → 1-t≈1）。
+           如果紧接着又移到第三行，第二行就成了"既不是 hover 也不是 from"的行，
+           永远停在满色上 —— 用户看到的就是"扫过谁谁就上底色"。
+           所以这里记一本 `_hover_tinted` 账：上一帧画过、浓度还没归零的行，
+           下一帧继续重画，直到 `hover_amount()` 真的回到 0。
         """
         if (self.prompt or self.exepick
                 or self.frame_effect not in ('mica', 'tabbed', 'acrylic')):
             self._hover_patch = None
+            self._hover_keys = set()
             return
-        rects = self.hover_rects(self.hover) + self.hover_rects(self._hover_from)
+        keys = set(self._hover_tinted)
+        for k in (self.hover, self._hover_from):
+            if k:
+                keys.add(k)
+        rects = []
+        for k in keys:
+            rects.extend(self.hover_rects(k))
         if not rects:
             self._hover_patch = None
+            self._hover_keys = set()
             return
         pad = self.S(8)          # 圆角/描边/阴影外扩一点，别留毛边
         fresh = [(r[0] - pad, r[1] - pad, r[2] + pad, r[3] + pad) for r in rects]
@@ -4246,9 +4264,23 @@ class App(VisualShell):
         if not pending or area > w * h * 0.45:
             # 扫过太多行，补丁已经不比整帧省了；整帧重画一次，顺便把尾巴擦干净
             self._hover_patch = None
+            self._hover_keys = set()
             return
         self._hover_patch = pending
+        self._hover_keys = keys
         self._hover_patch_serial = self._paint_serial
+
+    def _settle_hover_tint(self):
+        """一帧提交之后结账：哪些行的底色浓度还没归零，下一帧还得继续画。
+
+        浓度用 `hover_amount()` 判断；返回 0 的行说明这一帧已经把它画干净了，
+        从账上划掉。整帧重画时同理 —— 屏幕已经全对，账自然清零。
+        """
+        keys = set(getattr(self, '_hover_keys', ()))
+        for k in (self.hover, self._hover_from):
+            if k:
+                keys.add(k)
+        self._hover_tinted = {k for k in keys if self.hover_amount(k) > 0.004}
 
     def hover_amount(self, key):
         if not self.motion_enabled() or not self._hover_at:
@@ -5589,6 +5621,7 @@ class App(VisualShell):
             else:
                 self.present_scene(target, mem, w, h)
         self._patch_clip = None
+        self._settle_hover_tint()
         self._paint_serial += 1
         if DEBUG_TIMING:
             log_line("frame: gdi %.0f ms, present %.0f ms, %dx%d%s"
@@ -7380,7 +7413,9 @@ def main():
             "sel": 1,
             "on_ok": lambda p: None,
         }
-    if "--page" in args and (shot or "--test-wheel" in args):
+    if "--page" in args:
+        # 以前只在 --shot / --test-wheel 下生效；调 hover 这类交互 bug 时
+        # 需要让真窗口直接停在某一页，所以这里放开，普通启动也认
         _i = args.index("--page")
         if len(args) > _i + 1:
             _pg = args[_i + 1].lower()
