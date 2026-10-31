@@ -94,6 +94,11 @@ class Compositor:
         self.last_argb=None
         self.animation_pair=None
         self.animation_canvas=None
+        # 材质模式下上一帧合成好的 ARGB（局部重算时当底板用）
+        self.prepared=None
+        # 文字层降采样缓存：(w,h,ss) -> (coverage L, ink RGB)
+        self.text_cache=None
+        self.text_cache_key=None
         try:
             dll = c.WinDLL('msimg32', use_last_error=True)
             self.alpha = dll.AlphaBlend
@@ -125,7 +130,7 @@ class Compositor:
         return bool(self.alpha(target, l+int(dx), t, r-l, b-t,
                                source, l, t, r-l, b-t, Blend(0, 0, int(alpha), int(source_alpha))))
 
-    def present(self, target, source, width, height, regions, mica, animation=None):
+    def present(self, target, source, width, height, regions, mica, animation=None, patch=None):
         """Premultiply in native AlphaBlend, then copy ARGB buffer to DWM.
 
         First normalize legacy GDI pixels to opaque ARGB in a source DIB.
@@ -134,6 +139,9 @@ class Compositor:
 
         mica=False 时走不透明路径；此时如果文字在独立层里（材质模式），
         必须先把文字合回场景，否则 BitBlt 出去的画面上一个字都没有。
+
+        patch：只重算这几块矩形（hover 动画帧用）。场景其余像素跟上一帧一样，
+        直接沿用缓存好的 ARGB，省掉整帧的 LUT / 降采样。
         """
         if not mica:
             layers = getattr(self, 'text_layers', None)
@@ -151,7 +159,10 @@ class Compositor:
             return False
         if animation and self.last_argb:
             return self.present_animation(target,source,width,height,animation)
-        prepared = self.prepare(source, width, height, regions)
+        if patch:
+            prepared = self.patch(source, width, height, patch)
+        else:
+            prepared = self.prepare(source, width, height, regions)
         if prepared is None:
             return False
         rect = w.RECT(0, 0, width, height)
@@ -159,7 +170,6 @@ class Compositor:
         dc = c.c_void_p()
         buffer = self.theme.BeginBufferedPaint(target, c.byref(rect), 2, c.byref(params), c.byref(dc))
         if not buffer:
-            prepared.close()
             return False
         try:
             gdi.BitBlt(dc, 0, 0, width, height, prepared.dc, 0, 0, 0x00CC0020)
@@ -169,7 +179,7 @@ class Compositor:
             self.save_argb(prepared.dc,width,height)
             self.frames += 1
         finally:
-            prepared.close()
+            pass
         return self.theme.EndBufferedPaint(buffer, True) == 0
 
     def save_argb(self,dc,width,height):
@@ -179,34 +189,117 @@ class Compositor:
             self.last_argb=DibSurface(dc,width,height)
         self.last_argb.copy(dc)
 
-    def prepare(self,source,width,height,regions):
+    # ---------- 材质模式的整帧合成 ----------
+    def _ensure_prepared(self, source, width, height):
+        """整帧 ARGB 缓存：尺寸没变就复用，省一次 8MB 分配。"""
+        p = self.prepared
+        if p and (p.width, p.height) == (width, height):
+            return p
+        if p:
+            p.close()
+        self.prepared = DibSurface(source, width, height)
+        return self.prepared
+
+    def _alpha_map(self, rgb):
+        """按亮度算每像素的透出程度：浅色面板透壁纸，深色内容保持不透明。"""
+        from PIL import Image, ImageChops
+        r, g, b = rgb.split()
+        light = ImageChops.darker(ImageChops.darker(r, g), b)
+        surface = {'mica': 168, 'tabbed': 154, 'acrylic': 140}.get(getattr(self, 'material', 'mica'), 168)
+        lut = [255 if x <= 205 else round(255 + (surface - 255) * (x - 205) / 30) if x < 235 else surface
+               for x in range(256)]
+        alpha = light.point(lut)
+        diff = ImageChops.difference(rgb, Image.new('RGB', rgb.size, (241, 243, 251)))
+        dr, dg, db = diff.split()
+        canvas = ImageChops.lighter(ImageChops.lighter(dr, dg), db).point([255] + [0] * 255)
+        alpha.paste(32, mask=canvas)
+        return alpha
+
+    def _text_images(self, layers, width, height, reuse):
+        """把超采样文字层降采样成 1 倍。reuse=True 时直接用上一帧的结果。
+
+        hover 动画期间文字一个像素都没变，每帧重新 frombytes 135MB + reduce
+        纯属浪费（实测占单帧 60% 以上），所以这里按 (w,h,层尺寸) 缓存。
+        """
+        from PIL import Image
+        key = (width, height, layers[0].width, layers[0].height)
+        if reuse and self.text_cache is not None and self.text_cache_key == key:
+            return self.text_cache
+        sw, sh = layers[0].width, layers[0].height
+        coverage = Image.frombytes('RGB', (sw, sh), c.string_at(layers[0].bits, sw * sh * 4),
+                                   'raw', 'BGRX').getchannel('R')
+        ink = Image.frombytes('RGB', (sw, sh), c.string_at(layers[1].bits, sw * sh * 4),
+                              'raw', 'BGRX')
+        # reduce(Box) 正好等于「2x2 四个像素取平均」，标准的超采样降采样
+        factor = max(1, sw // width) if width else 1
+        if factor > 1 and (sw, sh) != (width, height):
+            coverage = coverage.reduce(factor)
+            ink = ink.reduce(factor)
+        self.text_cache = (coverage, ink)
+        self.text_cache_key = key
+        return self.text_cache
+
+    def prepare(self, source, width, height, regions, reuse_text=False):
         """Shape-aware glass: pale surfaces transmit DWM, ink stays opaque.
 
         Work runs once per endpoint; animated frames only blend cached DIBs.
         Exact canvas pixels remain almost clear, including rounded corners.
         """
-        from PIL import Image, ImageChops
-        result=DibSurface(source,width,height)
+        from PIL import Image
+        result = self._ensure_prepared(source, width, height)
         result.copy(source)
         gdi.GdiFlush()
-        rgb=Image.frombytes('RGB',(width,height),c.string_at(result.bits,width*height*4),'raw','BGRX')
-        r,g,b=rgb.split()
-        light=ImageChops.darker(ImageChops.darker(r,g),b)
-        surface={'mica':168,'tabbed':154,'acrylic':140}.get(getattr(self,'material','mica'),168)
-        lut=[255 if x<=205 else round(255+(surface-255)*(x-205)/30) if x<235 else surface for x in range(256)]
-        alpha=light.point(lut)
-        diff=ImageChops.difference(rgb,Image.new('RGB',rgb.size,(241,243,251)))
-        dr,dg,db=diff.split()
-        canvas=ImageChops.lighter(ImageChops.lighter(dr,dg),db).point([255]+[0]*255)
-        alpha.paste(32,mask=canvas)
-        rgb.putalpha(alpha)
-        rgb=self.overlay_text(rgb,width,height)
+        rgb = Image.frombytes('RGB', (width, height),
+                              c.string_at(result.bits, width * height * 4), 'raw', 'BGRX')
+        rgb.putalpha(self._alpha_map(rgb))
+        rgb = self.overlay_text(rgb, width, height, reuse=reuse_text)
         # RGBa performs true premultiplication in Pillow's compiled pixel loop.
-        data=rgb.convert('RGBa').tobytes('raw','BGRa')
-        c.memmove(result.bits,data,len(data))
+        data = rgb.convert('RGBa').tobytes('raw', 'BGRa')
+        c.memmove(result.bits, data, len(data))
         return result
 
-    def overlay_text(self,rgb,width,height):
+    def patch(self, source, width, height, rects, reuse_text=True):
+        """只重算给定矩形，其余沿用上一帧的 ARGB。
+
+        hover 动画里变化的只有鼠标下那颗按钮，整帧重算（~175ms）纯属浪费。
+        这里把每块矩形单独抠出来走一遍同样的 LUT / 文字合成，再写回缓存。
+        """
+        from PIL import Image
+        prepared = self.prepared
+        if not prepared or (prepared.width, prepared.height) != (width, height):
+            return self.prepare(source, width, height, None, reuse_text=False)
+        layers = getattr(self, 'text_layers', None)
+        cov = ink = None
+        if layers:
+            cov, ink = self._text_images(layers, width, height, reuse_text)
+        base = prepared.bits.value
+        for rect in rects:
+            x0 = max(0, int(rect[0])); y0 = max(0, int(rect[1]))
+            x1 = min(width, int(rect[2])); y1 = min(height, int(rect[3]))
+            rw, rh = x1 - x0, y1 - y0
+            if rw <= 0 or rh <= 0:
+                continue
+            # 场景像素只在内存 DC 里，先 BitBlt 到小 DIB 再读
+            tile = DibSurface(source, rw, rh)
+            try:
+                gdi.BitBlt(tile.dc, 0, 0, rw, rh, source, x0, y0, 0x00CC0020)
+                gdi.GdiFlush()
+                rgb = Image.frombytes('RGB', (rw, rh), c.string_at(tile.bits, rw * rh * 4),
+                                      'raw', 'BGRX')
+            finally:
+                tile.close()
+            rgb.putalpha(self._alpha_map(rgb))
+            if cov is not None:
+                rgb = self._composite(rgb, cov.crop((x0, y0, x1, y1)),
+                                      ink.crop((x0, y0, x1, y1)))
+            data = rgb.convert('RGBa').tobytes('raw', 'BGRa')
+            stride = rw * 4
+            for row in range(rh):
+                c.memmove(base + ((y0 + row) * width + x0) * 4,
+                          data[row * stride:(row + 1) * stride], stride)
+        return prepared
+
+    def overlay_text(self, rgb, width, height, reuse=True):
         """把独立文字层合到场景图上（已经是 RGBA，返回 RGBA）。
 
         文字当"印在面板上的墨"，**像素一律不透明**。
@@ -221,29 +314,23 @@ class Compositor:
             out = 文字色*覆盖率 + 面板色*(1-覆盖率) = ink + 面板色*(1-覆盖率)
         两次 LUT + 一次 add，全在 C 层做，单帧只有毫秒级。
         """
-        from PIL import Image, ImageChops
-        layers=getattr(self,'text_layers',None)
+        layers = getattr(self, 'text_layers', None)
         if not layers:
             return rgb
-        sw,sh=layers[0].width,layers[0].height
-        coverage=Image.frombytes('RGB',(sw,sh),c.string_at(layers[0].bits,sw*sh*4),'raw','BGRX').getchannel('R')
-        ink=Image.frombytes('RGB',(sw,sh),c.string_at(layers[1].bits,sw*sh*4),'raw','BGRX')
-        # 文字层是超采样尺寸（见 daily_launcher.TEXT_SS），先缩回原尺寸。
-        # reduce(Box) 正好等于「2x2 四个像素取平均」，也就是标准的超采样降采样。
-        factor=max(1,sw//width) if width else 1
-        if factor>1 and (sw,sh)!=(width,height):
-            coverage=coverage.reduce(factor)
-            ink=ink.reduce(factor)
-        base=rgb.convert('RGB')
-        # 面板色按 (1-覆盖率) 衰减，再叠上墨色
-        inv=coverage.point(lambda v: 255-v)
-        inv=Image.merge('RGB',(inv,inv,inv))
-        out=ImageChops.add(ink,ImageChops.multiply(base,inv))
-        # 有字的地方 alpha 拉满；没字的地方保留场景原来的透明度（磨砂玻璃）
-        inked=coverage.point(lambda v: 255 if v else 0)
-        out_alpha=Image.composite(Image.new('L',coverage.size,255),
-                                  rgb.getchannel('A'),inked)
-        result=out.convert('RGBA')
+        cov, ink = self._text_images(layers, width, height, reuse)
+        return self._composite(rgb, cov, ink)
+
+    def _composite(self, rgb, coverage, ink):
+        """out = ink + base*(1-coverage)，有字处 alpha 拉满。"""
+        from PIL import Image, ImageChops
+        base = rgb.convert('RGB')
+        inv = coverage.point(lambda v: 255 - v)
+        inv = Image.merge('RGB', (inv, inv, inv))
+        out = ImageChops.add(ink, ImageChops.multiply(base, inv))
+        inked = coverage.point(lambda v: 255 if v else 0)
+        out_alpha = Image.composite(Image.new('L', coverage.size, 255),
+                                    rgb.getchannel('A'), inked)
+        result = out.convert('RGBA')
         result.putalpha(out_alpha)
         return result
 
@@ -255,7 +342,7 @@ class Compositor:
         gdi.GdiFlush()
         rgb=Image.frombytes('RGB',(width,height),c.string_at(result.bits,width*height*4),'raw','BGRX')
         # 必须是 alpha=255：DWM 会照 alpha 合成，全 0 的话 BitBlt 出去等于全透明
-        rgb=self.overlay_text(rgb.convert('RGBA'),width,height)
+        rgb=self.overlay_text(rgb.convert('RGBA'),width,height,reuse=False)
         c.memmove(result.bits,rgb.tobytes('raw','BGRA'),width*height*4)
         return result
 
@@ -263,9 +350,11 @@ class Compositor:
         generation,progress,offset,regions,kind,split=animation
         if self.animation_pair is None or self.animation_pair[0]!=generation:
             self.finish_animation()
-            incoming=self.prepare(source,width,height,regions)
-            if incoming is None:
+            # prepare 现在复用同一块整帧缓存，动画要留着自己那份，必须克隆
+            prepared=self.prepare(source,width,height,regions,reuse_text=False)
+            if prepared is None:
                 return False
+            incoming=prepared.clone()
             self.animation_pair=(generation,self.last_argb.clone(),incoming)
             self.animation_canvas=DibSurface(target,width,height)
         _,old,new=self.animation_pair
@@ -306,6 +395,9 @@ class Compositor:
         self.finish_animation()
         if self.last_argb:
             self.last_argb.close();self.last_argb=None
+        if self.prepared:
+            self.prepared.close();self.prepared=None
+        self.text_cache=None;self.text_cache_key=None
         if self.theme:
             self.theme.BufferedPaintUnInit()
             self.theme = None

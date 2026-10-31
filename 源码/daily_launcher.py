@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.16.3"
+APP_VERSION = "v2.17.0"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -134,6 +134,10 @@ PROMPT_SECONDS = 5
 
 # 自定义实例最多加几个（设置页行高有限，多了会挤掉日志区）
 MAX_CUSTOM = 4
+
+# 每帧耗时打点：设了 DL_TIMING=1 就在 launcher.log 里记 gdi/present 各多少毫秒。
+# 只用来定位材质模式卡顿，正常运行时零开销。
+DEBUG_TIMING = bool(os.environ.get("DL_TIMING"))
 
 
 # ----------------------------------------------------------------------------
@@ -3946,6 +3950,14 @@ gdi32.IntersectClipRect.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int,
                                     ctypes.c_int, ctypes.c_int]
 gdi32.IntersectClipRect.restype = ctypes.c_int
 
+# 局部刷新（hover）时把落笔范围限制在变化的那几块：多块矩形合成一个裁剪区
+gdi32.CreateRectRgn.argtypes = [ctypes.c_int] * 4
+gdi32.CreateRectRgn.restype = wt.HRGN
+gdi32.CombineRgn.argtypes = [wt.HRGN, wt.HRGN, wt.HRGN, ctypes.c_int]
+gdi32.CombineRgn.restype = ctypes.c_int
+gdi32.SelectClipRgn.argtypes = [wt.HDC, wt.HRGN]
+gdi32.SelectClipRgn.restype = ctypes.c_int
+
 kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wt.HINSTANCE
 user32.MessageBoxW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.UINT]
@@ -4018,6 +4030,11 @@ class App(VisualShell):
         self._hover_from = None
         self._hover_at = 0.0
         self.hover = None
+        # hover 局部刷新用：本帧只需重算的矩形 / 该矩形对应的整帧序号
+        self._hover_patch = None
+        self._hover_patch_serial = -1
+        self._paint_serial = 0
+        self._patch_clip = None
         self.pressed = None
         self.busy = False
         self.steps = {k: ("idle", "") for k in STEP_KEYS}
@@ -4102,6 +4119,25 @@ class App(VisualShell):
 
     def motion_enabled(self):
         return self.motion_allowed and self.cfg.get("ui_motion", True)
+
+    def _mark_hover_patch(self):
+        """记下这一帧只需重算的矩形：hover 动画只改鼠标下那颗控件。
+
+        材质模式整帧合成要 175ms 左右，而 hover 只动了按钮底色这一小块，
+        按矩形打补丁能到 ~30ms/帧。算不出矩形（命中在奇怪位置）就置 None，
+        退回整帧重算 —— 宁可慢一点，也不能画错。
+        """
+        if (not self.motion_enabled() or self.prompt or self.exepick
+                or self.frame_effect not in ('mica', 'tabbed', 'acrylic')):
+            self._hover_patch = None
+            return
+        rects = self.hover_rects(self.hover) + self.hover_rects(self._hover_from)
+        if not rects:
+            self._hover_patch = None
+            return
+        pad = self.S(8)          # 圆角/描边/阴影外扩一点，别留毛边
+        self._hover_patch = [(r[0] - pad, r[1] - pad, r[2] + pad, r[3] + pad) for r in rects]
+        self._hover_patch_serial = self._paint_serial
 
     def hover_amount(self, key):
         if not self.motion_enabled() or not self._hover_at:
@@ -4215,6 +4251,7 @@ class App(VisualShell):
             for layer, ink in zip(layers, (0xffffff, color)):
                 saved = gdi32.SaveDC(layer.dc)
                 gdi32.IntersectClipRect(layer.dc, cl, ct, cr, cb)
+                self._apply_patch_clip(layer.dc, ss)
                 gdi32.SelectObject(layer.dc, big)
                 gdi32.SetTextColor(layer.dc, ink)
                 gdi32.SetBkMode(layer.dc, 1)
@@ -4252,6 +4289,58 @@ class App(VisualShell):
             gdi32.PatBlt(layer.dc, r.left * ss, r.top * ss,
                          (r.right - r.left) * ss, (r.bottom - r.top) * ss,
                          0x00000042)          # BLACKNESS = 全 0，等于没画过
+    def _apply_patch_clip(self, dc, ss=1):
+        """局部刷新：把 DC 的裁剪区再和 patch 矩形求交（多块用区域合并）。
+
+        没有 patch 时什么都不做；有的话就在 DC 上装一个「只允许这几块」的区域，
+        后面所有落笔自动被裁掉。
+        """
+        rects = getattr(self, '_patch_clip', None)
+        if not rects:
+            return
+        rgn = gdi32.CreateRectRgn(0, 0, 0, 0)
+        if not rgn:
+            return
+        first = True
+        for r in rects:
+            sub = gdi32.CreateRectRgn(int(r[0]) * ss, int(r[1]) * ss,
+                                      int(r[2]) * ss, int(r[3]) * ss)
+            if not sub:
+                continue
+            if first:
+                gdi32.CombineRgn(rgn, sub, 0, 5)      # RGN_COPY
+                first = False
+            else:
+                gdi32.CombineRgn(rgn, rgn, sub, 2)    # RGN_OR
+            gdi32.DeleteObject(sub)
+        gdi32.SelectClipRgn(dc, rgn)
+        gdi32.DeleteObject(rgn)
+
+    def hover_rects(self, key):
+        """把 hover 的 key 翻成屏幕矩形；翻不出来就返回 []（调用方会退回整帧重算）。"""
+        if not key:
+            return []
+        R = self.rects
+        for page, rect in self.nav_rects():
+            if key == 'nav:' + page:
+                return [rect]
+        if key.startswith('chk:'):
+            k = key[4:]
+            r = (R.get('tiles') or {}).get(k)
+            if r:
+                return [r]
+        r = R.get(key)
+        if isinstance(r, (list, tuple)) and len(r) == 4:
+            return [r]
+        if key.startswith('chk:') or key.startswith('set:'):
+            name = key.split(':', 1)[1]
+            for item, ry, rowh in R.get('rows', []):
+                if item.get('key') == name:
+                    card = R.get('card')
+                    l = card[0] if card else 0
+                    rr = card[2] if card else self._paint_w
+                    return [(l, ry - 2, rr, ry + rowh - 2)]
+        return []
 
     def fill_round(self, hdc, rect, radius, fill, border=None, bwidth=1):
         """rect 已是物理像素；radius 是逻辑值"""
@@ -5211,6 +5300,7 @@ class App(VisualShell):
 
     # ---------- 绘制 ----------
     def paint(self, target):
+        frame_started = time.monotonic()
         rc = wt.RECT()
         user32.GetClientRect(self.hwnd, ctypes.byref(rc))
         w, h = rc.right, rc.bottom
@@ -5219,41 +5309,83 @@ class App(VisualShell):
                 and self._animation_generation == self._visual_generation
                 and (cached.width,cached.height) == (w,h)):
             self.present_scene(target,cached.dc,w,h)
+            if DEBUG_TIMING:
+                log_line("frame(anim): present %.0f ms, %dx%d"
+                         % ((time.monotonic() - frame_started) * 1000, w, h))
             return
+        # hover 局部刷新：只有鼠标悬停状态在变，场景其余部分和上一帧逐像素相同。
+        # 这时只重算变化的矩形，整帧合成（~175ms）省掉，动画才跟得上手。
+        patch = None
+        hp = getattr(self, '_hover_patch', None)
+        if (hp and getattr(self, '_hover_patch_serial', -1) == self._paint_serial
+                and not self._transition and not self._modal_transition
+                and not self.prompt and not self.exepick
+                and self.frame_effect in ('mica', 'tabbed', 'acrylic')):
+            patch = hp
+        self._hover_patch = None
+        self._patch_serial_seen = self._paint_serial
+
         render_started = time.monotonic()
         mem = gdi32.CreateCompatibleDC(target)
         bmp = gdi32.CreateCompatibleBitmap(target, w, h)
         old_bmp = gdi32.SelectObject(mem, bmp)
+
+        self._paint_dc = mem
+        self._paint_w, self._paint_h = w, h
+        self._patch_clip = list(patch) if patch else None
+        # 走补丁时场景只有那几块会被读走，干脆把画笔也裁到那几块，
+        # GDI 少画一大片（整帧 25ms → 5ms）。前提是整帧缓存确实对得上，
+        # 否则 patch 会退回整帧合成，读到被裁过的场景就花了。
+        prepared = self._compositor.prepared
+        if self._patch_clip and prepared and (prepared.width, prepared.height) == (w, h):
+            self._apply_patch_clip(mem)
+        else:
+            self._patch_clip = None
 
         bg = gdi32.CreateSolidBrush(C["bg"])
         full = wt.RECT(0, 0, w, h)
         user32.FillRect(mem, ctypes.byref(full), bg)
         gdi32.DeleteObject(bg)
 
-        for layer in getattr(self, '_glass_text_layers', ()) or ():
-            layer.close()
-        self._glass_text_layers = None
-        self._text_ss = 1
-        self._paint_dc = mem
-        self._paint_w, self._paint_h = w, h
-        if self.frame_effect in ('mica', 'tabbed', 'acrylic'):
+        material = self.frame_effect in ('mica', 'tabbed', 'acrylic')
+        ss = TEXT_SS if material else 1
+        layers = getattr(self, '_glass_text_layers', None)
+        if layers and (layers[0].width, layers[0].height) != (w * ss, h * ss):
+            for layer in layers:
+                layer.close()
+            layers = None
+        self._glass_text_layers = layers
+        self._text_ss = ss if layers else 1
+        if material:
             from ui_render import DibSurface
-            # 图层的绘制坐标仍是逻辑像素：靠世界变换放大 TEXT_SS 倍渲染，
-            # 合成时再 BOX 缩回去 —— 等于给文字做超采样，把 GDI 那 16 级灰度
-            # 抗锯齿变成 100 多级（锯齿主要就来自这 16 级）。
-            try:
-                self._glass_text_layers = (
-                    DibSurface(mem, w * TEXT_SS, h * TEXT_SS),
-                    DibSurface(mem, w * TEXT_SS, h * TEXT_SS))
-            except OSError:
-                # 2 倍图层比窗口大 4 倍内存，极端情况下（显存/内存吃紧）退回 1 倍，
-                # 宁可少点抗锯齿也不能画不出来
-                self._glass_text_layers = (DibSurface(mem, w, h), DibSurface(mem, w, h))
-                self._text_ss = 1
+            if layers is None:
+                # 图层的绘制坐标仍是逻辑像素：按 TEXT_SS 倍渲染，
+                # 合成时再 BOX 缩回去 —— 等于给文字做超采样，把 GDI 那 16 级灰度
+                # 抗锯齿变成 100 多级（锯齿主要就来自这 16 级）。
+                try:
+                    self._glass_text_layers = (
+                        DibSurface(mem, w * TEXT_SS, h * TEXT_SS),
+                        DibSurface(mem, w * TEXT_SS, h * TEXT_SS))
+                except OSError:
+                    # 2 倍图层比窗口大 4 倍内存，极端情况下（显存/内存吃紧）退回 1 倍，
+                    # 宁可少点抗锯齿也不能画不出来
+                    self._glass_text_layers = (DibSurface(mem, w, h), DibSurface(mem, w, h))
+                    self._text_ss = 1
+                else:
+                    self._text_ss = TEXT_SS
+                layers = self._glass_text_layers
+            # 2 倍图层 135MB，每帧整层 clear 要 16ms；局部刷新只擦变化的那几块，
+            # 文字绘制也只在那些块里进行（见 text()），否则同一行字会被叠两遍、变粗。
+            if patch:
+                for rect in patch:
+                    self.text_layer_cover(rect)
             else:
-                self._text_ss = TEXT_SS
-            for layer in self._glass_text_layers:
-                layer.clear()
+                self.text_layer_cover()
+        else:
+            for layer in layers or ():
+                layer.close()
+            self._glass_text_layers = None
+            self._text_ss = 1
         self.layout(w, h)
         R = self.rects
 
@@ -5331,7 +5463,14 @@ class App(VisualShell):
         if self._modal_transition:
             old, started, opening, dialog = self._modal_transition
             self._modal_transition = (old, started + render_elapsed, opening, dialog)
-        self.present_scene(target, mem, w, h)
+        self.present_scene(target, mem, w, h, patch=patch)
+        self._patch_clip = None
+        self._paint_serial += 1
+        if DEBUG_TIMING:
+            log_line("frame: gdi %.0f ms, present %.0f ms, %dx%d%s"
+                     % (render_elapsed * 1000,
+                        (time.monotonic() - render_started - render_elapsed) * 1000,
+                        w, h, " patch=%d" % len(patch) if patch else ""))
         gdi32.SelectObject(mem, old_bmp)
         gdi32.DeleteObject(bmp)
         gdi32.DeleteDC(mem)
@@ -6580,6 +6719,7 @@ class App(VisualShell):
                     self._hover_from = self.hover
                     self._hover_at = time.monotonic()
                     self.hover = h
+                    self._mark_hover_patch()
                     if self.motion_enabled():
                         user32.SetTimer(hwnd, 2, 16, None)
                     user32.InvalidateRect(hwnd, None, False)
@@ -6662,6 +6802,7 @@ class App(VisualShell):
                     user32.InvalidateRect(hwnd, None, False)
                     return 0
                 if wp == 2:
+                    self._mark_hover_patch()
                     user32.InvalidateRect(hwnd, None, False)
                     if time.monotonic() - self._hover_at >= 0.18:
                         user32.KillTimer(hwnd, 2)

@@ -20,6 +20,7 @@ class VisualShell:
             return
         self.finish_modal_transition()
         a = self.api()
+        self._hover_patch = None
         scene = getattr(self, '_last_scene', None)
         # 材质模式下弹窗是不透明呈现的，做淡入淡出既没必要也看不出效果
         if (scene and self.motion_enabled() and self._compositor.alpha
@@ -65,6 +66,8 @@ class VisualShell:
             self._animation_clock.start()
             self.api().user32.SetTimer(self.hwnd, 3, 16, None)
         self.hover = self.pressed = None
+        # 换页必须整帧重算：patch 是「在上一帧上打补丁」，底图还是旧页面就全错了
+        self._hover_patch = None
         self.api().user32.InvalidateRect(self.hwnd, None, False)
 
     def finish_transition(self):
@@ -80,7 +83,7 @@ class VisualShell:
         if getattr(self, 'hwnd', None):
             self.api().user32.KillTimer(self.hwnd, 3)
 
-    def present_scene(self, target, scene, w, h):
+    def present_scene(self, target, scene, w, h, patch=None):
         a = self.api()
         output = scene
         animation_progress=None
@@ -147,7 +150,10 @@ class VisualShell:
             cached = None
         if cached is None:
             cached = self._last_scene = Surface(target, w, h)
-        cached.copy(output)
+        if not patch:
+            # 局部刷新时 output 只有那几块是画过的，整屏底下是空的，
+            # 不能拿它当「上一帧」（换页动画要用）；留着上一次整帧的。
+            cached.copy(output)
         regions = [((0, 0, self.S(192), h), 218),
                    ((self.S(204), self.S(12), w-self.S(20), self.S(86)), 226)]
         if self.page == 'main':
@@ -173,7 +179,8 @@ class VisualShell:
         self._compositor.material = self.frame_effect
         ok = self._compositor.present(target, self._animation_scene.dc if animation and native_animation else output,
                                       w, h, regions, material_on,
-                                      animation if material_on else None)
+                                      animation if material_on else None,
+                                      patch=patch if material_on and not animation else None)
         if not ok:
             self.frame_effect = a.apply_native_frame(self.hwnd, False)
             # 材质提交失败时退回不透明；这时同样要先把文字层合回场景
