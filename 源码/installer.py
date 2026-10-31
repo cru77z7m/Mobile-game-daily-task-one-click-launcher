@@ -664,7 +664,11 @@ class SetupUI(object):
             r = RECT(*[pt for pt in box])
             user32.DrawTextW(hdc, s, -1, ctypes.byref(r), flags)
         else:
-            r = RECT(x, y, 4000, y + 40)
+            # 默认矩形的高度必须跟着字号走：以前写死 y+40 物理像素，
+            # 而 175% 缩放下 16pt 的卡片标题行高约 58px —— DT_SINGLELINE 在这个
+            # 矮盒子里排版，底部笔画直接被切掉（"安装 一键日常启动器"只剩上半截）。
+            # 只用"顶部对齐 + DT_SINGLELINE"的地方都走这条路，盒子给宽一点无害。
+            r = RECT(x, y, 4000, y + self.S(64))
             user32.DrawTextW(hdc, s, -1, ctypes.byref(r), flags)
 
     def fill_round(self, hdc, rect, radius, fill, border=None, bw=1):
