@@ -3,7 +3,12 @@
 No layered windows, color keys, screen captures, or third-party runtime.
 """
 import ctypes as c
+import os
 from ctypes import wintypes as w
+
+# 整帧合成的并行带数：纯像素运算，按横带切给线程。
+# 实测 4 带最划算（8 带反而慢：Pillow 一部分步骤不放 GIL，线程多了只剩调度开销）。
+WORKERS = int(os.environ.get('DL_WORKERS') or min(4, os.cpu_count() or 4))
 
 gdi = c.WinDLL('gdi32', use_last_error=True)
 gdi.CreateCompatibleDC.argtypes = [c.c_void_p]
@@ -244,19 +249,78 @@ class Compositor:
 
         Work runs once per endpoint; animated frames only blend cached DIBs.
         Exact canvas pixels remain almost clear, including rounded corners.
+
+        整帧合成按横带切给多个线程做：alpha LUT、文字层 2 倍降采样、预乘
+        这三步都是纯像素运算，带与带之间互不相干，拼起来和单线程逐像素一致。
         """
         from PIL import Image
+        from concurrent.futures import ThreadPoolExecutor
         result = self._ensure_prepared(source, width, height)
         result.copy(source)
         gdi.GdiFlush()
-        rgb = Image.frombytes('RGB', (width, height),
-                              c.string_at(result.bits, width * height * 4), 'raw', 'BGRX')
-        rgb.putalpha(self._alpha_map(rgb))
-        rgb = self.overlay_text(rgb, width, height, reuse=reuse_text)
-        # RGBa performs true premultiplication in Pillow's compiled pixel loop.
-        data = rgb.convert('RGBa').tobytes('raw', 'BGRa')
-        c.memmove(result.bits, data, len(data))
+        layers = getattr(self, 'text_layers', None)
+        ss = 2 if (layers and layers[0].width == width * 2) else 1
+        bands = self._bands(height)
+        bits = result.bits.value
+        if len(bands) == 1:
+            out = [self._render_band(bits, width, bands[0][0], bands[0][1], layers, ss)]
+        else:
+            with ThreadPoolExecutor(max_workers=len(bands)) as ex:
+                futs = [ex.submit(self._render_band, bits, width, y0, y1, layers, ss)
+                        for y0, y1 in bands]
+                out = [f.result() for f in futs]
+        if layers:
+            # 拼一份 1 倍文字图存着：紧跟其后的 hover 补丁就不用再降一次采样
+            try:
+                cov_all = Image.new('L', (width, height))
+                ink_all = Image.new('RGB', (width, height))
+                for (y0, _y1), (cov, ink) in zip(bands, out):
+                    cov_all.paste(cov, (0, y0))
+                    ink_all.paste(ink, (0, y0))
+                self.text_cache = (cov_all, ink_all)
+                self.text_cache_key = (width, height, layers[0].width, layers[0].height)
+            except (ValueError, OSError):
+                self.text_cache = None
         return result
+
+    def _bands(self, height):
+        """把高度切成若干横带；2 倍图层的带高必须是偶数。"""
+        n = max(1, min(WORKERS, height // 96))
+        step = (height + n - 1) // n
+        step += step % 2
+        out, y = [], 0
+        while y < height:
+            y1 = min(height, y + step)
+            out.append((y, y1))
+            y = y1
+        return out
+
+    def _render_band(self, bits, width, y0, y1, layers, ss):
+        """合成 [y0,y1) 这条横带，直接写回整帧缓存；返回该带的 1 倍文字图。"""
+        from PIL import Image
+        bh = y1 - y0
+        raw = c.string_at(bits + y0 * width * 4, bh * width * 4)
+        rgb = Image.frombytes('RGB', (width, bh), raw, 'raw', 'BGRX')
+        rgb.putalpha(self._alpha_map(rgb))
+        cov = ink = None
+        if layers:
+            lw = layers[0].width
+            lb0, lb1 = layers[0].bits.value, layers[1].bits.value
+            if ss > 1 and lw == width * ss:
+                raw0 = c.string_at(lb0 + y0 * ss * lw * 4, bh * ss * lw * 4)
+                cov = Image.frombytes('RGB', (lw, bh * ss), raw0, 'raw', 'BGRX') \
+                    .getchannel('R').reduce(ss)
+                raw1 = c.string_at(lb1 + y0 * ss * lw * 4, bh * ss * lw * 4)
+                ink = Image.frombytes('RGB', (lw, bh * ss), raw1, 'raw', 'BGRX').reduce(ss)
+            else:
+                raw0 = c.string_at(lb0 + y0 * lw * 4, bh * lw * 4)
+                cov = Image.frombytes('RGB', (lw, bh), raw0, 'raw', 'BGRX').getchannel('R')
+                raw1 = c.string_at(lb1 + y0 * lw * 4, bh * lw * 4)
+                ink = Image.frombytes('RGB', (lw, bh), raw1, 'raw', 'BGRX')
+            rgb = self._composite(rgb, cov, ink)
+        data = rgb.convert('RGBa').tobytes('raw', 'BGRa')
+        c.memmove(bits + y0 * width * 4, data, len(data))
+        return cov, ink
 
     def patch(self, source, width, height, rects, reuse_text=True):
         """只重算给定矩形，其余沿用上一帧的 ARGB。
