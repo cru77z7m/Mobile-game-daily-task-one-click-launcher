@@ -189,7 +189,18 @@ class VisualShell:
         return surface
 
     def material_name(self):
-        material=self.cfg.get('ui_material','mica') if self.cfg.get('ui_mica',True) else 'solid'
+        """标签显示**实际生效**的材质，而不是配置里写的愿望。
+
+        默认想要 Mica；系统不支持（Win10 / 旧版 11 / 关掉透明效果 / 取不到合成器）时
+        会静默回退实色 —— 这种情况下再显示「Mica」就是在骗人。
+        """
+        want=self.cfg.get('ui_material','mica') if self.cfg.get('ui_mica',True) else 'solid'
+        actual=getattr(self,'frame_effect','solid')
+        if actual=='unsupported':
+            return '实色（本机不支持 Mica）'
+        if actual=='unavailable':
+            return '实色（Mica 调用失败）'
+        material=actual if actual in ('mica','tabbed','acrylic','solid') else want
         return {'mica':'Mica','tabbed':'Tabbed / Mica Alt','acrylic':'亚克力','solid':'实色'}.get(material,'Mica')
 
     def setting_button(self,item):
