@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.18.2"
+APP_VERSION = "v2.18.3"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -5087,8 +5087,7 @@ class App(VisualShell):
         # 三个子页面统一行高，各分组内部密度才一致（之前 ①组 38、②③组 32，看着参差）。
         row_h = {"settings": 42, "custom": 42, "night": 42, "tasks": 42}.get(self.page, 58)
         self.row_h_logical = row_h
-        self.sub_page = self.page in ("settings", "custom", "night", "about", "tasks",
-                                      "pipeline")
+        self.sub_page = self.page in ("settings", "custom", "night", "about", "tasks")
         items = self.current_rows()
         b_h = 46
 
@@ -5248,8 +5247,6 @@ class App(VisualShell):
             return self.task_rows()
         if self.page == "settings":
             return self.settings_rows()
-        if self.page == "pipeline":
-            return self.pipeline_rows()
         return self.instance_rows()
 
     # ---------- 关于页 ----------
@@ -5533,6 +5530,9 @@ class App(VisualShell):
             "chip": dict(self.OKWW_TASKS).get(t, t) if t else "不自启",
         })
 
+        # 启动编排（原来在设置页的独立二级页，用户要求合并到这一页）
+        out.extend(self.pipeline_section_rows())
+
         out.append({
             "key": "t_reset",
             "icon": "ui_update",
@@ -5619,15 +5619,18 @@ class App(VisualShell):
                 assign[k] = 2
         return assign
 
-    def pipeline_rows(self):
-        """每个项目一行，点右侧按钮循环切换「第几轮」"""
+    def pipeline_section_rows(self):
+        """启动编排那一段（合并进「安排自动任务」页，不再是独立二级页）
+
+        每项一行，点右侧按钮循环切换「第几轮」；下面是按轮汇总。
+        """
         cfg = self.cfg
         pl = cfg.get("pipeline") or {}
         assign = pl.get("assign") or {}
         out = [{
             "key": "sec:pipe",
             "h": 22,
-            "title": "启动编排",
+            "title": "启动编排 · 一轮一轮跑",
             "sub": "轮号小的先跑；一轮的任务真跑完了才开下一轮",
         }, {
             "key": "pl_enabled",
@@ -5745,21 +5748,7 @@ class App(VisualShell):
             "chip": label,
         })
 
-        pl = cfg.get("pipeline") or {}
-        nround = max(pl.get("assign", {}).values() or [0]) if pl.get("assign") else 0
-        out.append({"key": "sec:pipe", "h": 22, "title": "③ 启动编排",
-                    "sub": "把项目分成几轮，一轮跑完再开下一轮（如先终末地、再模拟器、最后鸣潮）"})
-        out.append({
-            "key": "pipeline",
-            "icon": "ui_tasks",
-            "h": 42,
-            "title": "启动顺序与轮次",
-            "sub": ("已启用 · 共 %d 轮" % nround) if (pl.get("enabled") and nround)
-                   else "未启用（所有勾选项一趟跑完）",
-            "chip": "第 %d 轮" % nround if (pl.get("enabled") and nround) else "未编排",
-        })
-
-        out.append({"key": "sec:update", "h": 22, "title": "④ 软件更新", "sub": ""})
+        out.append({"key": "sec:update", "h": 22, "title": "③ 软件更新", "sub": ""})
         u_sub, u_chip = self.upd_text()
         out.append({
             "key": "update",
@@ -5771,7 +5760,7 @@ class App(VisualShell):
         })
 
         out.extend([
-            {"key": "sec:appearance", "h": 22, "title": "⑤ 界面与动效", "sub": ""},
+            {"key": "sec:appearance", "h": 22, "title": "④ 界面与动效", "sub": ""},
             {"key": "ui_material", "icon": "ui_sparkle", "title": "窗口背景材质",
              "sub": "Mica / Tabbed（Mica Alt）/ 亚克力 / 实色 · 不支持时自动回退",
              "chip": self.material_name()},
@@ -7285,7 +7274,7 @@ class App(VisualShell):
         # 设置页的点击统一走 pick_row（命中 key 是 set:<kind>），所以必须在这里
         # 先把它们摘出去交给 do()，否则会掉到最后的兜底分支去弹"浏览文件夹"
         # —— v2.18.0 实测：点「启动顺序与轮次」直接弹出选择目录对话框。
-        if kind in ("pipeline", "pl_enabled") or kind.startswith("pl:"):
+        if kind == "pl_enabled" or kind.startswith("pl:"):
             self.do(kind)
             return
         if self.busy:
@@ -7400,14 +7389,6 @@ class App(VisualShell):
 
     def do(self, key):
         if key.startswith("pl_sum:"):
-            return
-        if key == "pipeline":
-            if self.busy:
-                return
-            self.page_stack.append("settings")
-            self.page = "pipeline"
-            self.status = "启动编排：点右侧按钮给每个项目选轮次"
-            user32.InvalidateRect(self.hwnd, None, False)
             return
         if key == "pl_enabled":
             if self.busy:
@@ -8140,8 +8121,8 @@ def main():
                 app.page = "about"             # 自检时截「关于」页
                 app.page_stack.append("settings")
             elif _pg.startswith("pip"):
-                app.page = "pipeline"          # 自检时截「启动编排」页
-                app.page_stack.append("settings")
+                app.page = "tasks"             # 启动编排已并入「安排自动任务」，截这一页
+                app.page_stack.append("main")
     if shot and "--scroll" in args:
         # 自检用：把子页面滚到指定位置再截图（看裁剪和滚动条对不对）
         # 必须在 --page 之后设置，否则 layout 换页会把它归零

@@ -123,46 +123,44 @@ try:
     assert ui._transition is None
     ui.cfg['ui_motion']=True
     print('PASS: actual WM_LBUTTON navigation, forward/back, reversal, reduced motion')
-    # 设置页的「启动编排 → 启动顺序与轮次」必须进二级页。
-    # 设置页所有行点击都走 pick_row（命中键 set:<key>），没在 pick_row 里摘出来
-    # 就会掉到最后的兜底分支弹"浏览文件夹" —— v2.18.0 实测就是这个症状。
+    # 启动编排已并入「安排自动任务」页：那里点「分轮执行」要能切开关，不能弹选目录框。
+    # （设置页的点击统一走 pick_row，末尾兜底是"当路径 → 弹 SHBrowseForFolder"，
+    #   没在 pick_row 里登记的 key 会掉进去 —— v2.18.0 就是弹了这个框。）
     ui.page='settings'
+    ui.finish_transition()
+    paint()
+    keys=[it['key'] for it,_,_ in ui.rects.get('rows',[])]
+    assert 'pipeline' not in keys, '设置页里不该再有启动编排入口（已合并到安排自动任务）'
+
+    ui.page='tasks'
     ui.finish_transition()
     paint()                      # _scroll_max 要画一次才更新
     ui.scroll=ui._scroll_max
+    ui.finish_transition()       # 滚动不改动画状态，但保持一致
     paint()
 
     def click_row(key):
         rows=[(it,ry,rh) for it,ry,rh in ui.rects.get('rows',[]) if it['key']==key]
-        assert rows, '设置页里找不到 %s 行' % key
+        assert rows, '当前页里找不到 %s 行' % key
         _,ry,rh=rows[0]
         card=ui.rects['card']
         lp=(((ry+rh//2)<<16)|((card[0]+card[2])//2))
         a.user32.SendMessageW(hwnd,a.WM_LBUTTONDOWN,1,lp)
         a.user32.SendMessageW(hwnd,a.WM_LBUTTONUP,0,lp)
 
+    assert any(it['key']=='pl_enabled' for it,_,_ in ui.rects['rows']), \
+        '安排自动任务页里找不到「分轮执行」行'
     opened=[]
     real_pick=a.pick_folder
     a.pick_folder=lambda *ar,**kw: opened.append(True) or None
     try:
-        click_row('pipeline')
+        click_row('pl_enabled')
     finally:
         a.pick_folder=real_pick
-    assert ui.page=='pipeline', '点了启动编排却停在 %r' % ui.page
-    assert not opened, '点了启动编排却弹出了文件夹选择框'
-    ui.finish_transition()       # 进页面有动画，动画期间点击会被丢弃（真实行为）
-    ui.scroll=0                  # 二级页从顶部开始
-    paint()
-    tgt=[(it,ry,rh) for it,ry,rh in ui.rects.get('rows',[]) if it['key']=='pl_enabled']
-    assert tgt, '编排页里找不到「分轮执行」行'
-    _,ry,rh=tgt[0]
-    card=ui.rects['card']
-    lp=(((ry+rh//2)<<16)|((card[0]+card[2])//2))
-    a.user32.SendMessageW(hwnd,a.WM_LBUTTONDOWN,1,lp)
-    a.user32.SendMessageW(hwnd,a.WM_LBUTTONUP,0,lp)
+    assert not opened, '点「分轮执行」弹出了文件夹选择框'
     assert ui.cfg['pipeline']['enabled'] is True, ui.cfg.get('pipeline')
     assert ui.cfg['pipeline'].get('assign'), '开启后应自动带出默认分轮'
-    print('PASS: 设置里点「启动顺序与轮次」进编排页，开关可切换（没有弹文件夹选择框）')
+    print('PASS: 安排自动任务页里的「分轮执行」可切换（没有弹文件夹选择框）')
     ui.cfg['pipeline']['enabled']=False
     ui.page='settings'
     ui.finish_transition()
