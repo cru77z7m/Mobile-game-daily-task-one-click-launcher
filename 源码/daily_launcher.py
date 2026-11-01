@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.18.1"
+APP_VERSION = "v2.18.2"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -7281,6 +7281,13 @@ class App(VisualShell):
 
     def pick_row(self, kind):
         """设置页点了一行：路径类弹文件夹选择框，选项类就地循环切换"""
+        # 分轮编排那几行是"进二级页 / 切轮号"，不是选路径。
+        # 设置页的点击统一走 pick_row（命中 key 是 set:<kind>），所以必须在这里
+        # 先把它们摘出去交给 do()，否则会掉到最后的兜底分支去弹"浏览文件夹"
+        # —— v2.18.0 实测：点「启动顺序与轮次」直接弹出选择目录对话框。
+        if kind in ("pipeline", "pl_enabled") or kind.startswith("pl:"):
+            self.do(kind)
+            return
         if self.busy:
             return
         if kind == "ui_material":
