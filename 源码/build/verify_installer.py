@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""安装程序回归检查：能装上、锁住时说人话、写入失败会重试。
+"""安装程序回归检查：能装上、锁住时说人话、写入失败会重试、只读占用能绕过去。
 
-三条用例都直接调 Installer.run()，不经过窗口，也不碰真实注册表/快捷方式
+用例都直接调 Installer.run()，不经过窗口，也不碰真实注册表/快捷方式
 （register_uninstall / make_shortcuts 在这里被替换成空操作，否则会把用户
 真正的卸载项指向临时目录）。
 
@@ -63,6 +63,20 @@ def lock_file(path):
     """用独占句柄锁住文件（模拟"程序正在运行"）。"""
     h = kernel32.CreateFileW(str(path), GENERIC_READ | GENERIC_WRITE, 0, None,
                              OPEN_EXISTING, 0x80, None)
+    if h == INVALID_HANDLE:
+        raise OSError("CreateFileW 失败：%d" % ctypes.get_last_error())
+    return h
+
+
+def share_read_delete(path):
+    """以「只读 + 允许删除」打开文件。
+
+    复刻 v2.18.0 踩到的那类句柄（杀软扫盘、游戏启动器扫描、云盘同步）：
+    FILE_SHARE_READ | FILE_SHARE_DELETE，但不共享写。
+    → open(path, 'r+b') 报 PermissionError，改名却可以。
+    """
+    h = kernel32.CreateFileW(str(path), GENERIC_READ,
+                             0x1 | 0x4, None, OPEN_EXISTING, 0x80, None)
     if h == INVALID_HANDLE:
         raise OSError("CreateFileW 失败：%d" % ctypes.get_last_error())
     return h
@@ -164,13 +178,37 @@ try:
         installer.shutil.copyfileobj = real
         installer.FILE_RETRY_DELAY = 0.15
     meta_absent = not (t4 / "install.json").exists()
+    # 每个文件：FILE_TRIES 次重试 + 1 次"改名挪开后重写"（文件存在且挪得动时会多试一次）
+    want_calls = (len(FILES) - 1) * (installer.FILE_TRIES + 1)
     ok = (inst.error and "重试" in inst.error and meta_absent
-          and calls["n"] == len(FILES) * installer.FILE_TRIES - installer.FILE_TRIES)
+          and calls["n"] == want_calls)
     check(ok, "彻底失败不写标记",
           "error=%r install.json 不存在=%s 尝试 %d 次"
           % (inst.error, meta_absent, calls["n"]))
+    # ---- 5) 只读+允许删除的占用：不该拦人，改名挪开后照常装 ----
+    #     v2.18.0 的真实事故：_internal/VCRUNTIME140.dll 被别的程序以这种句柄打开，
+    #     写不进去但能改名，旧逻辑直接报「请先退出正在运行的程序」——用户被误导。
+    t5 = tmp / "app5"
+    run_installer(t5, tmp / "e1.log")
+    (t5 / "version.txt").write_text("v0.0.0\n", encoding="utf-8")
+    h = share_read_delete(t5 / "_internal/python313.dll")
+    try:
+        inst = run_installer(t5, tmp / "e2.log")
+    finally:
+        kernel32.CloseHandle(h)
+    new_hash = hashlib.sha256((t5 / "_internal/python313.dll").read_bytes()).hexdigest()
+    leftovers = [p.name for p in t5.rglob("*.setup-old*")]
+    log_text = (tmp / "e2.log").read_text(encoding="utf-8", errors="replace")
+    ok = (inst.done and not inst.error
+          and new_hash == hashlib.sha256(FILES["_internal/python313.dll"]).hexdigest()
+          and not leftovers
+          and "改名挪开" in log_text)
+    check(ok, "只读占用可绕过",
+          "error=%r 内容已更新=%s 残留=%r"
+          % (inst.error, new_hash == hashlib.sha256(
+              FILES["_internal/python313.dll"]).hexdigest(), leftovers))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\n%d 项检查，%d 项失败" % (4, fails))
+print("\n%d 项检查，%d 项失败" % (5, fails))
 sys.exit(1 if fails else 0)

@@ -66,6 +66,28 @@ FILE_TRIES = 3
 FILE_RETRY_DELAY = 0.15
 
 
+def _move_aside(dst):
+    """把一个"能改名但写不进去"的文件移到旁边（安装时用来绕过占用）
+
+    为什么需要它：v2.18.0 实测到一种情况 —— 某进程（杀软、游戏启动器扫盘之类）
+    以 FILE_SHARE_READ | FILE_SHARE_DELETE 打开着 dll：这时 `open(dst, 'r+b')`
+    直接 PermissionError，但**改名是允许的**。以前只认第一种信号，于是明明能装
+    却报「请先退出正在运行的 XX」，把人引到错误方向。
+
+    返回挪到哪儿了；挪不动（真被 image 映射 / 只读目录）返回 None。
+    """
+    for i in range(8):
+        side = dst + ".setup-old" if i == 0 else "%s.setup-old%d" % (dst, i)
+        if os.path.exists(side):
+            continue
+        try:
+            os.replace(dst, side)
+            return side
+        except OSError:
+            return None
+    return None
+
+
 def log(msg):
     line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
     try:
@@ -509,7 +531,7 @@ class Installer(object):
             raise InstallError("安装目录不可写：%s" % _why(e, self.target),
                                "目录：%s\n%s" % (self.target, _why(e, self.target)))
 
-        locked = []
+        locked, movable = [], []
         for item in items:
             if item.filename == "version.txt":
                 continue
@@ -519,13 +541,66 @@ class Installer(object):
             try:
                 with open(dst, "r+b"):
                     pass
+                continue
             except OSError as e:
-                locked.append((dst, _why(e, dst)))
+                why = _why(e, dst)
+            # 写不进去，再问一句：能不能改名挪开？
+            # 能挪 = 占用者只给了"读 + 删除"权限（杀软扫盘、云盘同步、预览窗口），
+            # 安装时先移走再写新文件即可，不该拦着用户去"退出程序"。
+            side = _move_aside(dst)
+            if side and os.path.isfile(side):
+                try:
+                    os.replace(side, dst)          # 立刻还原：体检阶段不动任何文件
+                    movable.append(dst)
+                    log("%s：不能直接覆盖，但可以改名挪开，安装时先移走再写"
+                        % os.path.basename(dst))
+                    continue
+                except OSError:
+                    pass
+            locked.append((dst, why))
+        if movable:
+            log("提示：%d 个文件被别的程序占着读，安装时会临时改名挪开" % len(movable))
         if locked:
             raise InstallError(
                 "请先退出正在运行的「%s」再装" % APP_NAME,
-                "被占用的文件：\n" + "\n".join("  %s  <- %s" % (p, w)
-                                              for p, w in locked[:12]))
+                "被占用的文件（改名也挪不开，说明进程正映射着它们）：\n"
+                + "\n".join("  %s  <- %s" % (p, w) for p, w in locked[:12]))
+
+    def _copy_one(self, z, item, dst):
+        """写一个文件；被"只读+允许删除"占着时先改名挪开再写
+
+        顺序：直接写 → 失败就挪开重写 → 还失败就按 FILE_TRIES 重试。
+        挪开的那份在写成功后立刻删掉，不留在安装目录里。
+        """
+        last = None
+        for attempt in range(FILE_TRIES):
+            try:
+                with z.open(item) as src, open(dst, "wb") as out:
+                    shutil.copyfileobj(src, out, 262144)
+                return
+            except OSError as e:
+                last = e
+                if attempt == 0 and os.path.isfile(dst):
+                    side = _move_aside(dst)
+                    if side:
+                        log("%s 写不进去（%s），改名挪开到 %s 再试"
+                            % (os.path.basename(dst), _why(e, dst),
+                               os.path.basename(side)))
+                        try:
+                            with z.open(item) as src, open(dst, "wb") as out:
+                                shutil.copyfileobj(src, out, 262144)
+                            try:
+                                os.remove(side)
+                            except OSError:
+                                log("挪开的旧文件删不掉：%s" % side)
+                            return
+                        except OSError as e2:
+                            last = e2
+                if attempt + 1 < FILE_TRIES:
+                    log("写入 %s 失败（%s），第 %d 次重试"
+                        % (os.path.basename(dst), _why(e, dst), attempt + 2))
+                    time.sleep(FILE_RETRY_DELAY * (attempt + 1))
+        raise last
 
     def _extract(self, z, items):
         """把 payload 铺到安装目录；单个文件失败会重试，最后才报错。"""
@@ -545,22 +620,11 @@ class Installer(object):
                 failures.append((dst, _why(e, dst)))
                 self.pct = (idx + 1) * 100.0 / total
                 continue
-            last = None
-            for attempt in range(FILE_TRIES):
-                try:
-                    with z.open(item) as src, open(dst, "wb") as out:
-                        shutil.copyfileobj(src, out, 262144)
-                    last = None
-                    break
-                except OSError as e:
-                    last = e
-                    if attempt + 1 < FILE_TRIES:
-                        log("写入 %s 失败（%s），第 %d 次重试"
-                            % (os.path.basename(dst), _why(e, dst), attempt + 2))
-                        time.sleep(FILE_RETRY_DELAY * (attempt + 1))
-            if last is not None:
-                failures.append((dst, _why(last, dst)))
-                log("写入失败：%s（%s）" % (dst, _why(last, dst)))
+            try:
+                self._copy_one(z, item, dst)
+            except OSError as e:
+                failures.append((dst, _why(e, dst)))
+                log("写入失败：%s（%s）" % (dst, _why(e, dst)))
             self.pct = (idx + 1) * 100.0 / total
         if failures:
             raise InstallError(
