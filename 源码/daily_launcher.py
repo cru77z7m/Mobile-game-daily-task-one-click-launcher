@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.17.9"
+APP_VERSION = "v2.18.0"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -381,6 +381,11 @@ def migrate_config(cfg, ver=None):
     if moved:
         notes.append("config.json 里不再保存 %s：版本号改存 launcher.state.json，"
                      "作者信息写死在程序里" % " / ".join(moved))
+    # v2.18：启动编排。默认关闭 = 保持"一趟跑完"的老行为，不打扰老用户。
+    if "pipeline" not in cfg:
+        cfg["pipeline"] = {"enabled": False, "assign": {}, "order": []}
+        notes.append("启动编排：默认关闭（所有勾选项一趟跑完）")
+
     return notes
 
 
@@ -2459,6 +2464,8 @@ def draw_icon(hdc, name, x, y, size):
     DrawIconEx。之前这里 `except: return False` 把异常整个吞掉，打包版里 17 个
     图标一起消失却查不出原因（PYZ 里明明有 PIL）—— 兜底和证据都要留。
     """
+    if not name:                       # 没有图标的行（分组标题/摘要行）不该把绘制整块带崩
+        return False
     px = max(8, int(round(size)))
     key = (name, px)
     surf = _PIL_ICON_CACHE.get(key)
@@ -3112,11 +3119,151 @@ class Runner:
         return pending
 
     # -- 主流程 -------------------------------------------------------------
+    # ---------- 启动编排：分轮 ----------
+    def item_label(self, key):
+        """给日志/状态栏用的人话名字"""
+        if key in ("maaend", "maa", "maafgo", "okww"):
+            return {"maaend": "MaaEnd", "maa": "MAA",
+                    "maafgo": "MaaFgo", "okww": "ok-ww"}[key]
+        if key.startswith("vm"):
+            return "实例" + key[2:]
+        if key.startswith("custom:"):
+            cid = key[7:]
+            for it in self.cfg.get("custom_items", []) or []:
+                if str(it.get("id")) == cid:
+                    return it.get("name") or "自定义"
+            return "自定义"
+        return key
+
+    def planned_rounds(self):
+        """把项目按 config.pipeline 分轮；没编排过返回 None（= 老行为：一趟跑完）
+
+        pipeline 结构：
+            {"enabled": true,
+             "assign": {"maaend": 1, "vm0": 2, "maa": 2, "maafgo": 2, "okww": 3},
+             "order":  ["maaend", "vm0", "maa", "maafgo", "okww"]}
+
+        轮号从 1 开始；不在 assign 里的项不参与分轮（这一趟不会被启动）。
+        轮内顺序由 order 决定，order 里没有的排在后面。
+        """
+        pl = self.cfg.get("pipeline") or {}
+        if not pl.get("enabled"):
+            return None
+        buckets = {}
+        for key, r in (pl.get("assign") or {}).items():
+            try:
+                r = int(r)
+            except Exception:
+                continue
+            if r > 0:
+                buckets.setdefault(r, []).append(key)
+        if not buckets:
+            return None
+        rank = {k: i for i, k in enumerate(pl.get("order") or [])}
+        return [sorted(buckets[r], key=lambda k: rank.get(k, 10 ** 6))
+                for r in sorted(buckets)]
+
     def run(self):
-        cfg = self.cfg
+        """入口：配了编排就一轮一轮跑，没配就照旧一趟跑完"""
         try:
             self.stop_flag = False
             self.emit("busy", True)
+            rounds = self.planned_rounds()
+            if not rounds:
+                self._one_pass(None)
+                return
+            total = len(rounds)
+            self.log("启动编排：共 %d 轮，一轮的任务真跑完了才开下一轮" % total)
+            for i, keys in enumerate(rounds, 1):
+                if self.stop_flag:
+                    break
+                names = "、".join(self.item_label(k) for k in keys)
+                self.log("—— 第 %d/%d 轮：%s ——" % (i, total, names))
+                self.emit("status", "第 %d/%d 轮 · 启动中…" % (i, total))
+                self._one_pass(set(keys), monitor=False)
+                if self.stop_flag:
+                    break
+                if i < total and not self._wait_round_done(set(keys), i, total):
+                    break
+            if not self.stop_flag:
+                self.log("—— 全部轮次已启动 ——")
+                if self.start_monitor():
+                    self.emit("status", "就绪 · 后台等任务完成")
+                else:
+                    self.emit("status", "就绪")
+        except Exception:
+            self.log("✗ 异常：\n" + traceback.format_exc())
+            self.emit("status", "出错了，看日志")
+        finally:
+            self.emit("busy", False)
+
+    def _wait_round_done(self, keys, i, total):
+        """等这一轮的任务真的跑完，再放行下一轮
+
+        判据和后台监视一致：MAA / MaaFgo / ok-ww 看日志里的完成标记。
+        MaaEnd 在 _one_pass 里已经同步等过（跑完才返回），MuMu 实例算"起来即完成"。
+        等不到就按 pipeline_round_timeout_hours 超时放行，免得整晚卡死在一轮上。
+        """
+        cfg = self.cfg
+        poll = max(5, int(cfg.get("monitor_poll", 20)))
+        limit = float(cfg.get("pipeline_round_timeout_hours", 4)) * 3600
+        need = [k for k in ("maa", "maafgo", "okww")
+                if k in keys and k in self.baseline]
+        if not need:
+            return True
+        self.log("第 %d 轮还在跑（%s），等它完成再开第 %d 轮"
+                 % (i, "、".join(self.item_label(k) for k in need), i + 1))
+        self.emit("status", "第 %d/%d 轮 · 等任务完成…" % (i, total))
+        done = {k: False for k in need}
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            if self.stop_flag:
+                return False
+            time.sleep(poll)
+            for k in need:
+                if done[k]:
+                    continue
+                if k == "maa":
+                    ts = scan_logs(maa_log_files(cfg), MAA_DONE_MARK,
+                                   self.baseline[k])
+                    if ts is None:
+                        ts = scan_logs(maa_core_log_files(cfg), MAACORE_DONE_MARK,
+                                       self.baseline[k])
+                    ok = bool(ts)
+                elif k == "maafgo":
+                    quiet = float(cfg.get("maafgo", {}).get("quiet", 60))
+                    hits = scan_logs_multi(maafgo_log_files(cfg),
+                                           (MXU_START_MARK, MXU_DONE_MARK),
+                                           self.baseline[k])
+                    st, ts = hits.get(MXU_START_MARK), hits.get(MXU_DONE_MARK)
+                    ok = bool(ts and (st is None or ts >= st)
+                              and time.time() - ts >= quiet)
+                else:
+                    ok = bool(scan_logs(okww_log_files(cfg), OKWW_DONE_MARK,
+                                        self.baseline[k]))
+                if ok:
+                    done[k] = True
+                    self.step(k, "ok", "任务已完成")
+                    self.log("✓ %s 任务已完成（第 %d 轮）"
+                             % (self.item_label(k), i))
+            if all(done.values()):
+                self.log("—— 第 %d/%d 轮完成 ——" % (i, total))
+                return True
+            self.emit("status", "第 %d/%d 轮 · 等 %s…"
+                      % (i, total, "、".join(self.item_label(k)
+                                             for k in need if not done[k])))
+        self.log("⚠ 第 %d 轮等了 %.0f 小时还没等到全部完成标记，先开下一轮"
+                 % (i, limit / 3600))
+        return True
+
+    def _one_pass(self, scope=None, monitor=True):
+        """跑一趟：把 scope 里的项目按固定顺序启动（None = 按勾选全跑）
+
+        分轮编排时由 run() 每轮调一次。这里**只负责启动**，不等任务跑完 ——
+        "这一轮什么时候算完"在 _wait_round_done() 里判定。
+        """
+        cfg = self.cfg
+        try:
 
             # 1) 先按 MuMu 里"实际存在"的实例对齐列表。
             #    新用户通常只建了 1 个实例，配置里却写着 0 和 1，
@@ -3157,7 +3304,9 @@ class Runner:
                     self.step(key, "idle", "本次跳过")
 
             def want(key, default=True):
-                """这一项这次要不要跑：勾了 + 在本次范围内 + 没被删 + 自检没否掉"""
+                """这一项这次要不要跑：属于本轮 + 勾了 + 在本次范围内 + 没被删 + 自检没否掉"""
+                if scope is not None and key not in scope:
+                    return False
                 if only is not None:
                     return key in only and key not in self.skip
                 if key in hidden:
@@ -3167,6 +3316,8 @@ class Runner:
 
             def vm_on(inst):
                 key = "vm%d" % int(inst["index"])
+                if scope is not None and key not in scope:
+                    return False
                 if only is not None:
                     return key in only and key not in self.skip
                 if key in hidden:
@@ -3335,7 +3486,7 @@ class Runner:
                 self.start_okww()
 
             # ---- 用户自己加的项目（未适配）：只负责把游戏和脚本打开 ----
-            self.start_custom_items(only, hidden)
+            self.start_custom_items(only, hidden, scope)
 
             # 实例就绪后按配置处理「MuMu模拟器」主窗口（隐藏 / 最小化 / 不动）
             if insts and len(left) < len(insts) and not self.stop_flag:
@@ -3345,16 +3496,17 @@ class Runner:
                 self.emit("status", "已取消")
                 self.log("已取消")
             else:
-                self.log("—— 全部完成 ——")
-                if self.start_monitor():
+                self.log("—— 本批启动完成 ——")
+                if monitor and self.start_monitor():
                     self.emit("status", "就绪 · 后台等任务完成")
+                elif not monitor:
+                    pass
                 else:
                     self.emit("status", "就绪")
         except Exception:
             self.log("✗ 异常：\n" + traceback.format_exc())
             self.emit("status", "出错了，看日志")
-        finally:
-            self.emit("busy", False)
+            self.stop_flag = True          # 出异常就别再往下跑下一轮了
 
     # -- MaaFgo（FGO）-------------------------------------------------------
     def emu_game_pid(self, idx, pkg, port=None):
@@ -3373,7 +3525,7 @@ class Runner:
                 return txt.splitlines()[0][:80]
         return ""
 
-    def start_custom_items(self, only=None, hidden=None):
+    def start_custom_items(self, only=None, hidden=None, scope=None):
         """用户自己加的项目：启动器只负责把游戏和脚本打开
 
         这些项目**没有适配**，所以：
@@ -3389,6 +3541,8 @@ class Runner:
             name = it.get("name") or "自定义"
             if key in hidden:
                 self.step(key, "idle", "已从主界面删除")
+                continue
+            if scope is not None and key not in scope:
                 continue
             if only is not None and key not in only:
                 self.step(key, "idle", "本次跳过")
@@ -4933,7 +5087,8 @@ class App(VisualShell):
         # 三个子页面统一行高，各分组内部密度才一致（之前 ①组 38、②③组 32，看着参差）。
         row_h = {"settings": 42, "custom": 42, "night": 42, "tasks": 42}.get(self.page, 58)
         self.row_h_logical = row_h
-        self.sub_page = self.page in ("settings", "custom", "night", "about", "tasks")
+        self.sub_page = self.page in ("settings", "custom", "night", "about", "tasks",
+                                      "pipeline")
         items = self.current_rows()
         b_h = 46
 
@@ -5093,6 +5248,8 @@ class App(VisualShell):
             return self.task_rows()
         if self.page == "settings":
             return self.settings_rows()
+        if self.page == "pipeline":
+            return self.pipeline_rows()
         return self.instance_rows()
 
     # ---------- 关于页 ----------
@@ -5440,6 +5597,85 @@ class App(VisualShell):
                     "MaaFgo「默认设置」+ 自动开始 · ok-ww 每日任务")
         self.status = "安排自动任务已恢复默认"
 
+    # ---------- 启动编排页 ----------
+    PIPELINE_MAX_ROUNDS = 4
+
+    def pipeline_items(self):
+        """参与编排的项目：主界面里能看到的那些（不含分组标题）"""
+        return [it for it in self.instance_rows()
+                if not str(it.get("key", "")).startswith("sec:")
+                and not str(it.get("key", "")).startswith("custom_add")]
+
+    def default_pipeline(self):
+        """第一次开启编排时给个贴合现状的默认：终末地 / 模拟器那一批 / 鸣潮"""
+        assign = {}
+        for it in self.pipeline_items():
+            k = it["key"]
+            if k == "maaend":
+                assign[k] = 1
+            elif k == "okww":
+                assign[k] = 3
+            else:
+                assign[k] = 2
+        return assign
+
+    def pipeline_rows(self):
+        """每个项目一行，点右侧按钮循环切换「第几轮」"""
+        cfg = self.cfg
+        pl = cfg.get("pipeline") or {}
+        assign = pl.get("assign") or {}
+        out = [{
+            "key": "sec:pipe",
+            "h": 22,
+            "title": "启动编排",
+            "sub": "轮号小的先跑；一轮的任务真跑完了才开下一轮",
+        }, {
+            "key": "pl_enabled",
+            "icon": "ui_tasks",
+            "h": 42,
+            "title": "分轮执行",
+            "sub": "开启后按下面的轮次一轮一轮跑；关闭则所有勾选项一趟跑完（原行为）",
+            "chip": "已开启" if pl.get("enabled") else "已关闭",
+        }, {
+            "key": "sec:assign",
+            "h": 22,
+            "title": "每项属于第几轮",
+            "sub": "点右侧按钮切换：不参与 → 第1轮 → 第2轮 … → 第%d轮 → 不参与"
+                   % self.PIPELINE_MAX_ROUNDS,
+        }]
+        for it in self.pipeline_items():
+            k = it["key"]
+            try:
+                r = int(assign.get(k, 0) or 0)
+            except Exception:
+                r = 0
+            out.append({
+                "key": "pl:" + k,
+                "icon": it.get("icon"),
+                "h": 42,
+                "title": it.get("title") or k,
+                "sub": ("第 %d 轮" % r) if r > 0 else "不参与编排（这一趟不会启动）",
+                "chip": ("第 %d 轮" % r) if r > 0 else "未编排",
+            })
+        # 轮次摘要
+        for r in range(1, self.PIPELINE_MAX_ROUNDS + 1):
+            names = [self.runner.item_label(k) for k, v in assign.items()
+                     if str(v) == str(r)]
+            if names:
+                out.append({
+                    "key": "pl_sum:%d" % r,
+                    "icon": "ui_tasks",
+                    "h": 30,
+                    "title": "第 %d 轮：%s" % (r, " → ".join(names)),
+                    "sub": "",
+                })
+        out.append({
+            "key": "pl_hint", "icon": "ui_info", "h": 30,
+            "title": "同一轮里按依赖顺序启动（实例先起，再 MAA / MaaFgo）；轮与轮之间严格串行。",
+            "sub": "",
+        })
+        return out
+
     def settings_rows(self):
         """设置页：路径、连接与版本、软件更新、界面偏好；模块入口统一在侧栏
 
@@ -5509,7 +5745,21 @@ class App(VisualShell):
             "chip": label,
         })
 
-        out.append({"key": "sec:update", "h": 22, "title": "③ 软件更新", "sub": ""})
+        pl = cfg.get("pipeline") or {}
+        nround = max(pl.get("assign", {}).values() or [0]) if pl.get("assign") else 0
+        out.append({"key": "sec:pipe", "h": 22, "title": "③ 启动编排",
+                    "sub": "把项目分成几轮，一轮跑完再开下一轮（如先终末地、再模拟器、最后鸣潮）"})
+        out.append({
+            "key": "pipeline",
+            "icon": "ui_tasks",
+            "h": 42,
+            "title": "启动顺序与轮次",
+            "sub": ("已启用 · 共 %d 轮" % nround) if (pl.get("enabled") and nround)
+                   else "未启用（所有勾选项一趟跑完）",
+            "chip": "第 %d 轮" % nround if (pl.get("enabled") and nround) else "未编排",
+        })
+
+        out.append({"key": "sec:update", "h": 22, "title": "④ 软件更新", "sub": ""})
         u_sub, u_chip = self.upd_text()
         out.append({
             "key": "update",
@@ -5521,7 +5771,7 @@ class App(VisualShell):
         })
 
         out.extend([
-            {"key": "sec:appearance", "h": 22, "title": "④ 界面与动效", "sub": ""},
+            {"key": "sec:appearance", "h": 22, "title": "⑤ 界面与动效", "sub": ""},
             {"key": "ui_material", "icon": "ui_sparkle", "title": "窗口背景材质",
              "sub": "Mica / Tabbed（Mica Alt）/ 亚克力 / 实色 · 不支持时自动回退",
              "chip": self.material_name()},
@@ -5907,10 +6157,28 @@ class App(VisualShell):
             # 顺序说明：和卡片上的序号角标呼应，省得用户自己数
             _n = len(R.get("rows") or [])
             if _n > 1:
-                self.text(mem, "按序号依次执行  1 → %d" % _n,
-                          (self.S(288), self.S(186), self.S(600), self.S(209)),
+                _hint = "按序号依次执行  1 → %d" % _n
+                try:
+                    _rounds = self.runner.planned_rounds()
+                except Exception:
+                    _rounds = None
+                if _rounds:
+                    _idx = {it["key"]: i + 1 for i, (it, _, _) in
+                            enumerate(R.get("rows") or [])}
+                    _segs = []
+                    for _r in _rounds:
+                        _ns = sorted(_idx[k] for k in _r if k in _idx)
+                        if _ns:
+                            _segs.append(str(_ns[0]) if len(_ns) == 1
+                                         else "%d-%d" % (_ns[0], _ns[-1]))
+                    if _segs:
+                        _hint = "分 %d 轮执行 · %s（每轮跑完再开下一轮）" % (
+                            len(_rounds), " / ".join(_segs))
+                self.text(mem, _hint,
+                          (self.S(288), self.S(186), self.S(720), self.S(209)),
                           C["muted"], self.font(9.5),
-                          DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
+                          DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS
+                          | DT_NOPREFIX)
         if self.page != "main":
             cr = R["card"]
             self.fill_round(mem, (cr[0], cr[1] + self.S(3), cr[2], cr[3] + self.S(3)),
@@ -7124,6 +7392,58 @@ class App(VisualShell):
         user32.InvalidateRect(self.hwnd, None, False)
 
     def do(self, key):
+        if key.startswith("pl_sum:"):
+            return
+        if key == "pipeline":
+            if self.busy:
+                return
+            self.page_stack.append("settings")
+            self.page = "pipeline"
+            self.status = "启动编排：点右侧按钮给每个项目选轮次"
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if key == "pl_enabled":
+            if self.busy:
+                return
+            pl = self.cfg.setdefault("pipeline", {})
+            pl["enabled"] = not bool(pl.get("enabled"))
+            if pl["enabled"] and not pl.get("assign"):
+                pl["assign"] = self.default_pipeline()
+                pl["order"] = [it["key"] for it in self.pipeline_items()]
+                self.ui_log("启动编排已开启，先按「终末地 / 模拟器 / 鸣潮」分成 3 轮，"
+                            "下面的轮次可以逐项改")
+            else:
+                self.ui_log("分轮执行 → %s" % ("开" if pl["enabled"] else "关"))
+            save_config(self.cfg)
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if key.startswith("pl:"):
+            if self.busy:
+                return
+            raw = key[3:]
+            if raw.startswith("sum_"):
+                return
+            pl = self.cfg.setdefault("pipeline", {})
+            assign = pl.setdefault("assign", {})
+            if not pl.get("enabled"):
+                pl["enabled"] = True
+            try:
+                cur = int(assign.get(raw, 0) or 0)
+            except Exception:
+                cur = 0
+            nxt = 0 if cur >= self.PIPELINE_MAX_ROUNDS else cur + 1
+            if nxt:
+                assign[raw] = nxt
+            else:
+                assign.pop(raw, None)
+            order = pl.setdefault("order", [])
+            if raw not in order:
+                order.append(raw)
+            save_config(self.cfg)
+            label = self.runner.item_label(raw)
+            self.ui_log("%s → %s" % (label, ("第 %d 轮" % nxt) if nxt else "不参与编排"))
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
         if key.startswith("nav:"):
             target = key[4:]
             if target in {row[0] for row in self.NAV} and target != self.page and not self.busy:
@@ -7811,6 +8131,9 @@ def main():
                 app.page_stack.append("settings")
             elif _pg.startswith("abo"):
                 app.page = "about"             # 自检时截「关于」页
+                app.page_stack.append("settings")
+            elif _pg.startswith("pip"):
+                app.page = "pipeline"          # 自检时截「启动编排」页
                 app.page_stack.append("settings")
     if shot and "--scroll" in args:
         # 自检用：把子页面滚到指定位置再截图（看裁剪和滚动条对不对）

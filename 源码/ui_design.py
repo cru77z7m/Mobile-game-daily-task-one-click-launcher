@@ -218,6 +218,24 @@ class VisualShell:
     def setting_button(self,item):
         """Separate the observed state from the exact action on activation."""
         key=item['key'];chip=item.get('chip','');cfg=self.cfg
+        if key.startswith('pl_sum:') or key in ('pl_hint',):
+            return '','',False
+        if key=='pipeline':
+            pl=cfg.get('pipeline') or {}
+            n=max(list((pl.get('assign') or {}).values())+[0])
+            on=bool(pl.get('enabled')) and n>0
+            return '当前：'+('已启用 · %d 轮'%n if on else '未启用'),'进入设置',True
+        if key=='pl_enabled':
+            on=bool((cfg.get('pipeline') or {}).get('enabled'))
+            return '当前：'+('已开启' if on else '已关闭'),'点击'+('关闭' if on else '开启'),True
+        if key.startswith('pl:'):
+            raw=key[3:]
+            if raw.startswith('sum_') or raw=='hint':
+                return '','',False
+            r=int((cfg.get('pipeline') or {}).get('assign',{}).get(raw,0) or 0)
+            nxt=0 if r>=4 else r+1
+            return ('当前：'+('第 %d 轮'%r if r else '不参与')), \
+                   ('改为 '+(('第 %d 轮'%nxt) if nxt else '不参与')), True
         if key in ('t_hint','n_hint'):
             return '功能说明','',False
         if key in ('ui_motion','ui_mica') or key.startswith('t_flag:'):
@@ -310,10 +328,13 @@ class VisualShell:
         self.text(dc, '本地任务工作台', (S(43), h-S(76), S(174), h-S(49)), C['text2'], self.font(10))
         self.text(dc, a.APP_VERSION, (S(26), h-S(48), S(174), h-S(27)), C['muted'], self.font(10))
         title = dict((p, title) for p, _, title in self.NAV).get(self.page, '日常控制台')
+        if self.page == 'pipeline':
+            title = '启动编排'
         subtitle = {'main': '选好任务，把重复的日常交给自动化。',
                     'settings': '管理程序路径、模拟器连接与界面偏好。',
                     'tasks': '为每个项目安排合适的自动任务。', 'night': '只运行今晚需要处理的手游日常。',
-                    'custom': '整理常用项目，让控制台保持简洁。', 'about': '版本信息、作者与项目主页。'}[self.page]
+                    'custom': '整理常用项目，让控制台保持简洁。', 'about': '版本信息、作者与项目主页。',
+                    'pipeline': '把项目分成几轮，一轮真的跑完再开下一轮。'}.get(self.page, '')
         self.text(dc, title, self.rects['title'], C['text'], self.font(24, True))
         self.text(dc, subtitle, self.rects['sub'], C['text2'], self.font(11.5))
 
