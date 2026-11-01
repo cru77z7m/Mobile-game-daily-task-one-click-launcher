@@ -132,11 +132,13 @@ try:
     keys=[it['key'] for it,_,_ in ui.rects.get('rows',[])]
     assert 'pipeline' not in keys, '设置页里不该再有启动编排入口（已合并到安排自动任务）'
 
+    ui.task_view='rounds'
+    ui.cfg.setdefault('pipeline',{})['enabled']=False
     ui.page='tasks'
     ui.finish_transition()
     paint()                      # _scroll_max 要画一次才更新
-    ui.scroll=ui._scroll_max
-    ui.finish_transition()       # 滚动不改动画状态，但保持一致
+    ui.scroll=0
+    ui.finish_transition()       # 分轮开关固定在内容顶部
     paint()
 
     def click_row(key):

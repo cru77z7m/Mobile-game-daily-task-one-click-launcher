@@ -4,7 +4,10 @@ import time
 from ui_render import Surface, Compositor, gdi
 
 
-class VisualShell:
+from ui_tasks import TaskPlanner
+
+
+class VisualShell(TaskPlanner):
     def api(self):
         return sys.modules[type(self).__module__]
 
@@ -228,9 +231,7 @@ class VisualShell:
             if raw.startswith('sum_') or raw=='hint':
                 return '','',False
             r=int((cfg.get('pipeline') or {}).get('assign',{}).get(raw,0) or 0)
-            nxt=0 if r>=4 else r+1
-            return ('当前：'+('第 %d 轮'%r if r else '不参与')), \
-                   ('改为 '+(('第 %d 轮'%nxt) if nxt else '不参与')), True
+            return '当前：'+('第 %d 轮'%r if r else '不参与'),'选择轮次 ▾',True
         if key in ('t_hint','n_hint'):
             return '功能说明','',False
         if key in ('ui_motion','ui_mica') or key.startswith('t_flag:'):
@@ -325,7 +326,7 @@ class VisualShell:
         title = dict((p, title) for p, _, title in self.NAV).get(self.page, '日常控制台')
         subtitle = {'main': '选好任务，把重复的日常交给自动化。',
                     'settings': '管理程序路径、模拟器连接与界面偏好。',
-                    'tasks': '每个项目启动后自动跑什么；以及分几轮、按什么顺序跑。', 'night': '只运行今晚需要处理的手游日常。',
+                    'tasks': '先设置脚本启动行为，再安排各项目的执行轮次。', 'night': '只运行今晚需要处理的手游日常。',
                     'custom': '整理常用项目，让控制台保持简洁。', 'about': '版本信息、作者与项目主页。'}.get(self.page, '')
         self.text(dc, title, self.rects['title'], C['text'], self.font(24, True))
         self.text(dc, subtitle, self.rects['sub'], C['text2'], self.font(11.5))

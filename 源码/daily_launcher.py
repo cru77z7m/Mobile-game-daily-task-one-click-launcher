@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.18.3"
+APP_VERSION = "v2.18.5"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -3158,7 +3158,7 @@ class Runner:
             if r > 0:
                 buckets.setdefault(r, []).append(key)
         if not buckets:
-            return None
+            return []
         rank = {k: i for i, k in enumerate(pl.get("order") or [])}
         return [sorted(buckets[r], key=lambda k: rank.get(k, 10 ** 6))
                 for r in sorted(buckets)]
@@ -3169,8 +3169,12 @@ class Runner:
             self.stop_flag = False
             self.emit("busy", True)
             rounds = self.planned_rounds()
-            if not rounds:
+            if rounds is None:
                 self._one_pass(None)
+                return
+            if not rounds:
+                self.log("分轮执行已开启，但没有分配项目：本次不启动任何项目")
+                self.emit("status", "没有已编排项目，本次不启动")
                 return
             total = len(rounds)
             self.log("启动编排：共 %d 轮，一轮的任务真跑完了才开下一轮" % total)
@@ -5236,6 +5240,9 @@ class App(VisualShell):
                 R["tiles"][it["key"]]=(xx,yy,xx+tilew,yy+hh)
 
 
+        if self.page == "tasks":
+            self.layout_task_page(W, H)
+
     def current_rows(self):
         if self.page == "about":
             return []                   # 关于页是自绘整块，不用行列表
@@ -5536,7 +5543,7 @@ class App(VisualShell):
         out.append({
             "key": "t_reset",
             "icon": "ui_update",
-            "title": "恢复全部默认",
+            "title": "恢复脚本默认",
             "sub": "MaaEnd「全套日常」+ 自动开始 · MAA 自动运行 · ok-ww 每日任务",
             "chip": "恢复",
         })
@@ -6168,14 +6175,16 @@ class App(VisualShell):
                           C["muted"], self.font(9.5),
                           DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS
                           | DT_NOPREFIX)
-        if self.page != "main":
+        if self.page not in ("main", "tasks"):
             cr = R["card"]
             self.fill_round(mem, (cr[0], cr[1] + self.S(3), cr[2], cr[3] + self.S(3)),
                             14, rgb("#E6E9F4"))
             self.fill_round(mem, cr, 14, C["card"], C["border"])
             self.fill_round(mem, (cr[0] + self.S(20), cr[1], cr[0] + self.S(64), cr[1] + self.S(3)),
                             1.5, C["accent"])
-        if self.page == "about":
+        if self.page == "tasks":
+            self.draw_task_page(mem)
+        elif self.page == "about":
             clip=gdi32.SaveDC(mem)
             card=R["card"]
             gdi32.IntersectClipRect(mem,card[0],card[1]+self.S(6),card[2],card[3]-self.S(4))
@@ -6697,6 +6706,8 @@ class App(VisualShell):
                     if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
                         return "chk:"+key
             return None
+        if self.page == "tasks":
+            return self.task_page_hit(x,y)
         # 行列表只算卡片可视区里那部分（滚动后上半截可能被挡住了）
         card = R.get("card")
         if card and not (card[0] <= x <= card[2] and card[1] <= y <= card[3]):
@@ -7388,6 +7399,16 @@ class App(VisualShell):
         user32.InvalidateRect(self.hwnd, None, False)
 
     def do(self, key):
+        if key.startswith("task_view:"):
+            view = key.split(":",1)[1]
+            if view in ("scripts", "rounds") and not self.busy:
+                self.task_view = view
+                self.scroll = 0
+                self._hover_patch = None
+                self.finish_transition()
+                self.hover = self.pressed = None
+                user32.InvalidateRect(self.hwnd, None, False)
+            return
         if key.startswith("pl_sum:"):
             return
         if key == "pl_enabled":
@@ -7406,31 +7427,8 @@ class App(VisualShell):
             user32.InvalidateRect(self.hwnd, None, False)
             return
         if key.startswith("pl:"):
-            if self.busy:
-                return
-            raw = key[3:]
-            if raw.startswith("sum_"):
-                return
-            pl = self.cfg.setdefault("pipeline", {})
-            assign = pl.setdefault("assign", {})
-            if not pl.get("enabled"):
-                pl["enabled"] = True
-            try:
-                cur = int(assign.get(raw, 0) or 0)
-            except Exception:
-                cur = 0
-            nxt = 0 if cur >= self.PIPELINE_MAX_ROUNDS else cur + 1
-            if nxt:
-                assign[raw] = nxt
-            else:
-                assign.pop(raw, None)
-            order = pl.setdefault("order", [])
-            if raw not in order:
-                order.append(raw)
-            save_config(self.cfg)
-            label = self.runner.item_label(raw)
-            self.ui_log("%s → %s" % (label, ("第 %d 轮" % nxt) if nxt else "不参与编排"))
-            user32.InvalidateRect(self.hwnd, None, False)
+            if not self.busy:
+                self.choose_pipeline_round(key[3:])
             return
         if key.startswith("nav:"):
             target = key[4:]
