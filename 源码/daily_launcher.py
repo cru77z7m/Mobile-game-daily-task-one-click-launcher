@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.18.5"
+APP_VERSION = "v2.18.6"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -146,7 +146,7 @@ DEBUG_TIMING = bool(os.environ.get("DL_TIMING"))
 # 配置结构版本：升级 exe 时靠它判断要不要跑迁移。
 # 只做"加字段/改语义"的小步升级，每次 bump 都要在 migrate_config() 里补一段。
 # 这个值存在 launcher.state.json 里，**不写进 config.json**（用户不该动它）。
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4                # v2.18.6：任务失败判定写进配置
 
 # ---- 自动更新 ----
 # 只查 Releases API 的 latest，不要 token（公开仓库匿名够用，60 次/小时/ip）。
@@ -209,6 +209,9 @@ DEFAULT_CONFIG = {
         "timeout": 7200,              # 等任务完成的总上限（秒）· 实测全套日常约 85 分钟
         "game_close_timeout": 300,    # 任务完成后等游戏退出的上限（秒）
         "start_next_if_timeout": True,
+        "check_failures": True,       # 本轮出现 task failure 就算失败（tasks-completed 不代表成功）
+        "min_run_seconds": 300,       # 短于这个时长也当失败：起来就崩的任务链只跑几十秒
+        "stop_on_failure": True,      # 判定失败就停下，不开后面的轮次（现场留着给人看）
     },
     # MaaFgo（FGO 助手，取代原来的独立 BBchannel）：
     # 实例 1 就绪 → 没开游戏就先用 MuMu 打开 → 等游戏进程起来 → 再带 --autostart 启动它
@@ -222,6 +225,9 @@ DEFAULT_CONFIG = {
         "game_package": "com.bilibili.fatego",
         "launch_game": True,           # 游戏没开就用 MuMu 自己打开
         "game_wait": 240,              # 等游戏进程起来的上限（秒）
+        "check_failures": True,        # 同上：MXU 壳的 tasks-completed 不等于成功
+        "min_run_seconds": 180,
+        "stop_on_failure": True,
         "settle": 10,                  # 起来后再等几秒过启动画面
         "sync_device_address": True,   # 把 MaaFgo 里记的 adb 地址改成实际端口
     },
@@ -381,6 +387,23 @@ def migrate_config(cfg, ver=None):
     if moved:
         notes.append("config.json 里不再保存 %s：版本号改存 launcher.state.json，"
                      "作者信息写死在程序里" % " / ".join(moved))
+    # v4（v2.18.6）：「跑完了」不再等于「跑成了」。这几个键在 DEFAULT_CONFIG 里有默认值，
+    # 但老 config.json 里没有 —— 补进来，用户翻配置时能看见、能自己调。
+    # 用版本号而不是"键是否存在"来判断：load_config 已经把 DEFAULT_CONFIG 合并进来了，
+    # 看 cfg 永远"存在"，判不出来。
+    if ver < 4:
+        for _sec, _extra in (("maaend", {}), ("maafgo", {"min_run_seconds": 180})):
+            _d = cfg.get(_sec)
+            if not isinstance(_d, dict):
+                continue
+            _vals = {"check_failures": True, "min_run_seconds": 300,
+                     "stop_on_failure": True}
+            _vals.update(_extra)
+            for _k, _v in _vals.items():
+                _d.setdefault(_k, _v)
+        notes.append("任务失败判定已开启：MaaEnd / MaaFgo 本轮有 task failure 就算失败并停下"
+                     "（maaend.stop_on_failure=false 可关掉）")
+
     # v2.18：启动编排。默认关闭 = 保持"一趟跑完"的老行为，不打扰老用户。
     if "pipeline" not in cfg:
         cfg["pipeline"] = {"enabled": False, "assign": {}, "order": []}
@@ -1534,6 +1557,106 @@ def maaend_scan(files, bytes_each=1048576):
                 last_start = ts
                 note = line.split("]")[-1].strip()[:60]
     return last_start, last_done, note
+
+
+MAAEND_MARK_FAIL = "task failure"        # MXU 壳的 telemetry 行：某个 task 失败
+MXU_TAURI_RE = re.compile(r"^mxu-tauri.*\.log$")
+MXU_TAURI_TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2})\]\[(\d{2}:\d{2}:\d{2})\]")
+
+
+def mxu_tauri_files(root, sub="debug"):
+    """MXU 壳（MaaEnd / MaaFgo）的 tauri 日志，含按大小轮转出来的归档
+
+    mxu-tauri.log 只按大小轮转（实测到 1MB 就改名成 mxu-tauri_2026-11-02_10-42-28.log），
+    一轮任务里可能被切好几次 —— 失败计数必须把归档一起算，否则只看当前文件会漏掉
+    前半程的失败。
+    """
+    d = os.path.join(root, sub)
+    if not os.path.isdir(d):
+        return []
+    files = [os.path.join(d, f) for f in os.listdir(d) if MXU_TAURI_RE.match(f)]
+    files.sort(key=lambda p: os.path.getmtime(p))
+    return files
+
+
+def mxu_fail_scan(root, sub="debug", since=None, bytes_each=1048576):
+    """数 since（含）之后出现过多少次 task failure
+
+    只看这些日志每个文件末尾 1MB：轮转文件本身约 1MB，够用；
+    当前文件在长任务里可能十几 MB，但失败一定发生在近期，尾巴够覆盖。
+    返回 (次数, 首次时间, 最后时间, 失败任务名列表)
+    """
+    n = 0
+    first = last = None
+    tasks = []
+    for path in mxu_tauri_files(root, sub)[-3:]:
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                f.seek(max(0, size - bytes_each))
+                tail = f.read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        for line in tail.splitlines():
+            if MAAEND_MARK_FAIL not in line:
+                continue
+            m = MXU_TAURI_TS_RE.match(line)
+            if not m:
+                continue
+            ts = "%s %s" % (m.group(1), m.group(2))
+            if since and ts < since:
+                continue
+            n += 1
+            if first is None:
+                first = ts
+            last = ts
+            t = re.search(r"\btask=(\S+)", line)
+            if t and t.group(1) not in tasks:
+                tasks.append(t.group(1))
+    return n, first, last, tasks
+
+
+def mxu_run_verdict(root, sub, start_ts, done_ts, min_seconds=0, check_fail=True,
+                    since_ts=None):
+    """判断这一轮 MXU 任务（MaaEnd / MaaFgo）算成功还是失败
+
+    **关键：「tasks-completed」只说明任务链跑完了，失败也会发这个标记** ——
+    某个 task 失败后 MaaEnd 会自己 stop_agent，同一秒写出 tasks-completed
+    （2026-11-02 实测：09:29~09:36 连续 12 个 task failure，09:36:47 stop_agent
+    并写 tasks-completed，启动器据此判定"任务已完成"）。所以还要再问两句：
+
+      1) 本轮期间（start_ts 之后）有没有 task failure
+      2) 总耗时够不够长（跑 3 分钟就"完成"肯定是崩了，而不是干完了）
+
+    返回 (ok, reasons, info)。reasons 是给人看的中文句子，info 里带原始数据。
+    """
+    reasons = []
+    info = {"fails": 0, "tasks": [], "seconds": None,
+            "first_fail": None, "last_fail": None}
+    if start_ts and done_ts:
+        try:
+            a = time.mktime(time.strptime(start_ts, "%Y-%m-%d %H:%M:%S"))
+            b = time.mktime(time.strptime(done_ts, "%Y-%m-%d %H:%M:%S"))
+            secs = int(b - a)
+            if 0 <= secs < 86400:
+                info["seconds"] = secs
+        except (ValueError, OverflowError):
+            pass
+    if check_fail:
+        since = since_ts or start_ts
+        n, first, last, tasks = mxu_fail_scan(root, sub, since=since)
+        info.update(fails=n, tasks=tasks, first_fail=first, last_fail=last)
+        if n:
+            head = "、".join(tasks[:4])
+            if len(tasks) > 4:
+                head += " 等"
+            reasons.append("本轮有 %d 个任务失败（%s）"
+                           % (n, head or "日志里没记任务名"))
+    if min_seconds and info["seconds"] is not None and info["seconds"] < min_seconds:
+        reasons.append("只跑了 %d 分 %d 秒，低于下限 %d 分（多半是起来就崩了）"
+                       % (info["seconds"] // 60, info["seconds"] % 60,
+                          int(min_seconds // 60)))
+    return (not reasons), reasons, info
 
 
 def find_windows_by(class_regex=None, title_regex=None, min_w=0, min_h=0):
@@ -2831,6 +2954,11 @@ class Runner:
         self.monitor_on = False   # 后台完成监视是否已启动
         self.skip = set()         # 自检认为"这次跑不了"的项（vm0/maa/maafgo/maaend/okww）
         self.only = None          # 本次只跑这些项（开机点「是」时由 App 设置）
+        # 任务侧判定为失败（不是用户取消）。失败和取消必须分开：
+        # 取消是"我不想跑了"，失败是"跑了但没成"—— 后者要停下并叫人来看，
+        # 而不是默默开下一轮把别的游戏也拉起来。
+        self.failed = False
+        self.fail_reason = ""
 
     def cancel(self):
         if not self.stop_flag:
@@ -2918,6 +3046,10 @@ class Runner:
         self.log("监视 MaaEnd 日志：%s" % os.path.join(root, logdir))
 
         done_ts = None
+        # 整轮里有没有真的见到终末地窗口。任务链末项 CloseGamePC 会把游戏关掉，
+        # 等我们去看的时候窗口早就没了 —— 以前一律报"可能是这轮没开游戏"，
+        # 把"游戏跑过又被关掉"说成了"压根没开"，出错时非常误导。
+        ever_seen = maaend_game_running(self.cfg)
         while time.time() - t0 < total:
             if self.stop_flag:
                 self.step("maaend", "idle", "已取消")
@@ -2934,6 +3066,8 @@ class Runner:
                     el = int(time.time() - t0)
                     self.step("maaend", "run", "已跑 %d 分 %02d 秒"
                               % (el // 60, el % 60))
+            if not ever_seen and maaend_game_running(self.cfg):
+                ever_seen = True
             time.sleep(5.0)
 
         if not done_ts:
@@ -2943,6 +3077,40 @@ class Runner:
             if not m.get("start_next_if_timeout", True):
                 return False
             self.log("  按配置继续启动后面的 MuMu / MAA / MaaFgo")
+            return True
+
+        # ⚠ 「tasks-completed」只代表任务链跑完了 —— 失败的 task 也会发这个标记
+        #   （失败后 MaaEnd 自己 stop_agent，同一秒写出 tasks-completed）。
+        #   所以再问两句：本轮有没有 task failure、整体耗时够不够。
+        floor_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0 - 120))
+        ok, reasons, info = mxu_run_verdict(
+            root, logdir, last_start, done_ts,
+            int(m.get("min_run_seconds", 300)),
+            bool(m.get("check_failures", True)),
+            since_ts=max(last_start or "", floor_ts))
+        secs = info.get("seconds")
+        fails = info.get("fails") or 0
+        if secs is not None:
+            self.log("MaaEnd 任务链结束：耗时 %d 分 %d 秒，失败 %d 个任务%s"
+                     % (secs // 60, secs % 60, fails,
+                        ("（%s）" % "、".join(info["tasks"][:4]))
+                        if info.get("tasks") else ""))
+        else:
+            self.log("MaaEnd 任务链结束（%s），失败 %d 个任务" % (done_ts, fails))
+
+        if not ok:
+            for r in reasons:
+                self.log("✗ " + r)
+            self.step("maaend", "err", "任务有失败")
+            self.log("  游戏留在现场不动它，先看一眼卡在哪（MaaEnd 的 debug\\on_error 里有截图）")
+            if bool(m.get("stop_on_failure", True)):
+                self.failed = True      # failed 只在这条路径上置位，别让配置关掉的也停
+                self.fail_reason = "MaaEnd " + "；".join(reasons)
+                self.emit("status", "MaaEnd 任务失败")
+                self.log("—— 「失败即停」：本轮到此为止，后面的轮次不会开始 ——")
+                return False
+            self.log("提示：maaend.stop_on_failure=false，仍继续启动后面的流程")
+            self.emit("status", "MaaEnd 任务有失败，继续")
             return True
 
         self.log("MaaEnd 任务已完成（%s）" % done_ts)
@@ -2964,11 +3132,12 @@ class Runner:
                 self.step("maaend", "ok", "任务完成 · 等游戏退出 %ds" % el)
                 time.sleep(3.0)
                 continue
-            if seen:
+            if seen or ever_seen:
                 self.log("终末地已关闭，可以开始启动模拟器了")
                 return True
-            if time.time() - gt0 > 45:      # 一直没见着游戏窗口，多半压根没开
-                self.log("提示：没检测到终末地窗口（可能是这轮没开游戏），继续下一步")
+            if time.time() - gt0 > 45:      # 整轮都没见着游戏窗口
+                self.log("提示：这一轮始终没见到终末地窗口 —— MaaEnd 没把游戏拉起来，"
+                         "或者起来就被关掉了，继续下一步")
                 return True
             time.sleep(3.0)
         self.log("⚠ 等了 %d 秒终末地还没关，先继续后面的流程" % game_wait)
@@ -3167,6 +3336,8 @@ class Runner:
         """入口：配了编排就一轮一轮跑，没配就照旧一趟跑完"""
         try:
             self.stop_flag = False
+            self.failed = False
+            self.fail_reason = ""
             self.emit("busy", True)
             rounds = self.planned_rounds()
             if rounds is None:
@@ -3185,10 +3356,16 @@ class Runner:
                 self.log("—— 第 %d/%d 轮：%s ——" % (i, total, names))
                 self.emit("status", "第 %d/%d 轮 · 启动中…" % (i, total))
                 self._one_pass(set(keys), monitor=False)
-                if self.stop_flag:
+                if self.stop_flag or self.failed:
                     break
                 if i < total and not self._wait_round_done(set(keys), i, total):
                     break
+            if self.failed:
+                # 失败时绝不静默往下走：把原因摊在状态栏和日志里，等人处理
+                self.log("✗ 已暂停：%s" % (self.fail_reason or "任务失败"))
+                self.log("  后面的轮次没有启动。看一眼现场、修好后重新点「开始」")
+                self.emit("status", "任务失败，已暂停后续轮次")
+                return
             if not self.stop_flag:
                 self.log("—— 全部轮次已启动 ——")
                 if self.start_monitor():
@@ -3242,6 +3419,29 @@ class Runner:
                     st, ts = hits.get(MXU_START_MARK), hits.get(MXU_DONE_MARK)
                     ok = bool(ts and (st is None or ts >= st)
                               and time.time() - ts >= quiet)
+                    if ok:
+                        # MaaFgo 也是 MXU 壳，tasks-completed 同样会在失败后发出来
+                        mg = cfg.get("maafgo", {})
+                        mroot = os.path.dirname(mg.get("path", "") or ".")
+                        floor = time.strftime(
+                            "%Y-%m-%d %H:%M:%S",
+                            time.localtime(float(self.baseline[k]) - 120))
+                        vok, vreasons, _vi = mxu_run_verdict(
+                            mroot, mg.get("log_dir", "debug"), st, ts,
+                            int(mg.get("min_run_seconds", 180)),
+                            bool(mg.get("check_failures", True)),
+                            since_ts=max(st or "", floor))
+                        if not vok:
+                            for r in vreasons:
+                                self.log("✗ MaaFgo " + r)
+                            self.step(k, "err", "任务有失败")
+                            if bool(mg.get("stop_on_failure", True)):
+                                self.failed = True
+                                self.fail_reason = "MaaFgo " + "；".join(vreasons)
+                                self.log("—— 「失败即停」：第 %d 轮到此为止 ——" % i)
+                                self.emit("status", "MaaFgo 任务失败，已暂停")
+                                return False
+                            self.log("提示：maafgo.stop_on_failure=false，继续往下走")
                 else:
                     ok = bool(scan_logs(okww_log_files(cfg), OKWW_DONE_MARK,
                                         self.baseline[k]))
@@ -3364,7 +3564,10 @@ class Runner:
                 self.emit("status", "MaaEnd（终末地）优先…")
                 if self.start_maaend():
                     if not self.wait_maaend_done():
-                        self.emit("status", "已取消")
+                        if self.failed:      # 失败和取消是两回事，状态栏别说错
+                            self.emit("status", "MaaEnd 任务失败，已暂停")
+                        else:
+                            self.emit("status", "已取消")
                         return
                 if self.stop_flag:
                     self.cancel_steps(["vm%d" % int(i["index"])
