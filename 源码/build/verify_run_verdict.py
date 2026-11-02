@@ -1,9 +1,9 @@
-"""MaaEnd / MaaFgo 的「跑完了」判定：tasks-completed 不等于成功。
+"""MaaEnd / MaaFgo 的「跑完了」判定与「失败自动重跑」。
 
-真实事故（2026-11-02）：MaaEnd 连续 12 个 task failure，09:36:47 stop_agent 并写出
+真实事故（2026-11-02）：MaaEnd 连续 10 个 task failure，09:36:47 stop_agent 并写出
 kind: tasks-completed，启动器据此判「任务已完成」，接着就开了第 2 轮模拟器。
 
-本用例只碰临时目录里的假日志，不启动任何游戏或脚本。
+本用例只碰临时目录里的假日志，不启动任何游戏或脚本，也不杀任何真实进程。
 """
 import shutil
 import sys
@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / '源码'))
 import daily_launcher as a
 
+CHECKS = 10
 fails = 0
 
 
@@ -30,12 +31,21 @@ def ts(delta):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + delta))
 
 
-def app_log(path, start_ts, done_ts, extra=""):
-    path.write_text(
-        "%s INFO  [App] 加载完成, 项目: MaaEnd\n"
-        "%s INFO  [Task] 实例 全套日常: 开始执行任务, 数量: 17\n"
-        "%s%s DEBUG [App] 收到 state-changed，已刷新运行时状态, kind: tasks-completed\n"
-        % (start_ts, start_ts, extra, done_ts), encoding="utf-8")
+def write_app(path, lines):
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def start_line(t):
+    return "%s INFO  [Task] 实例 全套日常: 开始执行任务, 数量: 17\n" % t
+
+
+def done_line(t):
+    return "%s DEBUG [App] 收到 state-changed，已刷新运行时状态, kind: tasks-completed\n" % t
+
+
+def append_top(path, text):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
 
 
 def tauri_log(path, stamps):
@@ -53,7 +63,7 @@ try:
     d1 = tmp / "clean" / "debug"
     d1.mkdir(parents=True)
     s1, e1 = ts(-3600), ts(-1800)
-    app_log(d1 / "2026-11-02-1.log", s1, e1)
+    write_app(d1 / "2026-11-02-1.log", [start_line(s1), done_line(e1)])
     tauri_log(d1 / "mxu-tauri.log", [])
     ok, reasons, info = a.mxu_run_verdict(tmp / "clean", "debug", s1, e1, 300)
     check(ok and not reasons and info["seconds"] == 1800,
@@ -63,7 +73,7 @@ try:
     d2 = tmp / "fail" / "debug"
     d2.mkdir(parents=True)
     s2, e2 = ts(-3600), ts(-1200)
-    app_log(d2 / "2026-11-02-1.log", s2, e2)
+    write_app(d2 / "2026-11-02-1.log", [start_line(s2), done_line(e2)])
     tauri_log(d2 / "mxu-tauri.log",
               [(ts(-3000), "DijiangRewards"), (ts(-2400), "GiftOperator")])
     ok, reasons, info = a.mxu_run_verdict(tmp / "fail", "debug", s2, e2, 300)
@@ -76,7 +86,7 @@ try:
     d3 = tmp / "old" / "debug"
     d3.mkdir(parents=True)
     s3, e3 = ts(-1800), ts(-600)
-    app_log(d3 / "2026-11-02-1.log", s3, e3)
+    write_app(d3 / "2026-11-02-1.log", [start_line(s3), done_line(e3)])
     tauri_log(d3 / "mxu-tauri.log", [(ts(-3000), "YesterdayTask")])   # 早于本轮开始
     ok, reasons, info = a.mxu_run_verdict(tmp / "old", "debug", s3, e3, 300,
                                           since_ts=s3)
@@ -86,10 +96,9 @@ try:
     d4 = tmp / "rot" / "debug"
     d4.mkdir(parents=True)
     s4, e4 = ts(-3600), ts(-1200)
-    app_log(d4 / "2026-11-02-1.log", s4, e4)
+    write_app(d4 / "2026-11-02-1.log", [start_line(s4), done_line(e4)])
     tauri_log(d4 / "mxu-tauri.log", [])                                  # 当前文件干净
-    f = d4 / "mxu-tauri_2026-11-02_10-42-28.log"
-    tauri_log(f, [(ts(-3000), "AutoCollect")])
+    tauri_log(d4 / "mxu-tauri_2026-11-02_10-42-28.log", [(ts(-3000), "AutoCollect")])
     ok, reasons, info = a.mxu_run_verdict(tmp / "rot", "debug", s4, e4, 300)
     check((not ok) and info["fails"] == 1, "轮转归档里的失败也算", repr((ok, info)))
 
@@ -97,7 +106,7 @@ try:
     d5 = tmp / "short" / "debug"
     d5.mkdir(parents=True)
     s5, e5 = ts(-600), ts(-420)          # 只有 3 分钟
-    app_log(d5 / "2026-11-02-1.log", s5, e5)
+    write_app(d5 / "2026-11-02-1.log", [start_line(s5), done_line(e5)])
     tauri_log(d5 / "mxu-tauri.log", [])
     ok, reasons, info = a.mxu_run_verdict(tmp / "short", "debug", s5, e5, 300)
     check((not ok) and "低于下限" in reasons[0] and info["seconds"] == 180,
@@ -105,97 +114,108 @@ try:
     ok2, _r2, _i2 = a.mxu_run_verdict(tmp / "short", "debug", s5, e5, 0)
     check(ok2, "下限设 0 时只看失败", repr(ok2))
 
-    # ---------- 6) 集成：wait_maaend_done 失败即返回 False 并置 failed ----------
+    # ---------- 集成工具 ----------
     a.LOG_PATH = str(tmp / "verdict.log")
     a.maaend_game_running = lambda cfg: False
 
-    def run_wait(work, timeout=25):
-        """在后台跑 wait_maaend_done，同时按"真的在跑"的节奏写日志"""
+    def new_runner(work, **maaend):
         dbg = work / "debug"
         dbg.mkdir(parents=True, exist_ok=True)
-        start = ts(0)
-        app_log(dbg / "2026-11-02-1.log", start, start)      # 先只有启动行
-        (dbg / "2026-11-02-1.log").write_text(
-            "%s INFO  [Task] 实例 全套日常: 开始执行任务, 数量: 17\n" % start,
-            encoding="utf-8")
-        cfg = {"maaend": {"path": str(work / "MaaEnd.exe"), "log_dir": "debug",
-                          "timeout": 30, "wait_game_close": False,
-                          "min_run_seconds": 0, "check_failures": True,
-                          "stop_on_failure": True},
+        cfg = {"maaend": dict({"path": str(work / "MaaEnd.exe"), "log_dir": "debug",
+                               "timeout": 25, "wait_game_close": False,
+                               "min_run_seconds": 0, "check_failures": True,
+                               "stop_on_failure": True, "max_retries": 0,
+                               "retry_delay": 0, "retry_close_game": False},
+                              **maaend),
                "instances": [], "custom_items": []}
         r = a.Runner(cfg, lambda *x: None)
+        lines = []
+        r.log = lambda m: lines.append(m)
+        r._kill_app = lambda exe, label, wait=20: True
+        return r, dbg, lines
+
+    def run_attempts(r, dbg, lines, plans, timeout=40):
+        """在后台跑 wait_maaend_done，按 plans 逐次写日志
+
+        plans 里每项是一次尝试：(有失败?, 任务名)；第 1 次的 start 由调用方先写好，
+        后续每次由假的 start_maaend 追加新的 start 行。
+        """
+        app = dbg / "2026-11-02-1.log"
+        tauri = dbg / "mxu-tauri.log"
+        base = 0
+        attempts = {"n": 0}
+
+        def fake_start():
+            attempts["n"] += 1
+            k = attempts["n"]
+            append_top(app, start_line(ts(10000 * k)))
+            base_now = 10000 * k
+            return True
+
+        r.start_maaend = fake_start
         out = {}
 
         def body():
             out["ret"] = r.wait_maaend_done()
         th = threading.Thread(target=body, daemon=True)
         th.start()
-        time.sleep(0.6)
-        app_log(dbg / "2026-11-02-1.log", start, ts(2400))
-        tauri_log(dbg / "mxu-tauri.log", [(ts(1200), "DeliveryJobs")])
+        for i, (has_fail, task) in enumerate(plans):
+            n = i + 1
+            # 等第 n 次尝试真正开始（日志里会出现第 n 条"监视 MaaEnd 日志"）
+            t0 = time.time()
+            while sum(1 for x in lines if x.startswith("监视 MaaEnd 日志")) < n:
+                if time.time() - t0 > timeout or not th.is_alive():
+                    break
+                time.sleep(0.05)
+            off = 10000 * (i + 1) if i else 0
+            if has_fail:
+                append_top(tauri, "[%s][%s][INFO][x] [telemetry] task failure "
+                                  "event_id=x run_id=y task_id=1 task=%s\n"
+                           % (ts(off + 1200)[:10], ts(off + 1200)[11:], task))
+            append_top(app, done_line(ts(off + 2400)))
         th.join(timeout)
         out["alive"] = th.is_alive()
-        return r, out
+        return out
 
-    work = tmp / "app1"
-    r, out = run_wait(work)
-    check(out.get("alive") is False and out["ret"] is False
-          and r.failed and "MaaEnd" in r.fail_reason and "1 个任务失败" in r.fail_reason,
-          "MaaEnd 失败 → wait 返回 False、failed 置位",
-          repr((out, r.failed, r.fail_reason)))
+    # ---------- 6) 集成：max_retries=0 时失败直接返回 False ----------
+    r6, dbg6, lines6 = new_runner(tmp / "app6")
+    out6 = run_attempts(r6, dbg6, lines6, [(True, "DeliveryJobs")])
+    check(out6.get("alive") is False and out6["ret"] is False and r6.failed
+          and "1 个任务失败" in r6.fail_reason,
+          "max_retries=0：失败不重跑，直接判失败",
+          repr((out6, r6.failed, r6.fail_reason)))
 
     # ---------- 7) 集成：干净的一轮照旧算成功 ----------
-    work2 = tmp / "app2"
-    dbg2 = work2 / "debug"
-    dbg2.mkdir(parents=True)
-    s7 = ts(0)
-    (dbg2 / "2026-11-02-1.log").write_text(
-        "%s INFO  [Task] 实例 全套日常: 开始执行任务, 数量: 17\n" % s7, encoding="utf-8")
-    cfg2 = {"maaend": {"path": str(work2 / "MaaEnd.exe"), "log_dir": "debug",
-                       "timeout": 30, "wait_game_close": False,
-                       "min_run_seconds": 0},
-            "instances": [], "custom_items": []}
-    r2 = a.Runner(cfg2, lambda *x: None)
-    box = {}
+    r7, dbg7, lines7 = new_runner(tmp / "app7")
+    out7 = run_attempts(r7, dbg7, lines7, [(False, "")])
+    check(out7.get("ret") is True and not r7.failed,
+          "干净的一轮仍判成功", repr((out7, r7.failed, r7.fail_reason)))
 
+    # ---------- 8) stop_on_failure=false 且不重跑时只记失败、不阻断 ----------
+    r8, dbg8, lines8 = new_runner(tmp / "app8", stop_on_failure=False)
+    out8 = run_attempts(r8, dbg8, lines8, [(True, "GiftOperator")])
+    check(out8.get("ret") is True and r8.failed is False,
+          "stop_on_failure=false 不阻断", repr((out8, r8.failed)))
 
-    def body2():
-        box["ret"] = r2.wait_maaend_done()
-    th = threading.Thread(target=body2, daemon=True)
-    th.start()
-    time.sleep(0.6)
-    app_log(dbg2 / "2026-11-02-1.log", s7, ts(2400))
-    th.join(25)
-    check(box.get("ret") is True and not r2.failed,
-          "干净的一轮仍判成功", repr((box, r2.failed, r2.fail_reason)))
+    # ---------- 9) 失败后自动重跑，第二次成功 ----------
+    r9, dbg9, lines9 = new_runner(tmp / "app9", max_retries=1)
+    out9 = run_attempts(r9, dbg9, lines9, [(True, "DijiangRewards"), (False, "")])
+    retried = any("自动重跑" in x for x in lines9)
+    check(out9.get("ret") is True and not r9.failed and retried
+          and any("(第 2/2 次)" in x or "第 2/2 次" in x for x in lines9),
+          "失败后自动重跑，第二次成功",
+          repr((out9, r9.failed, r9.fail_reason, retried)))
 
-    # ---------- 8) stop_on_failure=false 时只记失败、不阻断 ----------
-    work3 = tmp / "app3"
-    dbg3 = work3 / "debug"
-    dbg3.mkdir(parents=True)
-    s8 = ts(0)
-    (dbg3 / "2026-11-02-1.log").write_text(
-        "%s INFO  [Task] 实例 全套日常: 开始执行任务, 数量: 17\n" % s8, encoding="utf-8")
-    cfg3 = {"maaend": {"path": str(work3 / "MaaEnd.exe"), "log_dir": "debug",
-                       "timeout": 30, "wait_game_close": False,
-                       "min_run_seconds": 0, "stop_on_failure": False},
-            "instances": [], "custom_items": []}
-    r3 = a.Runner(cfg3, lambda *x: None)
-    box3 = {}
-
-
-    def body3():
-        box3["ret"] = r3.wait_maaend_done()
-    th = threading.Thread(target=body3, daemon=True)
-    th.start()
-    time.sleep(0.6)
-    app_log(dbg3 / "2026-11-02-1.log", s8, ts(2400))
-    tauri_log(dbg3 / "mxu-tauri.log", [(ts(1200), "GiftOperator")])
-    th.join(25)
-    check(box3.get("ret") is True and r3.failed is False,
-          "stop_on_failure=false 不阻断", repr((box3, r3.failed, r3.fail_reason)))
+    # ---------- 10) 重跑也没成 → 判失败并写明重跑过 ----------
+    r10, dbg10, lines10 = new_runner(tmp / "app10", max_retries=1)
+    out10 = run_attempts(r10, dbg10, lines10,
+                         [(True, "DijiangRewards"), (True, "SellProduct")])
+    check(out10.get("ret") is False and r10.failed
+          and "已自动重跑 1 次" in r10.fail_reason,
+          "重跑也没成 → 停下并写明重跑次数",
+          repr((out10, r10.failed, r10.fail_reason)))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\n%d 项检查，%d 项失败" % (8, fails))
+print("\n%d 项检查，%d 项失败" % (CHECKS, fails))
 sys.exit(1 if fails else 0)

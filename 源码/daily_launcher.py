@@ -38,7 +38,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.18.6"
+APP_VERSION = "v2.18.7"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -146,7 +146,7 @@ DEBUG_TIMING = bool(os.environ.get("DL_TIMING"))
 # 配置结构版本：升级 exe 时靠它判断要不要跑迁移。
 # 只做"加字段/改语义"的小步升级，每次 bump 都要在 migrate_config() 里补一段。
 # 这个值存在 launcher.state.json 里，**不写进 config.json**（用户不该动它）。
-CONFIG_VERSION = 4                # v2.18.6：任务失败判定写进配置
+CONFIG_VERSION = 5                # v2.18.7：失败自动重跑写进配置
 
 # ---- 自动更新 ----
 # 只查 Releases API 的 latest，不要 token（公开仓库匿名够用，60 次/小时/ip）。
@@ -211,7 +211,11 @@ DEFAULT_CONFIG = {
         "start_next_if_timeout": True,
         "check_failures": True,       # 本轮出现 task failure 就算失败（tasks-completed 不代表成功）
         "min_run_seconds": 300,       # 短于这个时长也当失败：起来就崩的任务链只跑几十秒
-        "stop_on_failure": True,      # 判定失败就停下，不开后面的轮次（现场留着给人看）
+        "stop_on_failure": True,      # 重跑也没成就停下，不开后面的轮次
+        "max_retries": 1,             # 失败后自动重跑几次（0 = 不重跑）
+        "retry_delay": 30,            # 两次尝试之间等多久（秒）
+        "retry_close_game": True,     # 重跑前先关掉终末地，否则会对着卡住的那帧重播
+        "game_exe": "Endfield.exe",   # 关不掉时强杀用的进程名
     },
     # MaaFgo（FGO 助手，取代原来的独立 BBchannel）：
     # 实例 1 就绪 → 没开游戏就先用 MuMu 打开 → 等游戏进程起来 → 再带 --autostart 启动它
@@ -228,6 +232,8 @@ DEFAULT_CONFIG = {
         "check_failures": True,        # 同上：MXU 壳的 tasks-completed 不等于成功
         "min_run_seconds": 180,
         "stop_on_failure": True,
+        "max_retries": 1,              # 失败后自动重跑几次（关掉进程再开，不是原地重试）
+        "retry_delay": 30,
         "settle": 10,                  # 起来后再等几秒过启动画面
         "sync_device_address": True,   # 把 MaaFgo 里记的 adb 地址改成实际端口
     },
@@ -403,6 +409,19 @@ def migrate_config(cfg, ver=None):
                 _d.setdefault(_k, _v)
         notes.append("任务失败判定已开启：MaaEnd / MaaFgo 本轮有 task failure 就算失败并停下"
                      "（maaend.stop_on_failure=false 可关掉）")
+
+    # v5（v2.18.7）：失败自动重跑。老配置补一次，让用户能在 config.json 里看到并调。
+    if ver < 5:
+        for _sec, _vals in (
+                ("maaend", {"max_retries": 1, "retry_delay": 30,
+                            "retry_close_game": True, "game_exe": "Endfield.exe"}),
+                ("maafgo", {"max_retries": 1, "retry_delay": 30})):
+            _d = cfg.get(_sec)
+            if isinstance(_d, dict):
+                for _k, _v in _vals.items():
+                    _d.setdefault(_k, _v)
+        notes.append("失败自动重跑已开启：MaaEnd / MaaFgo 没跑成就关掉重开一次"
+                     "（max_retries=0 可关掉）")
 
     # v2.18：启动编排。默认关闭 = 保持"一趟跑完"的老行为，不打扰老用户。
     if "pipeline" not in cfg:
@@ -2385,6 +2404,42 @@ def close_game_window(cfg, log=None, wait=12):
     return not find_unreal_windows(cfg)
 
 
+def close_maaend_game(cfg, log=None, wait=15):
+    """关掉终末地（重跑 MaaEnd 前清场用）
+
+    重跑前必须让游戏回到"没开"的状态：MaaEnd 的 LaunchGamePC 看到
+    `game is already running` 会直接跳过启动，于是重跑只是对着卡住的那一帧再跑一遍，
+    白白浪费时间。先发 WM_CLOSE 让它自己退，还在就按 maaend.game_exe 强杀。
+    关不掉也不阻断重跑 —— 最差和第一次一样失败，用户仍能看到失败原因。
+    """
+    m = cfg.get("maaend", {})
+    cls = m.get("game_window_class", "UnityWndClass")
+    title = m.get("game_window_title", "Endfield")
+
+    def alive():
+        return bool(find_windows_by(cls, title, min_w=200, min_h=150))
+
+    if not alive():
+        return True
+    for h, t, c in find_windows_by(cls, title, min_w=200, min_h=150):
+        user32.PostMessageW(h, WM_CLOSE, 0, 0)
+        if log:
+            log("已向终末地窗口发关闭消息：%s" % (t or c))
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        if not alive():
+            if log:
+                log("终末地已退出")
+            return True
+        time.sleep(1.0)
+    exe = m.get("game_exe", "Endfield.exe")
+    if log:
+        log("⚠ 终末地没自己退出，强杀 %s" % os.path.basename(exe))
+    run_hidden(["taskkill", "/F", "/IM", os.path.basename(exe)], 30)
+    time.sleep(1.5)
+    return not alive()
+
+
 def shutdown_instance(cfg, idx, log=None):
     """只关某一个 MuMu 实例（比如 FGO 那个），别的实例和四个程序都不动
 
@@ -2959,6 +3014,8 @@ class Runner:
         # 而不是默默开下一轮把别的游戏也拉起来。
         self.failed = False
         self.fail_reason = ""
+        self._ports = None        # 最近一次启动用的 adb 端口表，MaaFgo 重跑要用
+        self._left = None         # 最近一次没起来的实例集合
 
     def cancel(self):
         if not self.stop_flag:
@@ -3021,21 +3078,136 @@ class Runner:
         self.log("MaaEnd 已启动：%s %s" % (os.path.basename(exe), " ".join(args)))
         return True
 
-    def wait_maaend_done(self):
-        """读 MaaEnd 日志等「任务链跑完」，再等终末地窗口关掉
+    # -- 自动重跑（失败重来一次）-------------------------------------------
+    def _kill_app(self, exe, label, wait=20):
+        """把某个程序彻底关掉，等进程真的消失
 
-        判据两条都要满足：
-          1) 日志里出现 kind: tasks-completed（MaaEnd 自己认为本轮任务结束了）
-          2) 终末地游戏窗口消失（任务链末项是 CloseGamePC，勾了才会关）
-        第 2 条给一个上限时间，超时就放行并记一行日志，免得卡死后面的流程。
+        重跑前必须先关：MaaEnd / MaaFgo 都是单实例 GUI，任务失败后它自己停掉了队列、
+        窗口还留着；这时再带 --autostart 起一次只会把窗口顶到前面，不会重跑任务。
+        """
+        name = os.path.basename(exe or "")
+        if not name:
+            return False
+        pids = proc_pids(name)
+        if not pids:
+            return True
+        self.log("  关闭 %s（pid %s）…" % (label, ", ".join(str(x) for x in pids)))
+        kill_pids(pids, self.log)
+        t0 = time.time()
+        while time.time() - t0 < wait:
+            if not proc_pids(name):
+                return True
+            time.sleep(0.5)
+        self.log("  ⚠ %s 还在运行（等了 %d 秒没退出）" % (label, wait))
+        return False
+
+    def _restart_maaend(self, m):
+        """清场 + 重新拉起 MaaEnd，用于失败重跑"""
+        if self.stop_flag:
+            return False
+        self.emit("status", "准备重跑 MaaEnd…")
+        if bool(m.get("retry_close_game", True)) and maaend_game_running(self.cfg):
+            self.log("  先把终末地关掉：不关的话重跑会对着同一帧卡住的画面再跑一遍")
+            close_maaend_game(self.cfg, self.log)
+        if not self._kill_app(m.get("path", ""), "MaaEnd"):
+            return False
+        delay = float(m.get("retry_delay", 30))
+        t0 = time.time()
+        while time.time() - t0 < delay:
+            if self.stop_flag:
+                return False
+            time.sleep(1.0)
+        if delay > 0:
+            self.log("  间隔 %d 秒后重新启动 MaaEnd" % int(delay))
+        ok = bool(self.start_maaend())
+        if not ok:
+            self.log("✗ MaaEnd 重跑没能启动")
+        return ok
+
+    def _restart_maafgo(self, mg, key):
+        """清场 + 重新拉起 MaaFgo，用于失败的轮内重跑"""
+        if self.stop_flag:
+            return False
+        self.emit("status", "准备重跑 MaaFgo…")
+        if not self._kill_app(mg.get("path", ""), "MaaFgo"):
+            return False
+        delay = float(mg.get("retry_delay", 30))
+        t0 = time.time()
+        while time.time() - t0 < delay:
+            if self.stop_flag:
+                return False
+            time.sleep(1.0)
+        before = self.baseline.get(key)
+        self.start_maafgo(getattr(self, "_ports", None) or {},
+                          getattr(self, "_left", None))
+        if self.baseline.get(key) == before:
+            # 没真启动（游戏没起来等），手动把基线推到现在，否则旧一轮的完成标记会立刻命中
+            self.baseline[key] = time.time()
+        return True
+
+    def wait_maaend_done(self):
+        """等 MaaEnd 跑完；**失败就自动重跑**（maaend.max_retries，默认 1 次）
+
+        为什么重跑要"关掉再开"：MaaEnd 是单实例 GUI，任务失败后它自己 stop_agent、
+        窗口还留着，这时再带 --autostart 起一次不会重跑任务。所以每次重跑前都关掉它
+        （必要时连终末地一起关），当成全新一轮启动。
+        """
+        m = self.cfg.get("maaend", {})
+        retries = max(0, int(m.get("max_retries", 1)))
+        tries = retries + 1
+        for attempt in range(1, tries + 1):
+            kind, reason = self._wait_maaend_once(attempt, tries)
+            if kind == "ok":
+                return True
+            if kind == "cancel":
+                return False
+            if attempt < tries:
+                self.log("—— MaaEnd 第 %d/%d 次没成：%s" % (attempt, tries, reason))
+                self.log("   自动重跑：关掉当前 MaaEnd 再来一次（第 %d/%d 次）"
+                         % (attempt, retries))
+                if not self._restart_maaend(m):
+                    self.failed = True
+                    self.fail_reason = "MaaEnd %s（重跑没能启动）" % reason
+                    self.emit("status", "MaaEnd 重跑启动失败")
+                    return False
+                continue
+            return self._maaend_give_up(m, kind, reason, retries)
+
+    def _maaend_give_up(self, m, kind, reason, retries):
+        """重跑次数用完了：按配置决定停下还是继续"""
+        extra = ("（已自动重跑 %d 次）" % retries) if retries else ""
+        if kind == "timeout":
+            if bool(m.get("start_next_if_timeout", True)):
+                self.log("  按配置继续启动后面的 MuMu / MAA / MaaFgo")
+                return True
+            self.failed = True
+            self.fail_reason = "MaaEnd " + reason + extra
+            self.emit("status", "MaaEnd 等待超时，已暂停")
+            return False
+        self.step("maaend", "err", "任务失败")
+        self.emit("status", "MaaEnd 任务失败")
+        if bool(m.get("stop_on_failure", True)):
+            self.failed = True
+            self.fail_reason = "MaaEnd " + reason + extra
+            self.log("—— 「失败即停」：本轮到此为止，后面的轮次不会开始 ——")
+            return False
+        self.log("提示：maaend.stop_on_failure=false，仍继续启动后面的流程")
+        return True
+
+    def _wait_maaend_once(self, attempt=1, tries=1):
+        """跑一次 MaaEnd 并等它结束，返回 (kind, reason)
+
+        kind: ok / cancel / failed（跑完了但有失败）/ timeout（一直没等到结束标记）
+        判据三条：任务链结束 + 本轮无 task failure + 耗时达标（v2.18.6）。
         """
         m = self.cfg.get("maaend", {})
         exe = m.get("path", "")
         root = os.path.dirname(exe or ".")
         logdir = m.get("log_dir", "debug")
-        total = int(m.get("timeout", 5400))
+        wait_total = int(m.get("timeout", 5400))
         game_wait = int(m.get("game_close_timeout", 300))
         need_game = bool(m.get("wait_game_close", True))
+        tag = "MaaEnd" if tries <= 1 else "MaaEnd（第 %d/%d 次）" % (attempt, tries)
 
         t0 = time.time()
         files = maaend_log_files(root, logdir)
@@ -3050,10 +3222,10 @@ class Runner:
         # 等我们去看的时候窗口早就没了 —— 以前一律报"可能是这轮没开游戏"，
         # 把"游戏跑过又被关掉"说成了"压根没开"，出错时非常误导。
         ever_seen = maaend_game_running(self.cfg)
-        while time.time() - t0 < total:
+        while time.time() - t0 < wait_total:
             if self.stop_flag:
                 self.step("maaend", "idle", "已取消")
-                return False
+                return "cancel", ""
             files = maaend_log_files(root, logdir)
             if files:
                 st, dn, note = maaend_scan(files)
@@ -3072,12 +3244,9 @@ class Runner:
 
         if not done_ts:
             self.step("maaend", "err", "等待超时")
-            self.log("✗ %d 分钟内没等到 MaaEnd 任务完成（config.json 里调 maaend.timeout）"
-                     % (total // 60))
-            if not m.get("start_next_if_timeout", True):
-                return False
-            self.log("  按配置继续启动后面的 MuMu / MAA / MaaFgo")
-            return True
+            self.log("✗ %s：%d 分钟内没等到任务完成（config.json 里调 maaend.timeout）"
+                     % (tag, wait_total // 60))
+            return "timeout", "%d 分钟内没等到任务完成" % (wait_total // 60)
 
         # ⚠ 「tasks-completed」只代表任务链跑完了 —— 失败的 task 也会发这个标记
         #   （失败后 MaaEnd 自己 stop_agent，同一秒写出 tasks-completed）。
@@ -3091,40 +3260,31 @@ class Runner:
         secs = info.get("seconds")
         fails = info.get("fails") or 0
         if secs is not None:
-            self.log("MaaEnd 任务链结束：耗时 %d 分 %d 秒，失败 %d 个任务%s"
-                     % (secs // 60, secs % 60, fails,
+            self.log("%s 任务链结束：耗时 %d 分 %d 秒，失败 %d 个任务%s"
+                     % (tag, secs // 60, secs % 60, fails,
                         ("（%s）" % "、".join(info["tasks"][:4]))
                         if info.get("tasks") else ""))
         else:
-            self.log("MaaEnd 任务链结束（%s），失败 %d 个任务" % (done_ts, fails))
+            self.log("%s 任务链结束（%s），失败 %d 个任务" % (tag, done_ts, fails))
 
         if not ok:
             for r in reasons:
                 self.log("✗ " + r)
             self.step("maaend", "err", "任务有失败")
-            self.log("  游戏留在现场不动它，先看一眼卡在哪（MaaEnd 的 debug\\on_error 里有截图）")
-            if bool(m.get("stop_on_failure", True)):
-                self.failed = True      # failed 只在这条路径上置位，别让配置关掉的也停
-                self.fail_reason = "MaaEnd " + "；".join(reasons)
-                self.emit("status", "MaaEnd 任务失败")
-                self.log("—— 「失败即停」：本轮到此为止，后面的轮次不会开始 ——")
-                return False
-            self.log("提示：maaend.stop_on_failure=false，仍继续启动后面的流程")
-            self.emit("status", "MaaEnd 任务有失败，继续")
-            return True
+            return "failed", "；".join(reasons)
 
-        self.log("MaaEnd 任务已完成（%s）" % done_ts)
+        self.log("%s 任务已完成（%s）" % (tag, done_ts))
         self.step("maaend", "ok", "任务完成")
 
         if not need_game:
-            return True
+            return "ok", ""
         self.emit("status", "等终末地关闭…")
         gt0 = time.time()
         seen = False
         while time.time() - gt0 < game_wait:
             if self.stop_flag:
                 self.step("maaend", "idle", "已取消")
-                return False
+                return "cancel", ""
             alive = maaend_game_running(self.cfg)
             if alive:
                 seen = True
@@ -3134,14 +3294,14 @@ class Runner:
                 continue
             if seen or ever_seen:
                 self.log("终末地已关闭，可以开始启动模拟器了")
-                return True
+                return "ok", ""
             if time.time() - gt0 > 45:      # 整轮都没见着游戏窗口
                 self.log("提示：这一轮始终没见到终末地窗口 —— MaaEnd 没把游戏拉起来，"
                          "或者起来就被关掉了，继续下一步")
-                return True
+                return "ok", ""
             time.sleep(3.0)
         self.log("⚠ 等了 %d 秒终末地还没关，先继续后面的流程" % game_wait)
-        return True
+        return "ok", ""
 
     # -- 单实例 -------------------------------------------------------------
     def ensure_main(self, first_idx):
@@ -3396,6 +3556,10 @@ class Runner:
                  % (i, "、".join(self.item_label(k) for k in need), i + 1))
         self.emit("status", "第 %d/%d 轮 · 等任务完成…" % (i, total))
         done = {k: False for k in need}
+        # 只有 MaaFgo 会在这里重跑：MaaEnd 在 _one_pass 里自己等、自己重跑，
+        # MAA / ok-ww 没有失败信号（只认完成标记），谈不上"失败重跑"。
+        retries = {"maafgo": max(0, int((cfg.get("maafgo") or {})
+                                       .get("max_retries", 1)))}
         t0 = time.time()
         while time.time() - t0 < limit:
             if self.stop_flag:
@@ -3434,6 +3598,16 @@ class Runner:
                         if not vok:
                             for r in vreasons:
                                 self.log("✗ MaaFgo " + r)
+                            left = retries.get(k, 0)
+                            if left > 0:
+                                retries[k] = left - 1
+                                self.step(k, "run", "任务有失败，准备重跑")
+                                self.log("   MaaFgo 失败重跑（还剩 %d 次）：关掉当前进程重开"
+                                         % left)
+                                if self._restart_maafgo(mg, k):
+                                    ok = False        # 这次不算完成，继续等新一轮
+                                    continue
+                                self.log("✗ MaaFgo 重跑没能启动")
                             self.step(k, "err", "任务有失败")
                             if bool(mg.get("stop_on_failure", True)):
                                 self.failed = True
@@ -3685,6 +3859,8 @@ class Runner:
             # ---- MaaFgo（FGO）：要等实例就绪、游戏开起来才能开跑 ----
             if not self.stop_flag and want("maafgo"):
                 self.emit("status", "MaaFgo（FGO）…")
+                # 记下来：MaaFgo 失败重跑时要按同样的端口/实例状态再拉一次
+                self._ports, self._left = ports, left
                 self.start_maafgo(ports, left)
 
             # ---- ok-ww（鸣潮）：PC 前台独占，排在最后 ----
