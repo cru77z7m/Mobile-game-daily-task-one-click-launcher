@@ -15,6 +15,7 @@ _BOOT_T = _boot_time.time()
 
 import ctypes
 import ctypes.wintypes as wt
+import atexit
 import json
 import os
 import re
@@ -38,7 +39,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.18.7"
+APP_VERSION = "v2.18.8"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -146,7 +147,7 @@ DEBUG_TIMING = bool(os.environ.get("DL_TIMING"))
 # 配置结构版本：升级 exe 时靠它判断要不要跑迁移。
 # 只做"加字段/改语义"的小步升级，每次 bump 都要在 migrate_config() 里补一段。
 # 这个值存在 launcher.state.json 里，**不写进 config.json**（用户不该动它）。
-CONFIG_VERSION = 5                # v2.18.7：失败自动重跑写进配置
+CONFIG_VERSION = 6                # v2.18.8：桌宠隐藏写进配置
 
 # ---- 自动更新 ----
 # 只查 Releases API 的 latest，不要 token（公开仓库匿名够用，60 次/小时/ip）。
@@ -178,6 +179,14 @@ DEFAULT_CONFIG = {
     "ui_material": "mica",
     "ui_mica": True,        # Full-client Win11 material; Win10 uses opaque rendering.
     "ui_motion": True,      # Also respects SPI_GETCLIENTAREAANIMATION.
+    # 桌宠（屏幕角落那个置顶挂件）：任务开跑时先藏起来，跑完再放出来。
+    # 它不是"挡住鼠标"这么简单——MaaEnd 是抓屏识别的，桌宠会被一起截进画面，
+    # 于是右下角的「传送 / 全部接收」按钮对它来说根本不存在（v2.18.8 实测：
+    # 传送按钮模板最高只匹配到 0.36，阈值 0.7，于是 20 个采集点全部传送失败）。
+    "desktop_pet": {
+        "hide_during_tasks": True,   # False = 不动它，只写日志提醒
+        "processes": ["WuwaTappo"],  # 桌宠的进程名（不带 .exe，大小写不敏感）
+    },
     # 首次运行时是空的：靠「首次使用向导」让用户点设置页选目录。
     # 这里绝不能写死作者机器上的路径——把程序发给别人时，那些路径根本不存在，
     # 打开就是满屏「找不到 xxx.exe」，看起来像程序坏了。
@@ -422,6 +431,16 @@ def migrate_config(cfg, ver=None):
                     _d.setdefault(_k, _v)
         notes.append("失败自动重跑已开启：MaaEnd / MaaFgo 没跑成就关掉重开一次"
                      "（max_retries=0 可关掉）")
+
+    # v6（v2.18.8）：桌宠在跑任务时自动隐藏。老配置补一次，让用户能看见并且能关。
+    if ver < 6:
+        _d = cfg.get("desktop_pet")
+        if not isinstance(_d, dict):
+            _d = cfg["desktop_pet"] = {}
+        _d.setdefault("hide_during_tasks", True)
+        _d.setdefault("processes", ["WuwaTappo"])
+        notes.append("桌宠自动隐藏已开启：开始跑任务先收起桌宠，"
+                     "跑完自动放回来（desktop_pet.hide_during_tasks=false 可关掉）")
 
     # v2.18：启动编排。默认关闭 = 保持"一趟跑完"的老行为，不打扰老用户。
     if "pipeline" not in cfg:
@@ -1722,6 +1741,156 @@ def maaend_game_running(cfg):
     return bool(find_windows_by(m.get("game_window_class", "UnityWndClass"),
                                 m.get("game_window_title", "Endfield"),
                                 min_w=200, min_h=150))
+
+
+# ---------------- 桌宠（屏幕角落那个置顶挂件） ----------------
+# 为什么要在跑任务时把它藏起来：
+#   桌宠是整屏透明置顶窗（Tauri/Electron 做的），角色画在右下角。它盖住的
+#   正好是游戏的确认按钮（传送 / 全部接收）。更麻烦的是 MaaEnd 靠抓屏识别，
+#   桌宠会被一起截进画面 —— 于是那个按钮对 MaaEnd 来说**根本不存在**，
+#   不是"点不到"，是"看不见"。v2.18.8 排查时实测：白色确认按钮模板
+#   最高只匹配到 0.36（阈值 0.7），20 个采集点因此全部传送失败。
+_HIDDEN_PETS = []            # [(hwnd, 进程名, 标题)]
+PET_FALLBACK_PROCS = ["WuwaTappo"]
+
+
+def _pet_proc_names(cfg):
+    """配置里的桌宠进程名，归一化后比较（去空格/连字符/.exe，全小写）"""
+    block = cfg.get("desktop_pet")
+    names = (block or {}).get("processes")
+    if not isinstance(names, list) or not names:
+        names = PET_FALLBACK_PROCS
+    out = []
+    for n in names:
+        s = str(n).strip().lower()
+        if s.endswith(".exe"):
+            s = s[:-4]
+        s = re.sub(r"[^0-9a-z]", "", s)
+        if s:
+            out.append(s)
+    return out
+
+
+def find_deskpet_windows(cfg):
+    """找"整屏置顶透明"的桌宠窗，返回 [(hwnd, 进程名, 标题)]
+
+    判据刻意收窄，宁可漏也别误伤别人的窗口：
+      · 进程名在 desktop_pet.processes 里（默认 WuwaTappo）
+      · 窗口可见、不是本进程自己的窗
+      · 扩展样式同时有 TOPMOST 和 LAYERED/TRANSPARENT（桌宠都这么画）
+      · 宽高都超过屏幕一半（整屏挂件；小悬浮窗、通知条、输入法一律不动）
+    """
+    procs = _pet_proc_names(cfg)
+    if not procs:
+        return []
+    pid_name = {}
+    for pid, _ppid, exe in list_processes():
+        pid_name[int(pid)] = re.sub(r"[^0-9a-z]", "", str(exe).lower())
+    sw = user32.GetSystemMetrics(0) or 1920
+    sh = user32.GetSystemMetrics(1) or 1080
+    me = os.getpid()
+    res = []
+
+    def cb(h, l):
+        try:
+            if not user32.IsWindowVisible(h):
+                return True
+            pid = wt.DWORD()
+            user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            if int(pid.value) == me:
+                return True
+            nm = pid_name.get(int(pid.value), "")
+            if not nm or not any(p in nm for p in procs):
+                return True
+            ex = user32.GetWindowLongW(h, -20) & 0xFFFFFFFF
+            if not (ex & 0x00000008):                     # WS_EX_TOPMOST
+                return True
+            if not (ex & (0x00080000 | 0x00000020)):      # LAYERED / TRANSPARENT
+                return True
+            r = wt.RECT()
+            user32.GetWindowRect(h, ctypes.byref(r))
+            if (r.right - r.left) < sw * 0.5 or (r.bottom - r.top) < sh * 0.5:
+                return True
+            n = user32.GetWindowTextLengthW(h)
+            buf = ctypes.create_unicode_buffer(n + 2)
+            user32.GetWindowTextW(h, buf, n + 2)
+            res.append((h, nm, buf.value))
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)(cb), 0)
+    except Exception:
+        return []
+    return res
+
+
+def hide_deskpets(cfg, log=None):
+    """把桌宠藏起来，返回真藏起来的个数（已经藏过就直接返回，不重复藏）
+
+    藏完要**回读一次** IsWindowVisible 才算数：桌宠要是以管理员权限跑、
+    而启动器没有提权，UIPI 会把 ShowWindow 悄悄丢掉——不报错，也没反应。
+    这种情况必须写进日志，否则用户只会看到"传送又失败了"，查不出为什么。
+    """
+    global _HIDDEN_PETS
+    if _HIDDEN_PETS:
+        return len(_HIDDEN_PETS)
+    block = cfg.get("desktop_pet") or {}
+    if not bool(block.get("hide_during_tasks", True)):
+        return 0
+    wins = find_deskpet_windows(cfg)
+    if not wins:
+        return 0
+    for h, _nm, _t in wins:
+        try:
+            user32.ShowWindow(h, 0)                       # SW_HIDE
+        except Exception:
+            pass
+    time.sleep(0.3)                       # 等它真的收起来再回读，别读到半路
+    ok, stuck = [], []
+    for h, nm, title in wins:
+        try:
+            if user32.IsWindowVisible(h):
+                stuck.append(title or nm)
+            else:
+                ok.append((h, nm, title))
+        except Exception:
+            stuck.append(title or nm)
+    _HIDDEN_PETS = ok
+    if ok and log:
+        log("桌宠先收起来（%s）：它盖着游戏右下角的确认按钮，"
+            "不收的话传送/领取会一直点不到" % "、".join(
+                sorted({t or n for _h, n, t in ok})))
+    if stuck and log:
+        log("⚠ 桌宠没藏起来（%s）：多半是它以管理员权限运行、而启动器没有提权，"
+            "系统把隐藏请求丢掉了。这一趟请手动关掉它，否则传送按钮还是被盖着"
+            % "、".join(sorted(set(stuck))))
+    return len(ok)
+
+
+def restore_deskpets(log=None):
+    """把藏起来的桌宠放回来（程序退出时也会兜一次，不会让它永久消失）"""
+    global _HIDDEN_PETS
+    if not _HIDDEN_PETS:
+        return 0
+    n = 0
+    for h, nm, title in _HIDDEN_PETS:
+        try:
+            if user32.IsWindow(h):
+                user32.ShowWindow(h, 4)    # SW_SHOWNOACTIVATE：放出来但不抢焦点
+                n += 1
+        except Exception:
+            pass
+    _HIDDEN_PETS = []
+    if n and log:
+        log("桌宠已恢复显示")
+    return n
+
+
+# 退出时兜一次：启动器正常关窗、异常退出都走这里，
+# 桌宠不能因为启动器没了就一直消失（那比挡按钮还烦人）。
+atexit.register(restore_deskpets)
 
 
 def maafgo_sync_device(exe, instance_name, port, log=None):
@@ -3499,6 +3668,8 @@ class Runner:
             self.failed = False
             self.fail_reason = ""
             self.emit("busy", True)
+            # 先收桌宠再启动任何东西：它盖住的右下角按钮，后面的每一步都要点
+            hide_deskpets(self.cfg, self.log)
             rounds = self.planned_rounds()
             if rounds is None:
                 self._one_pass(None)
@@ -3536,6 +3707,10 @@ class Runner:
             self.log("✗ 异常：\n" + traceback.format_exc())
             self.emit("status", "出错了，看日志")
         finally:
+            # 后台监视接管了就由 monitor_loop 收尾时放回来（任务还在跑，
+            # 桌宠这会儿放出来又会去挡按钮）；没接管说明这一趟已经结束
+            if not self.monitor_on:
+                restore_deskpets(self.log)
             self.emit("busy", False)
 
     def _wait_round_done(self, keys, i, total):
@@ -4237,6 +4412,13 @@ class Runner:
             self.step("vm%d" % idx, "err", "关闭失败")
 
     def monitor_loop(self):
+        """后台监视的收尾壳：不管正常结束还是超时退出，都把桌宠放回来"""
+        try:
+            self._monitor_loop()
+        finally:
+            restore_deskpets(self.log)
+
+    def _monitor_loop(self):
         cfg = self.cfg
         poll = max(5, int(cfg.get("monitor_poll", 20)))
         max_hours = float(cfg.get("monitor_max_hours", 10))
@@ -4375,6 +4557,7 @@ class Runner:
         except Exception:
             self.log("✗ 关闭异常：\n" + traceback.format_exc())
         finally:
+            restore_deskpets(self.log)
             self.emit("busy", False)
 
 
@@ -6153,6 +6336,11 @@ class App(VisualShell):
             {"key": "ui_motion", "icon": "ui_sliders", "title": "轻量动画",
              "sub": "页面淡入与滑移 · 跟随 Windows 的动画偏好",
              "chip": "开启" if cfg.get("ui_motion", True) else "关闭"},
+            {"key": "deskpet", "icon": "ui_sparkle", "title": "桌宠占位时自动隐藏",
+             "sub": "桌宠盖着游戏右下角的确认按钮，跑任务时先收起来、跑完放回来",
+             "chip": ("任务时隐藏"
+                      if (cfg.get("desktop_pet") or {}).get("hide_during_tasks", True)
+                      else "不动它")},
         ])
         return out
 
@@ -7682,6 +7870,17 @@ class App(VisualShell):
             self.cfg[kind] = not self.cfg.get(kind, True)
             save_config(self.cfg)
             self.refresh_effects()
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind == "deskpet":
+            block = self.cfg.setdefault("desktop_pet", {})
+            block["hide_during_tasks"] = not bool(block.get("hide_during_tasks", True))
+            save_config(self.cfg)
+            on = block["hide_during_tasks"]
+            if not on:
+                restore_deskpets(self.ui_log)   # 关掉就立刻放回来，不用等下一趟
+            self.ui_log("桌宠：%s" % ("跑任务时自动隐藏" if on else "不动它"))
+            self.status = "桌宠：%s" % ("跑任务时自动隐藏" if on else "不动它")
             user32.InvalidateRect(self.hwnd, None, False)
             return
         if kind in ("maa_instance", "fgo_instance", "fgo_ver"):
