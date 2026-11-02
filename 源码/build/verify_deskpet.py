@@ -118,6 +118,8 @@ check("Runner.run 收尾按 monitor 状态决定是否放回",
       "restore_deskpets(" in run_src and "self.monitor_on" in run_src)
 mon = inspect.getsource(D.Runner.monitor_loop)
 check("monitor_loop 用 finally 兜底恢复", "finally" in mon and "restore_deskpets" in mon)
+check("后台监视每轮补一次隐藏（中途又开起来也能收）",
+      "hide_deskpets(cfg)" in inspect.getsource(D.Runner._monitor_loop))
 check("每轮等完也会恢复",
       "restore_deskpets" in inspect.getsource(D.Runner.shutdown_all))
 check("atexit 已注册", True in [True])   # 占位，下面单独查

@@ -1827,46 +1827,51 @@ def find_deskpet_windows(cfg):
 
 
 def hide_deskpets(cfg, log=None):
-    """把桌宠藏起来，返回真藏起来的个数（已经藏过就直接返回，不重复藏）
+    """把桌宠藏起来，返回当前藏着的个数（可以重复调用：中途又开起来会再收一次）
 
     藏完要**回读一次** IsWindowVisible 才算数：桌宠要是以管理员权限跑、
     而启动器没有提权，UIPI 会把 ShowWindow 悄悄丢掉——不报错，也没反应。
     这种情况必须写进日志，否则用户只会看到"传送又失败了"，查不出为什么。
     """
     global _HIDDEN_PETS
-    if _HIDDEN_PETS:
-        return len(_HIDDEN_PETS)
     block = cfg.get("desktop_pet") or {}
     if not bool(block.get("hide_during_tasks", True)):
         return 0
-    wins = find_deskpet_windows(cfg)
-    if not wins:
-        return 0
-    for h, _nm, _t in wins:
+    known = {h for h, _n, _t in _HIDDEN_PETS}
+    todo = []
+    for h, nm, title in find_deskpet_windows(cfg):
+        # 没见过的窗、或者之前藏过又被自己显示出来的，都要再藏一次
+        try:
+            again = h in known and not user32.IsWindowVisible(h)
+        except Exception:
+            again = False
+        if not again:
+            todo.append((h, nm, title))
+    if not todo:
+        return len(_HIDDEN_PETS)
+    for h, _nm, _t in todo:
         try:
             user32.ShowWindow(h, 0)                       # SW_HIDE
         except Exception:
             pass
     time.sleep(0.3)                       # 等它真的收起来再回读，别读到半路
     ok, stuck = [], []
-    for h, nm, title in wins:
+    for h, nm, title in todo:
         try:
-            if user32.IsWindowVisible(h):
-                stuck.append(title or nm)
-            else:
-                ok.append((h, nm, title))
+            (stuck if user32.IsWindowVisible(h) else ok).append((h, nm, title))
         except Exception:
-            stuck.append(title or nm)
-    _HIDDEN_PETS = ok
-    if ok and log:
+            stuck.append((h, nm, title))
+    fresh = [w for w in ok if w[0] not in known]
+    _HIDDEN_PETS = [w for w in _HIDDEN_PETS if w[0] not in {h for h, _n, _t in ok}] + ok
+    if fresh and log:
         log("桌宠先收起来（%s）：它盖着游戏右下角的确认按钮，"
             "不收的话传送/领取会一直点不到" % "、".join(
-                sorted({t or n for _h, n, t in ok})))
+                sorted({t or n for _h, n, t in fresh})))
     if stuck and log:
         log("⚠ 桌宠没藏起来（%s）：多半是它以管理员权限运行、而启动器没有提权，"
             "系统把隐藏请求丢掉了。这一趟请手动关掉它，否则传送按钮还是被盖着"
-            % "、".join(sorted(set(stuck))))
-    return len(ok)
+            % "、".join(sorted({t or n for _h, n, t in stuck})))
+    return len(_HIDDEN_PETS)
 
 
 def restore_deskpets(log=None):
@@ -4456,6 +4461,10 @@ class Runner:
         t0 = time.time()
         while time.time() - t0 < max_hours * 3600:
             time.sleep(poll)
+
+            # 桌宠可能中途又被开起来（或者自己又把自己显示出来），每次轮询补一刀：
+            # 它一旦露出来，右下角的确认按钮就又"看不见"了
+            hide_deskpets(cfg)
 
             # ① MAA
             if not emu_closed and not self.done.get("maa") and "maa" in need_maa:
