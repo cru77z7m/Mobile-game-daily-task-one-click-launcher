@@ -39,7 +39,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.18.8"
+APP_VERSION = "v2.18.9"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -606,6 +606,9 @@ def merge_rects(rects, gap=2):
             if changed:
                 break
     return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in out]
+
+
+_WNDPROC_ERR_SEEN = {}      # 绘制异常去重：最后一行 → 上次记录时间（见 wndproc）
 
 
 def log_line(msg):
@@ -1671,6 +1674,12 @@ def mxu_run_verdict(root, sub, start_ts, done_ts, min_seconds=0, check_fail=True
     reasons = []
     info = {"fails": 0, "tasks": [], "seconds": None,
             "first_fail": None, "last_fail": None}
+    # 三个时间参数都先归一成字符串：上游有的给 epoch 秒（scan_logs* 系列），
+    # 有的给 'YYYY-MM-DD HH:MM:SS'（mxu-tauri 的文本扫描）。不归一就会
+    # 在下面的 max() / strptime() 里抛 TypeError，把整趟任务打断。
+    start_ts, done_ts = _ts_str(start_ts), _ts_str(done_ts)
+    if since_ts:
+        since_ts = _ts_str(since_ts)
     if start_ts and done_ts:
         try:
             a = time.mktime(time.strptime(start_ts, "%Y-%m-%d %H:%M:%S"))
@@ -1678,7 +1687,7 @@ def mxu_run_verdict(root, sub, start_ts, done_ts, min_seconds=0, check_fail=True
             secs = int(b - a)
             if 0 <= secs < 86400:
                 info["seconds"] = secs
-        except (ValueError, OverflowError):
+        except (ValueError, OverflowError, TypeError):
             pass
     if check_fail:
         since = since_ts or start_ts
@@ -2438,6 +2447,25 @@ def parse_log_ts(line):
                                          "%Y-%m-%d %H:%M:%S"))
     except Exception:
         return None
+
+
+def _ts_str(v):
+    """把时间统一成 'YYYY-MM-DD HH:MM:SS' —— 能给 epoch 秒，也能给字符串
+
+    这个转换是 v2.18.9 加的补丁：`scan_logs*` 系列返回的是 **epoch 秒（float）**，
+    而 `mxu_run_verdict` / `mxu_fail_scan` 这一层是按"字符串比大小"工作的
+    （'2026-11-03 12:00:00' 的字典序就是时间序）。两边混着传就会炸：
+    实测 v2.18.8 在第 2 轮等 MaaFgo 时抛
+    `TypeError: '>' not supported between instances of 'str' and 'float'`。
+    """
+    if not v:
+        return ""
+    if isinstance(v, str):
+        return v
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(v)))
+    except Exception:
+        return ""
 
 
 def scan_logs(files, marker, since, bytes_each=786432):
@@ -3767,14 +3795,18 @@ class Runner:
                         # MaaFgo 也是 MXU 壳，tasks-completed 同样会在失败后发出来
                         mg = cfg.get("maafgo", {})
                         mroot = os.path.dirname(mg.get("path", "") or ".")
+                        # st / ts 是 scan_logs_multi 返回的 epoch 秒（float），
+                        # mxu_run_verdict 要 "YYYY-MM-DD HH:MM:SS" —— 必须转，
+                        # 否则 max(st, floor) 直接 TypeError（v2.18.8 实测）。
+                        st_s, ts_s = _ts_str(st), _ts_str(ts)
                         floor = time.strftime(
                             "%Y-%m-%d %H:%M:%S",
                             time.localtime(float(self.baseline[k]) - 120))
                         vok, vreasons, _vi = mxu_run_verdict(
-                            mroot, mg.get("log_dir", "debug"), st, ts,
+                            mroot, mg.get("log_dir", "debug"), st_s, ts_s,
                             int(mg.get("min_run_seconds", 180)),
                             bool(mg.get("check_failures", True)),
-                            since_ts=max(st or "", floor))
+                            since_ts=max(st_s or "", floor))
                         if not vok:
                             for r in vreasons:
                                 self.log("✗ MaaFgo " + r)
@@ -8267,7 +8299,15 @@ class App(VisualShell):
                 user32.PostQuitMessage(0)
                 return 0
         except Exception:
-            log_line("wndproc 异常：\n" + traceback.format_exc())
+            # 同一个绘制异常会每帧刷一次（CreateDIBSection 在内存紧张时返回 NULL，
+            # 实测一次跑下来刷了 250 多行）。同一条错 60 秒内只记一次，
+            # 免得把真正的错误淹在刷屏里。
+            tb = traceback.format_exc()
+            tail = tb.strip().splitlines()[-1] if tb.strip() else "?"
+            now = time.time()
+            if now - _WNDPROC_ERR_SEEN.get(tail, 0) >= 60:
+                _WNDPROC_ERR_SEEN[tail] = now
+                log_line("wndproc 异常：\n" + tb)
         return user32.DefWindowProcW(hwnd, msg, wp, lp)
 
     # ---------- 图标 ----------

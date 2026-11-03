@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / '源码'))
 import daily_launcher as a
 
-CHECKS = 10
+CHECKS = 14
 fails = 0
 
 
@@ -214,6 +214,66 @@ try:
           and "已自动重跑 1 次" in r10.fail_reason,
           "重跑也没成 → 停下并写明重跑次数",
           repr((out10, r10.failed, r10.fail_reason)))
+    # ---------- 11) 时间类型归一化（v2.18.9 修的真事故） ----------
+    # 现场：第 2 轮等 MaaFgo 时 scan_logs_multi 给的是 epoch 秒（float），
+    # mxu_run_verdict 却按 "YYYY-MM-DD HH:MM:SS" 字符串比大小 →
+    # TypeError: '>' not supported between instances of 'str' and 'float'
+    now = time.time()
+    check(a._ts_str(now) == time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+          and a._ts_str(None) == "" and a._ts_str("") == ""
+          and a._ts_str("2026-11-03 01:02:03") == "2026-11-03 01:02:03",
+          "_ts_str：epoch / 字符串 / 空值都对",
+          repr((a._ts_str(now), a._ts_str(None))))
+
+    # ---------- 12) verdict 同时接受 epoch 秒和字符串 ----------
+    root12 = tmp / "app12"
+    (root12 / "debug").mkdir(parents=True, exist_ok=True)
+    tauri_log(root12 / "debug" / "mxu-tauri.log", [(ts(-600), "DijiangRewards")])
+    s_str, d_str = ts(-1800), ts(0)
+    s_flt = time.mktime(time.strptime(s_str, "%Y-%m-%d %H:%M:%S"))
+    d_flt = time.mktime(time.strptime(d_str, "%Y-%m-%d %H:%M:%S"))
+    ok_str, _r1, info_str = a.mxu_run_verdict(
+        str(root12), "debug", s_str, d_str, 0, True, since_ts=s_str)
+    try:
+        ok_flt, _r2, info_flt = a.mxu_run_verdict(
+            str(root12), "debug", s_flt, d_flt, 0, True, since_ts=s_flt)
+        same = (ok_str == ok_flt and info_str["fails"] == info_flt["fails"] == 1)
+    except TypeError as e:      # 老代码就死在这儿
+        same = False
+        print("      TypeError: %s" % e)
+    check(same, "verdict 吃 epoch 秒和吃字符串给同样结果",
+          repr((ok_str, ok_flt, info_str, info_flt)))
+
+    # ---------- 13) 调用点确实做了转换 ----------
+    import inspect as _insp
+    src = _insp.getsource(a.Runner._wait_round_done)
+    check("_ts_str(st)" in src and "_ts_str(ts)" in src,
+          "第几轮等待里，MaaFgo 那三个时间参数都先转成字符串")
+    # ---------- 14) 真跑一遍「第 2 轮等 MaaFgo」的那段（v2.18.8 的崩溃现场） ----------
+    base14 = tmp / "app14"
+    (base14 / "debug").mkdir(parents=True, exist_ok=True)
+    start14, done14 = ts(-1900), ts(-120)
+    write_app(base14 / "debug" / "2026-11-03-1.log",
+              [start_line(start14), done_line(done14)])
+    tauri_log(base14 / "debug" / "mxu-tauri.log", [(ts(-1500), "SellProduct")])
+    logs14 = []
+    r14 = a.Runner({"maafgo": {"path": str(base14 / "MaaFgo.exe"),
+                               "log_dir": "debug", "min_run_seconds": 180,
+                               "check_failures": True, "stop_on_failure": True,
+                               "max_retries": 0, "quiet": 0},
+                    "monitor_poll": 5, "pipeline_round_timeout_hours": 0.02},
+                   lambda kind, *a: logs14.append((kind, a)))
+    r14.baseline["maafgo"] = time.time() - 1900
+    try:
+        ret14 = r14._wait_round_done({"maafgo"}, 1, 2)
+        crashed = None
+    except Exception as e:
+        ret14, crashed = None, "%s: %s" % (type(e).__name__, e)
+    check(crashed is None and ret14 is False and r14.failed
+          and "MaaFgo" in (r14.fail_reason or ""),
+          "第 2 轮等 MaaFgo：不再抛 TypeError，正常判失败",
+          repr((crashed, ret14, r14.failed, r14.fail_reason)))
+
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
