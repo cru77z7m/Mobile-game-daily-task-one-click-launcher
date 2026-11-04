@@ -39,7 +39,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.18.9"
+APP_VERSION = "v2.19.0"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -5695,6 +5695,9 @@ class App(VisualShell):
         row_h = {"settings": 42, "custom": 42, "night": 42, "tasks": 42}.get(self.page, 58)
         self.row_h_logical = row_h
         self.sub_page = self.page in ("settings", "custom", "night", "about", "tasks")
+        # 分轮编排：每帧算一次轮次表，current_rows（排序用）和角标绘制都读它，
+        # 免得同一帧里两处各读一遍 cfg 出岔子
+        self._round_map = self.round_assign() if self.page == "main" else None
         items = self.current_rows()
         b_h = 46
 
@@ -5857,6 +5860,8 @@ class App(VisualShell):
             return self.task_rows()
         if self.page == "settings":
             return self.settings_rows()
+        if self.page == "main":
+            return self.main_rows()      # 分轮编排启用时在这里重排，见 main_rows
         return self.instance_rows()
 
     # ---------- 关于页 ----------
@@ -6448,6 +6453,51 @@ class App(VisualShell):
             })
         return out
 
+    def round_assign(self):
+        """轮次分配表 {key: 轮号}，是主界面排序和角标的唯一依据。
+
+        三种返回值得区分清楚，别用 `if not x` 一句吞掉：
+          - ``None``：没启用分轮编排，主界面按原来的固定顺序、显示执行序号；
+          - ``{}``  ：启用了但一个项目都没排，这一趟什么都不启动，
+                     角标要显示「未排」而不是序号，否则会骗人；
+          - ``{key: N}``：正常情况。
+        """
+        pl = self.cfg.get("pipeline") or {}
+        if not pl.get("enabled"):
+            return None
+        out = {}
+        for key, r in (pl.get("assign") or {}).items():
+            try:
+                r = int(r)
+            except (TypeError, ValueError):
+                continue
+            if r > 0:
+                out[str(key)] = r
+        return out
+
+    def main_rows(self):
+        """主界面卡片：启用分轮编排后按「轮次 → 名称」重排。
+
+        为什么要排：编排页里第 3 轮的项目，在主界面可能排在第 1 个位置。
+        角标改成轮次以后，如果卡片还按老顺序摆，用户看到的会是
+        「第3轮、第1轮、第1轮…」一路乱跳，反而比原来的序号更难读。
+
+        同轮次的任务是**同时**启动的，本就没有先后，所以按名称排 ——
+        这样每一轮内部稳定，用户改完轮次回来，同一轮里的卡片不会乱窜。
+        没分配轮次的项目这一趟不会被启动，统一沉到最后。
+        """
+        items = self.instance_rows()
+        # 直接现读，不吃 _round_map 缓存：那个缓存是 layout 每帧刷的，
+        # 单独调用 main_rows（测试、改配置后立刻重排）时可能还是上一帧的值。
+        rounds = self.round_assign()
+        if not rounds:
+            return items
+        ordered = sorted(
+            items,
+            key=lambda it: (1, 0, it.get("title") or "") if not rounds.get(it.get("key"))
+            else (0, rounds[it.get("key")], it.get("title") or ""))
+        return ordered
+
     @staticmethod
     def _custom_sub(it):
         """自定义行的一句话说明：强调"只打开，不自动跑" """
@@ -6758,26 +6808,24 @@ class App(VisualShell):
             self.draw_hero(mem)
             self.text(mem, "任务清单", (self.S(212),self.S(185),self.S(460),self.S(209)),
                       C["text2"], self.font(11, True))
-            # 顺序说明：和卡片上的序号角标呼应，省得用户自己数
+            # 顺序说明：和卡片上的角标呼应，省得用户自己数
             _n = len(R.get("rows") or [])
             if _n > 1:
                 _hint = "按序号依次执行  1 → %d" % _n
-                try:
-                    _rounds = self.runner.planned_rounds()
-                except Exception:
-                    _rounds = None
-                if _rounds:
-                    _idx = {it["key"]: i + 1 for i, (it, _, _) in
-                            enumerate(R.get("rows") or [])}
-                    _segs = []
-                    for _r in _rounds:
-                        _ns = sorted(_idx[k] for k in _r if k in _idx)
-                        if _ns:
-                            _segs.append(str(_ns[0]) if len(_ns) == 1
-                                         else "%d-%d" % (_ns[0], _ns[-1]))
-                    if _segs:
-                        _hint = "分 %d 轮执行 · %s（每轮跑完再开下一轮）" % (
-                            len(_rounds), " / ".join(_segs))
+                _rmap = getattr(self, "_round_map", None)
+                if _rmap is not None:
+                    # 卡片已经按轮次排好，这里只报每轮各有几项。
+                    # 老版本报的是"每轮占哪几个序号"，排序一改那串数字就没意义了。
+                    _keys = {it["key"] for it, _, _ in (R.get("rows") or [])}
+                    _cnt = {}
+                    for _k, _r in _rmap.items():
+                        if _k in _keys:
+                            _cnt[_r] = _cnt.get(_r, 0) + 1
+                    if _cnt:
+                        _hint = "分 %d 轮执行 · 各轮 %s 项（每轮跑完再开下一轮）" % (
+                            len(_cnt), " / ".join(str(_cnt[r]) for r in sorted(_cnt)))
+                    else:
+                        _hint = "已开启分轮执行，但一个项目都没排轮次 —— 这一趟不会启动"
                 self.text(mem, _hint,
                           (self.S(288), self.S(186), self.S(720), self.S(209)),
                           C["muted"], self.font(9.5),
@@ -6809,9 +6857,13 @@ class App(VisualShell):
                 _dc = gdi32.SaveDC(mem)
                 card = R["card"]
                 gdi32.IntersectClipRect(mem, card[0], card[1], card[2], card[3])
+            _rmap = getattr(self, "_round_map", None)
             for i, (item, y, rh) in enumerate(rows):
                 if self.page == "main":
-                    self.draw_task_tile(mem, item, R["tiles"][item["key"]], i + 1)
+                    # 启用分轮编排就显示「第 N 轮」，-1 = 启用了但这项没排（这趟不启动）
+                    _rno = 0 if _rmap is None else _rmap.get(item["key"], -1)
+                    self.draw_task_tile(mem, item, R["tiles"][item["key"]],
+                                        i + 1, round_no=_rno)
                 else:
                     self.draw_row(mem, item, y, R["card"][0], R["card"][2], rh)
                 if self.page != "main" and i < len(rows) - 1:

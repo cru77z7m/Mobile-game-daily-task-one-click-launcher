@@ -355,7 +355,7 @@ class VisualShell(TaskPlanner):
             return self.chk_custom.get(key[7:], True)
         return getattr(self, key+'_on', True)
 
-    def draw_task_tile(self, dc, item, rect, step=0):
+    def draw_task_tile(self, dc, item, rect, step=0, round_no=0):
         a,S,C = self.api(), self.S, self.api().C
         l,t,r,b=rect
         key=item['key']
@@ -365,10 +365,29 @@ class VisualShell(TaskPlanner):
         self.fill_round(dc,rect,13,a.mix_color(C['card'],C['accent_l'],hot*.55),
                         a.rgb('#D9DCF6') if checked else C['border'])
         a.draw_icon(dc,item.get('icon'),l+S(16),t+S(16),S(38))
-        if step:
-            # 序号角标：执行顺序是这套流程最重要的信息，光靠"左上到右下"的网格
-            # 读不出来（左右两列很容易被看成两条独立的队列）。压在图标左上角，
-            # 不占额外版面；没勾选的那项转灰，但序号保留 —— 用户能看出"第 3 步这次跳过"。
+        if round_no:
+            # 分轮编排启用后，角标改成「第 N 轮」。
+            # 这时候卡片已经按轮次排好序，再显示 1..n 的序号只会和轮次打架
+            # （第 3 轮的项目可能正好排在第 1 个位置上）。
+            # round_no < 0 = 启用了编排但这项没排轮次 —— 这一趟不会被启动，
+            # 必须明确写「未排」，不能留一个看起来还在队列里的数字。
+            if round_no > 0:
+                badge = "第%d轮" % round_no
+                bg = C['accent'] if checked else a.rgb('#C3CBDC')
+            else:
+                badge = "未排"
+                bg = a.rgb('#D5DBE8') if checked else a.rgb('#C3CBDC')
+            bw, bh = S(36), S(17)
+            bx, by = l + S(9), t + S(9)
+            self.fill_round(dc, (bx, by, bx + bw, by + bh), 8.5, bg,
+                            a.rgb('#FFFFFF'), 1.4)
+            self.text(dc, badge, (bx, by, bx + bw, by + bh), a.rgb('#FFFFFF'),
+                      self.font(8.5, True),
+                      a.DT_CENTER | a.DT_SINGLELINE | a.DT_VCENTER | a.DT_NOPREFIX)
+        elif step:
+            # 没启用编排时的执行序号：顺序就是 1 → n，和顶部的说明对应。
+            # 压在图标左上角，不占额外版面；没勾选的那项转灰，但序号保留 ——
+            # 用户能看出"第 3 步这次跳过"。
             d = S(17)
             bx, by = l + S(9), t + S(9)
             self.fill_round(dc, (bx, by, bx + d, by + d), 8.5,
