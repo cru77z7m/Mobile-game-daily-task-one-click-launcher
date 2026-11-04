@@ -39,7 +39,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.19.0"
+APP_VERSION = "v2.19.1"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -7439,11 +7439,59 @@ class App(VisualShell):
     def _inst_indexes(self):
         return [int(i["index"]) for i in self.cfg.get("instances", [])]
 
+    def visible_items(self):
+        """日常控制台当前真正显示出来的卡片（隐藏项已经在 instance_rows 里滤掉）"""
+        return self.instance_rows()
+
+    def set_item_checked(self, key, on):
+        """把某一项的勾选设成 on（内存 + config 一起改），不认识的 key 返回 False
+
+        全选改成逐项调这个，而不是"5 组开关一把梭" —— 只有这样才能做到
+        「隐藏起来的项一个都不碰」。以前 `_apply_checks` 直接写
+        maaend/maa/maafgo/okww + 全部实例，隐藏的 okww 照样被打开。
+        """
+        on = bool(on)
+        if key.startswith("vm"):
+            try:
+                idx = int(key[2:])
+            except (TypeError, ValueError):
+                return False
+            if idx not in self._inst_indexes():
+                return False
+            self.chk[idx] = on
+            for inst in self.cfg.get("instances", []):
+                if int(inst["index"]) == idx:
+                    inst["enabled"] = on
+            return True
+        if key.startswith("custom:"):
+            cid = key[7:]
+            self.chk_custom[cid] = on
+            for it in self.cfg.get("custom_items", []) or []:
+                if str(it.get("id")) == str(cid):
+                    it["enabled"] = on
+                    break
+            return True
+        attr = {"maaend": "maaend_on", "maa": "maa_on",
+                "maafgo": "maafgo_on", "okww": "okww_on"}.get(key)
+        if not attr:
+            return False
+        setattr(self, attr, on)
+        block = self.cfg.get(key)
+        if isinstance(block, dict):
+            block["enabled"] = on
+        return True
+
     def all_checked(self):
-        idxs = self._inst_indexes()
-        return (all(self.chk.get(i) for i in idxs)
-                and self.maaend_on and self.maa_on
-                and self.maafgo_on and self.okww_on)
+        """「全选」按钮现在该显示成"全选"还是"取消全选" —— **只看看得见的那些**
+
+        隐藏项不参与判定。否则隐藏起来的 okww 只要碰巧是取消状态，
+        这里就返回 False，按钮变成"取消全选"，用户点一下反而把可见项全清了。
+        一个都不显示时返回 False：空集的 all() 是 True，会让按钮直接反着来。
+        """
+        items = self.visible_items()
+        if not items:
+            return False
+        return all(self.item_checked(it) for it in items)
 
     def night_start(self):
         """只跑《今晚的手游日常》—— 开机弹窗的「否」和主界面「夜间启动」共用
@@ -7499,32 +7547,35 @@ class App(VisualShell):
             self.prompt["left"] = left
             user32.InvalidateRect(self.hwnd, None, False)
 
-    def _apply_checks(self, vm_on, maaend, maa, maafgo, okww):
-        """一次性把 5 组开关写进内存和 config.json"""
-        for i in self._inst_indexes():
-            self.chk[i] = vm_on
-            for inst in self.cfg.get("instances", []):
-                if int(inst["index"]) == i:
-                    inst["enabled"] = vm_on
-        self.maaend_on = maaend
-        self.cfg["maaend"]["enabled"] = maaend
-        self.maa_on = maa
-        self.cfg["maa"]["enabled"] = maa
-        self.maafgo_on = maafgo
-        self.cfg["maafgo"]["enabled"] = maafgo
-        self.okww_on = okww
-        self.cfg["okww"]["enabled"] = okww
+    def _apply_checks(self, on):
+        """把当前**看得见**的项一次性设成 on（隐藏项原地不动）"""
+        for it in self.visible_items():
+            self.set_item_checked(it["key"], on)
         self._persist_selection()
+        return len(self.visible_items())
+
+    def _hidden_count(self):
+        """被隐藏掉、因而不会参与全选的项数（内置 4 项 + 实例 + 自定义）"""
+        total = (4 + len(self.cfg.get("instances") or [])
+                 + len(self.cfg.get("custom_items") or []))
+        return max(0, total - len(self.visible_items()))
 
     def toggle_all(self):
+        items = self.visible_items()
+        if not items:
+            self.ui_log("「全选」跳过：日常控制台里一个项都没显示（都被隐藏了）")
+            self.status = "没有可选的项"
+            return
         on = not self.all_checked()
-        self._apply_checks(on, on, on, on, on)
-        n = len(self._inst_indexes()) + 4
+        n = self._apply_checks(on)
+        hid = self._hidden_count()
         if on:
-            self.ui_log("已全选：%d 项全部勾上" % n)
+            self.ui_log("已全选：%d 项全部勾上%s" % (
+                n, "（另有 %d 项已隐藏，未动）" % hid if hid else ""))
             self.status = "已全选（%d 项）" % n
         else:
-            self.ui_log("已全部取消：%d 项都没勾，点「一键启动」将什么都不做" % n)
+            self.ui_log("已全部取消：%d 项都没勾，点「一键启动」将什么都不做%s" % (
+                n, "（隐藏的 %d 项未动）" % hid if hid else ""))
             self.status = "已全部取消"
 
     def toggle(self, key):

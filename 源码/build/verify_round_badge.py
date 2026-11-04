@@ -29,6 +29,9 @@ def check(name, ok, detail=""):
 BASE = copy.deepcopy(a.DEFAULT_CONFIG)
 BASE.update(json.loads((ROOT / 'config.json').read_text(encoding='utf-8-sig')))
 BASE.update(ui_motion=False, ui_mica=False, ui_material="solid")
+# 隐藏列表是用户随时会改的东西（这次就是真把 okww 隐藏了），
+# 断言里写死了 6 项，依赖它就必然某天白挂一次 —— 测试自己清干净。
+BASE['hidden_items'] = []
 a.load_config = lambda: copy.deepcopy(BASE)
 a.save_config = lambda _: None
 a.save_state = lambda: None
