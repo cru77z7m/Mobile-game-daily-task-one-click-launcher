@@ -39,7 +39,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.19.1"
+APP_VERSION = "v2.20.0"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -3211,6 +3211,7 @@ class Runner:
         self.monitor_on = False   # 后台完成监视是否已启动
         self.skip = set()         # 自检认为"这次跑不了"的项（vm0/maa/maafgo/maaend/okww）
         self.only = None          # 本次只跑这些项（开机点「是」时由 App 设置）
+        self.single = False       # 双击单项启动：绕过分轮，直接一趟跑完 only
         # 任务侧判定为失败（不是用户取消）。失败和取消必须分开：
         # 取消是"我不想跑了"，失败是"跑了但没成"—— 后者要停下并叫人来看，
         # 而不是默默开下一轮把别的游戏也拉起来。
@@ -3703,6 +3704,12 @@ class Runner:
             self.emit("busy", True)
             # 先收桌宠再启动任何东西：它盖住的右下角按钮，后面的每一步都要点
             hide_deskpets(self.cfg, self.log)
+            # 双击单项启动：only 只有一个 key，编排在这里没有意义 ——
+            # 照常分轮的话会先空跑前几轮，再让 _wait_round_done 去等一个
+            # 根本没启动的项目的完成标记，白等到超时。直接一趟跑完。
+            if self.single:
+                self._one_pass(None)
+                return
             rounds = self.planned_rounds()
             if rounds is None:
                 self._one_pass(None)
@@ -5109,6 +5116,10 @@ class App(VisualShell):
         self.prompt = None
         # 本次只跑这些 key（点「是」时设；只影响这一轮，不改勾选、不写 config.json）
         self.run_only = None
+        # 双击某张卡片 = 这一趟只启动它，绕过分轮编排（见 Runner.single）
+        self.single_run = False
+        # 双击的第一下会先被当成单击切一次勾选，记下来好在双击到达时还原
+        self._last_toggle = None
         # 自动更新状态机：
         #   idle / checking / uptodate / available / downloading / ready / error
         # 只影响界面提示，不阻塞任何启动流程。
@@ -7184,13 +7195,18 @@ class App(VisualShell):
         self.dot(hdc, cx2 - S(26), y + S(30), radius, dotc)
 
     def draw_shortcuts(self, hdc):
-        """标题右侧的一键开关：全选"""
+        """标题右侧的一键开关：全选，外加一条双击操作的小提示"""
         R = self.rects
         S = self.S
         for key, label, on in (("all", "全选", self.all_checked()),):
             r = R.get(key)
             if not r:
                 continue
+            # 小小 tips：紧贴「全选」左边，不另占一行、不遮住轮次说明
+            self.text(hdc, "双击图标 · 只跑这一项",
+                      (r[0] - S(146), r[1], r[0] - S(10), r[3]),
+                      C["muted"], self.font(9),
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
             hot = self.hover == key
             bg = C["accent_l"] if on else (C["ghost_bg_h"] if hot else C["ghost_bg"])
             self.fill_round(hdc, r, 13, bg, C["accent"] if on else C["border"], 1.2)
@@ -7492,6 +7508,49 @@ class App(VisualShell):
         if not items:
             return False
         return all(self.item_checked(it) for it in items)
+
+    def hit_task_icon(self, x, y):
+        """主界面卡片左侧图标区的双击命中。
+
+        图标本身只有 S(38)，双击要连点两次太小了；命中区往外放一圈到
+        S(6)..S(62)，但**不含右上角的勾选框**，双击就不会和 toggle 抢语义。
+        滚动后图标被卡片裁掉一半时不算命中。
+        """
+        R = self.rects
+        card = R.get("card")
+        if self.page != "main" or not card:
+            return None
+        if not (card[1] <= y <= card[3]):
+            return None
+        for key, rect in R.get("tiles", {}).items():
+            l, t = rect[0], rect[1]
+            if (l + self.S(6) <= x <= l + self.S(62)
+                    and t + self.S(6) <= y <= t + self.S(64)
+                    and t + self.S(64) <= card[3]):
+                return key
+        return None
+
+    def sole_start(self, key):
+        """双击卡片图标：这一趟只启动这一个项目，其余都不动。
+
+        和夜间启动一样用 only 白名单（不改勾选、不写 config 的 enabled），
+        但额外把 single 打开 —— 单项启动不该走分轮编排。
+        """
+        if self.busy:
+            self.status = "正在跑任务，等这趟结束再单独启动"
+            self.ui_log("「单独启动」跳过：当前正在执行任务")
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        item = next((it for it in self.main_rows() if it["key"] == key), None)
+        if not item:
+            return
+        title = item.get("title") or key
+        self.run_only = {key}
+        self.single_run = True
+        self.do("start")
+        self.status = "单独启动：%s" % title
+        self.ui_log("双击单独启动：只跑「%s」；其余项本次跳过（勾选未改动）" % title)
+        user32.InvalidateRect(self.hwnd, None, False)
 
     def night_start(self):
         """只跑《今晚的手游日常》—— 开机弹窗的「否」和主界面「夜间启动」共用
@@ -8220,7 +8279,9 @@ class App(VisualShell):
                 self.status = "启动中…"
                 # 点过「是」就只跑手游那套；其余情况 None = 按勾选跑
                 self.runner.only = self.run_only
+                self.runner.single = self.single_run
                 self.run_only = None
+                self.single_run = False
                 threading.Thread(target=self.runner.run, daemon=True).start()
         elif key == "cancel":
             if self.busy:
@@ -8300,6 +8361,8 @@ class App(VisualShell):
                     if h.startswith("chk:"):
                         if not self.busy:
                             self.toggle(h)
+                            # 双击的第一下会先走到这里；记下来，DBLCLK 到达时还原
+                            self._last_toggle = (h[4:], time.monotonic())
                             user32.InvalidateRect(hwnd, None, False)
                     elif h.startswith("set:"):
                         self.pick_row(h[4:])
@@ -8309,9 +8372,24 @@ class App(VisualShell):
                 self.pressed = None
                 return 0
             if msg == WM_LBUTTONDBLCLK:
-                # 双击「选 exe」列表里的某一行 = 直接选中并确认
                 x = ctypes.c_short(lp & 0xFFFF).value
                 y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                # 双击卡片图标 = 只启动这一项。
+                # 消息序列是 DOWN / UP / DBLCLK / UP，第一次 UP 已经被当成
+                # 单击切了一次勾选并写进 config —— 先还原它，否则用户只是
+                # 想单独跑一下，下次「一键启动」的勾选却被悄悄改了。
+                if (self.page == "main" and not self.prompt
+                        and not self.exepick and not self.busy):
+                    k = self.hit_task_icon(x, y)
+                    if k:
+                        lt = self._last_toggle
+                        if lt and lt[0] == k and time.monotonic() - lt[1] < 1.0:
+                            self.toggle("chk:" + k)
+                        self._last_toggle = None
+                        self.pressed = None
+                        self.sole_start(k)
+                        return 0
+                # 双击「选 exe」列表里的某一行 = 直接选中并确认
                 h = self.hit(x, y)
                 if h and h.startswith("expick_row:"):
                     self.do(h)
@@ -8474,7 +8552,9 @@ class App(VisualShell):
 
         wc = WNDCLASSW()
         self._proc = WNDPROC(self.wndproc)
-        wc.style = 0x0002 | 0x0020  # CS_HREDRAW | CS_VREDRAW
+        # CS_DBLCLKS 不能省：少了它系统根本不会投递 WM_LBUTTONDBLCLK，
+        # 主界面「双击图标单独启动」和选 exe 列表的双击确认都会静默失效。
+        wc.style = 0x0002 | 0x0020 | 0x0008  # HREDRAW | VREDRAW | DBLCLKS
         wc.lpfnWndProc = self._proc
         wc.hInstance = hInst
         wc.hbrBackground = gdi32.CreateSolidBrush(C["bg"])
