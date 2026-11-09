@@ -37,7 +37,7 @@ def check(name, cond, extra=""):
 block = D.DEFAULT_CONFIG.get("desktop_pet") or {}
 check("默认配置：跑任务时隐藏", block.get("hide_during_tasks") is True)
 check("默认配置：进程名列表", block.get("processes") == ["WuwaTappo"])
-check("CONFIG_VERSION 已升到 6", D.CONFIG_VERSION == 6)
+check("CONFIG_VERSION 至少是 6（v6 桌宠迁移仍在）", D.CONFIG_VERSION >= 6)
 
 old = {"ui_material": "mica"}
 D.migrate_config(old, 5)
@@ -61,11 +61,14 @@ check("进程名留空时回退到 WuwaTappo",
 real = D.find_deskpet_windows(D.DEFAULT_CONFIG)
 only_pet = D.find_deskpet_windows({"desktop_pet": {"processes": ["explorer"]}})
 check("进程名不在列表里 → 一个都不认", only_pet == [], "命中 %d 个" % len(only_pet))
-check("桌宠在跑时能认出来", bool(real),
-      "、".join("%s(%s)" % (t or n, h) for h, n, t in real) or "（桌宠没开，跳过得证）")
-
-if not real:
-    print("提示：Wuwa Tappo 没在跑，真隐藏那两项按「跳过」处理")
+if real:
+    check("桌宠在跑时能认出来", True,
+          "、".join("%s(%s)" % (t or n, h) for h, n, t in real))
+else:
+    # 桌宠开没开是用户当下的状态，不该决定回归结果。下面第 4 段会注入
+    # 假窗口来覆盖「藏不住」这条链，这里只确认没误伤别的窗口。
+    check("桌宠没开时识别为空（没有误伤）", real == [])
+    print("提示：Wuwa Tappo 没在跑，真隐藏/恢复用注入窗口代替")
 
 # ---- 4. 真隐藏 / 真恢复 --------------------------------------------------
 # 注意：桌宠（WuwaTappo）是以管理员权限运行的。**测试进程没提权时，UIPI 会把
@@ -99,11 +102,29 @@ if can_hide:
 else:
     print("跳过 真隐藏/真恢复：本测试进程%s提权，桌宠%s提权"
           % ("已" if i_am_admin else "未", "已" if pet_admin else "未"))
+    # 注入一个假窗口，模拟「找到了桌宠，但 UIPI 把 ShowWindow 悄悄丢了」。
+    # 这样无论用户当下有没有开桌宠，回读可见性 + 写警告这条链都测得到。
+    fake = (0x123456, "WuwaTappo", "Wuwa Tappo")
+    o_find = D.find_deskpet_windows
+    o_vis = D.user32.IsWindowVisible
+    o_sw = D.user32.ShowWindow
+    D.find_deskpet_windows = lambda _cfg: [fake]
+    D.user32.IsWindowVisible = lambda _h: True
+    D.user32.ShowWindow = lambda _h, _n: 0
+    D._HIDDEN_PETS = []
+    logs = []
+    try:
+        hid = D.hide_deskpets(cfg, logs.append)
+    finally:
+        D.find_deskpet_windows = o_find
+        D.user32.IsWindowVisible = o_vis
+        D.user32.ShowWindow = o_sw
     check("没提权时不会假装成功（返回 0）", hid == 0, "返回 %d" % hid)
     check("没提权时写出「没藏起来」的警告",
           any("桌宠没藏起来" in m for m in logs),
           next((m for m in logs if "没藏起来" in m), ""))
     check("失败时不留垃圾清单", D._HIDDEN_PETS == [])
+    D._HIDDEN_PETS = []
 
 # 关掉开关 -> 一个都不藏
 off = {"desktop_pet": {"hide_during_tasks": False, "processes": ["WuwaTappo"]}}

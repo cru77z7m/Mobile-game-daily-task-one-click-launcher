@@ -39,7 +39,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.20.0"
+APP_VERSION = "v2.20.1"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -147,7 +147,7 @@ DEBUG_TIMING = bool(os.environ.get("DL_TIMING"))
 # 配置结构版本：升级 exe 时靠它判断要不要跑迁移。
 # 只做"加字段/改语义"的小步升级，每次 bump 都要在 migrate_config() 里补一段。
 # 这个值存在 launcher.state.json 里，**不写进 config.json**（用户不该动它）。
-CONFIG_VERSION = 6                # v2.18.8：桌宠隐藏写进配置
+CONFIG_VERSION = 7                # v2.20.1：跑完关掉鹰角启动器写进配置
 
 # ---- 自动更新 ----
 # 只查 Releases API 的 latest，不要 token（公开仓库匿名够用，60 次/小时/ip）。
@@ -225,6 +225,11 @@ DEFAULT_CONFIG = {
         "retry_delay": 30,            # 两次尝试之间等多久（秒）
         "retry_close_game": True,     # 重跑前先关掉终末地，否则会对着卡住的那帧重播
         "game_exe": "Endfield.exe",   # 关不掉时强杀用的进程名
+        # v2.20.1：鹰角启动器首页是循环播放的视频（QtWebEngine），Chromium 会为它
+        # 挂 Video Wake Lock = ES_DISPLAY_REQUIRED。只要窗口还开着，系统「10 分钟后
+        # 关闭显示器」永远不触发。MaaEnd 只关游戏、不关启动器，所以由我们收尾。
+        "close_launcher_when_done": True,
+        "launcher_window_title": "鹰角启动器",
     },
     # MaaFgo（FGO 助手，取代原来的独立 BBchannel）：
     # 实例 1 就绪 → 没开游戏就先用 MuMu 打开 → 等游戏进程起来 → 再带 --autostart 启动它
@@ -441,6 +446,17 @@ def migrate_config(cfg, ver=None):
         _d.setdefault("processes", ["WuwaTappo"])
         notes.append("桌宠自动隐藏已开启：开始跑任务先收起桌宠，"
                      "跑完自动放回来（desktop_pet.hide_during_tasks=false 可关掉）")
+
+    # v7（v2.20.1）：MaaEnd 收尾时把鹰角启动器一起关掉。老配置补一次。
+    if ver < 7:
+        _m = cfg.get("maaend")
+        if not isinstance(_m, dict):
+            _m = cfg["maaend"] = {}
+        _m.setdefault("close_launcher_when_done", True)
+        _m.setdefault("launcher_window_title", "鹰角启动器")
+        notes.append("跑完终末地会顺手关掉鹰角启动器：它首页的循环视频会占着"
+                     "显示电源请求，不关的话显示器不会自动息屏"
+                     "（maaend.close_launcher_when_done=false 可关掉）")
 
     # v2.18：启动编排。默认关闭 = 保持"一趟跑完"的老行为，不打扰老用户。
     if "pipeline" not in cfg:
@@ -2642,6 +2658,53 @@ def close_maaend_game(cfg, log=None, wait=15):
     return not alive()
 
 
+def close_hypergryph_launcher(cfg, log=None, wait=8):
+    """MaaEnd 这一趟收工时，把鹰角启动器也一起关掉
+
+    鹰角启动器首页是 QtWebEngine 里**循环播放的视频**。Chromium 播放视频会挂
+    Video Wake Lock（底层就是 SetThreadExecutionState(ES_DISPLAY_REQUIRED)），
+    只要这个窗口还开着，电源计划里「10 分钟后关闭显示器」就永远不会触发。
+    MaaEnd 的 CloseGamePC 只关 Endfield.exe，启动器是独立进程，得我们收尾。
+
+    ⚠ 只能在这一趟 MaaEnd 真正结束后调，**不能放进重跑清场**：
+    启动器窗口留着，重跑的 LaunchGamePC 才能 1 秒找到已渲染好的窗口；
+    冷启动渲染慢正是 2026-11-09 07:54 那次预任务失败的原因（08:47 重跑，
+    窗口已存在，49 秒就成功）。
+
+    只发 WM_CLOSE 让它自己退，不强杀 —— 启动器可能正在下载/更新，硬杀容易
+    留下半死的进程，下次启动更麻烦。关不掉就写一条日志让用户手动关。
+    """
+    m = cfg.get("maaend", {})
+    if not bool(m.get("close_launcher_when_done", True)):
+        return 0
+    title = str(m.get("launcher_window_title") or "鹰角启动器")
+    pat = r"^%s$" % re.escape(title)
+    # 启动器还有个 1x1 的隐藏窗口（Qt5158QWindowOwnDCIcon），用尺寸滤掉；
+    # find_windows_by 本身也只认可见窗口。
+    def alive():
+        return find_windows_by(title_regex=pat, min_w=400, min_h=300)
+
+    wins = alive()
+    if not wins:
+        return 0
+    for h, t, c in wins:
+        user32.PostMessageW(h, WM_CLOSE, 0, 0)
+        if log:
+            log("已向鹰角启动器发关闭消息：%s" % (t or c))
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        if not alive():
+            if log:
+                log("鹰角启动器已关闭（首页视频会一直占着显示电源请求，"
+                    "不关的话显示器不会自动息屏）")
+            return len(wins)
+        time.sleep(0.5)
+    if log:
+        log("⚠ 鹰角启动器没自己退出（等了 %d 秒），不强杀，"
+            "需要的话手动关掉它的窗口" % wait)
+    return 0
+
+
 def shutdown_instance(cfg, idx, log=None):
     """只关某一个 MuMu 实例（比如 FGO 那个），别的实例和四个程序都不动
 
@@ -3956,7 +4019,15 @@ class Runner:
             if want("maaend", False):
                 self.emit("status", "MaaEnd（终末地）优先…")
                 if self.start_maaend():
-                    if not self.wait_maaend_done():
+                    try:
+                        maaend_ok = self.wait_maaend_done()
+                    finally:
+                        # 这一趟 MaaEnd 结束了（成功 / 失败 / 取消都算），顺手把
+                        # 鹰角启动器收掉：它首页的循环视频会一直占着显示电源请求。
+                        # 重跑清场发生在 wait_maaend_done 内部，那时绝不能关 ——
+                        # 启动器窗口留着，重跑才能 1 秒找到已渲染好的窗口。
+                        close_hypergryph_launcher(cfg, self.log)
+                    if not maaend_ok:
                         if self.failed:      # 失败和取消是两回事，状态栏别说错
                             self.emit("status", "MaaEnd 任务失败，已暂停")
                         else:
@@ -6398,6 +6469,11 @@ class App(VisualShell):
              "chip": ("任务时隐藏"
                       if (cfg.get("desktop_pet") or {}).get("hide_during_tasks", True)
                       else "不动它")},
+            {"key": "close_launcher", "icon": "ui_sliders", "title": "跑完关掉鹰角启动器",
+             "sub": "首页循环视频会占着显示电源请求，不关的话显示器不会自动息屏",
+             "chip": ("跑完关闭"
+                      if (cfg.get("maaend") or {}).get("close_launcher_when_done", True)
+                      else "留着不动")},
         ])
         return out
 
@@ -8084,6 +8160,17 @@ class App(VisualShell):
                 restore_deskpets(self.ui_log)   # 关掉就立刻放回来，不用等下一趟
             self.ui_log("桌宠：%s" % ("跑任务时自动隐藏" if on else "不动它"))
             self.status = "桌宠：%s" % ("跑任务时自动隐藏" if on else "不动它")
+            user32.InvalidateRect(self.hwnd, None, False)
+            return
+        if kind == "close_launcher":
+            block = self.cfg.setdefault("maaend", {})
+            block["close_launcher_when_done"] = not bool(
+                block.get("close_launcher_when_done", True))
+            save_config(self.cfg)
+            on = block["close_launcher_when_done"]
+            msg = "跑完终末地：%s" % ("顺手关掉鹰角启动器" if on else "留着不动")
+            self.ui_log(msg)
+            self.status = msg
             user32.InvalidateRect(self.hwnd, None, False)
             return
         if kind in ("maa_instance", "fgo_instance", "fgo_ver"):
