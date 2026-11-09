@@ -6,6 +6,13 @@ from ui_render import Surface, Compositor, gdi
 
 from ui_tasks import TaskPlanner
 
+# 页面切换动画：v2.20.2 起六个侧边栏项一视同仁，方向恒定、幅度加大。
+# 以前是 22px / 0.28s，在 175% 缩放下几乎看不出来；测试脚本也曾把这两个数
+# 硬编码在模拟进度里，所以统一提到常量，改一次就够了。
+PAGE_ANIM_SECONDS = 0.36
+PAGE_ANIM_SHIFT = 56            # 逻辑像素，绘制时会过 self.S() 缩放
+PAGE_ANIM_DIRECTION = 1         # 所有页面一律同向（新页从右往左滑入）
+
 
 class VisualShell(TaskPlanner):
     def api(self):
@@ -63,9 +70,12 @@ class VisualShell(TaskPlanner):
         scene = getattr(self, '_last_scene', None)
         compositor = getattr(self, '_compositor', None)
         if scene and compositor and compositor.alpha and self.motion_enabled():
-            depths = {'main': 0, 'settings': 1, 'custom': 2, 'night': 2, 'tasks': 2, 'about': 2}
+            # 侧边栏六项是**并列的标签**，不是层级导航。旧版按 depths
+            # （main=0 / settings=1 / 其余=2）决定方向：切到「日常控制台」
+            # 「设置」时从左边进，切到另外四项时从右边进，观感撕裂。
+            # 现在一律同向，任何两个页面之间切换都走同一个动画。
             self._transition = (scene.clone(), time.monotonic(),
-                                1 if depths.get(value, 1) >= depths.get(old, 1) else -1)
+                                PAGE_ANIM_DIRECTION)
             self._animation_clock.start()
             self.api().user32.SetTimer(self.hwnd, 3, 16, None)
         self.hover = self.pressed = None
@@ -110,19 +120,20 @@ class VisualShell(TaskPlanner):
         temp = None
         if transition:
             previous, started, direction = transition
-            t = min(1.0, (time.monotonic()-started)/0.28)
+            t = min(1.0, (time.monotonic()-started)/PAGE_ANIM_SECONDS)
             if not self.motion_enabled() or t >= 1 or (previous.width, previous.height) != (w, h):
                 self.finish_transition()
             else:
                 eased = 1-(1-t)**3
+                shift = self.S(PAGE_ANIM_SHIFT*(1-eased)*direction)
                 animation_progress=t
-                animation_offset=self.S(22*(1-eased)*direction)
+                animation_offset=shift
                 if not native_animation:
                     temp = self.blend_surface(target, w, h)
                     temp.copy(previous.dc)
                     split = self.S(196)
                     self._compositor.blend(temp.dc, scene, (split, 0, w, h),
-                                           round(255*eased), self.S(22*(1-eased)*direction))
+                                           round(255*eased), shift)
                     self._compositor.blend(temp.dc, scene, (0, 0, split, h), 255)
                     output = temp.dc
         modal_amount = 1.0 if self.prompt or self.exepick else 0.0

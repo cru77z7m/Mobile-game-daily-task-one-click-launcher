@@ -9,6 +9,7 @@ import time
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'源码'))
 import daily_launcher as a
+import ui_design as ui_d
 
 cfg=copy.deepcopy(a.DEFAULT_CONFIG)
 cfg.update(json.loads((ROOT/'config.json').read_text(encoding='utf-8-sig')))
@@ -116,7 +117,7 @@ try:
         ui.page='main';ui.finish_transition();paint();ui.page='settings'
         old,_,direction=ui._transition;hashes=[]
         for progress in (.08,.5,.85):
-            ui._transition=(old,time.monotonic()-.28*progress,direction);paint()
+            ui._transition=(old,time.monotonic()-ui_d.PAGE_ANIM_SECONDS*progress,direction);paint()
             if material=='solid':
                 rc=a.wt.RECT();a.user32.GetClientRect(hwnd,c.byref(rc));tmp=DibSurface(dc,rc.right,rc.bottom);tmp.copy(dc);data=pixels(tmp);tmp.close()
             else:data=pixels(ui._compositor.last_argb)

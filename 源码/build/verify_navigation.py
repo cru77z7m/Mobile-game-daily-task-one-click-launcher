@@ -9,6 +9,7 @@ import time
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'源码'))
 import daily_launcher as a
+import ui_design as ui_d
 
 cfg=copy.deepcopy(a.DEFAULT_CONFIG)
 cfg.update(json.loads((ROOT/'config.json').read_text(encoding='utf-8-sig')))
@@ -98,17 +99,29 @@ try:
     assert ui.hit(ui.S(60),ui.S(510)) is None
     print('PASS: both task columns and sidebar whitespace hit-testing')
     click_nav('settings')
-    assert ui._transition is not None and ui._transition[2]==1
+    assert ui._transition is not None and ui._transition[2]==ui_d.PAGE_ANIM_DIRECTION
     frames=[]
     previous,_,direction=ui._transition
     for i in range(11):
-        ui._transition=(previous,time.monotonic()-0.28*(i/10),direction)
+        ui._transition=(previous,time.monotonic()-ui_d.PAGE_ANIM_SECONDS*(i/10),direction)
         paint()
         frames.append(shot('enter-%02d'%i))
     assert ui._transition is None
     click_nav('main')
-    assert ui._transition is not None and ui._transition[2]==-1
+    # v2.20.2：六个侧边栏项是并列标签，一律同向；不再有 main/settings 反向。
+    assert ui._transition is not None and ui._transition[2]==ui_d.PAGE_ANIM_DIRECTION
     paint()
+    all_pages=('main','settings','tasks','night','custom','about')
+    dirs=set()
+    for src in all_pages:
+        for dst in all_pages:
+            if src==dst: continue
+            ui.page=src; ui.finish_transition()
+            ui.page=dst
+            if ui._transition: dirs.add(ui._transition[2])
+            ui.finish_transition()
+    assert dirs=={ui_d.PAGE_ANIM_DIRECTION},('动画方向不一致',dirs)
+    print('PASS: all six tabs share one animation direction')
     # Rapid reversal clones the currently displayed scene rather than flashing.
     click_nav('about')
     assert ui._transition is not None
@@ -180,7 +193,7 @@ try:
             paint()
             if ui._transition:
                 old,_,direction=ui._transition
-                ui._transition=(old,time.monotonic()-.29,direction)
+                ui._transition=(old,time.monotonic()-(ui_d.PAGE_ANIM_SECONDS+0.01),direction)
                 paint()
     after=a.user32.GetGuiResources(c.c_void_p(-1),0)
     assert after<=before+2,(before,after)

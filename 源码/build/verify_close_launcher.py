@@ -59,7 +59,9 @@ def src(fn):
 
 
 # ---- 1. 版本与配置 -------------------------------------------------------
-check("APP_VERSION 已升到 v2.20.1", D.APP_VERSION == "v2.20.1", D.APP_VERSION)
+check("APP_VERSION 至少是 v2.20.1",
+      tuple(int(x) for x in D.APP_VERSION.lstrip("v").split(".")) >= (2, 20, 1),
+      D.APP_VERSION)
 check("CONFIG_VERSION 已升到 7", D.CONFIG_VERSION == 7, str(D.CONFIG_VERSION))
 m0 = D.DEFAULT_CONFIG.get("maaend", {})
 check("默认：跑完关掉鹰角启动器", m0.get("close_launcher_when_done") is True)
