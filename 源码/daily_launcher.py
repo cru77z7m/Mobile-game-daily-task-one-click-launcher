@@ -39,7 +39,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.20.2"
+APP_VERSION = "v2.20.3"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -1294,6 +1294,122 @@ def spawn(exe, workdir, args=None):
         creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
         close_fds=True,
     )
+
+
+def plain_launch_targets(cfg, key):
+    """双击卡片时「只打开程序」要启动的目标 —— 只解析路径，不启动任何东西。
+
+    返回 ``(exes, vm_index, err)``：
+
+    - ``exes``：``[(exe 绝对路径, 工作目录), ...]``，按打开顺序；
+    - ``vm_index``：要单独用 MuMu 拉起的实例号，``None`` = 没有；
+    - ``err``：路径没设 / 文件不存在时的说明，``None`` = 可以启动。
+
+    双击的语义是「把程序打开」，和启动器的任务链完全脱钩。所以这里连
+    ``--autostart`` 之类的参数都不准备 —— 带参数启动脚本就等于让它开始
+    跑任务，那是「多选 + 一键启动」的职责，双击不该碰。
+    """
+    exes, errs = [], []
+    vm_index = None
+
+    def add(path):
+        p = (path or "").strip()
+        if not p:
+            errs.append("路径没设")
+        elif not os.path.isfile(p):
+            errs.append("找不到 %s" % p)
+        else:
+            exes.append((p, os.path.dirname(p)))
+
+    if key in ("maaend", "maa", "maafgo", "okww"):
+        # 四类脚本都只开 exe 本体。尤其注意：
+        #   MaaEnd / MaaFgo 的 --autostart、ok-ww 的 -t DailyTask
+        # 一律不带；ok-ww 也不走 pythonw main.py 那条自动开任务的路。
+        add((cfg.get(key) or {}).get("path"))
+    elif key.startswith("vm") and key[2:].isdigit():
+        vm_index = int(key[2:])
+        root = (cfg.get("mumu_root") or "").strip()
+        if not (os.path.isfile(mumu_manager(root)) or os.path.isfile(mumu_main(root))):
+            errs.append("MuMu 目录没设对（找不到 MuMuManager.exe / MuMuNxMain.exe）")
+            vm_index = None
+    elif key.startswith("custom:"):
+        cid = key[7:]
+        it = next((x for x in (cfg.get("custom_items") or [])
+                   if str(x.get("id")) == cid), None)
+        if not it:
+            errs.append("这个自定义项已经不存在了")
+        else:
+            game = (it.get("game") or "").strip()
+            script = (it.get("script") or "").strip()
+            if not game and not script:
+                errs.append("这个自定义项没设游戏或脚本路径")
+            if game:
+                add(game)
+            if script:
+                add(script)
+    else:
+        errs.append("不认识的项目：%s" % key)
+
+    return exes, vm_index, ("；".join(errs) if errs else None)
+
+
+def plain_launch(cfg, key, log=None):
+    """双击 = 只把对应的程序打开，不进入启动器的任务链。
+
+    明确**不做**的事：启动前自检、同步实例、写 baseline、带任务参数、
+    改脚本配置、等任务完成、开后台监视、跑完关游戏/关模拟器/关启动器、
+    收桌宠、写卡片状态、改勾选或 ``config.json``。这些全都属于「一键启动」。
+
+    多选后点「一键启动」走那条完整链路；双击只是省得自己翻到目录里找 exe。
+
+    返回 ``(n, err)``，``n`` = 实际拉起来的程序个数。
+    """
+    exes, vm_index, err = plain_launch_targets(cfg, key)
+    if err and log:
+        log("双击打开失败：%s" % err)
+    n = 0
+    for exe, workdir in exes:
+        name = os.path.basename(exe)
+        try:
+            if proc_running(name):
+                if log:
+                    log("%s 已在运行，未重复打开" % name)
+                continue
+            spawn(exe, workdir)                 # 关键：不传 args，脚本不会自动开任务
+            n += 1
+            if log:
+                log("已打开 %s（仅程序，不带任务参数）" % name)
+        except Exception as e:
+            if log:
+                log("✗ 打开 %s 失败：%s" % (name, e))
+
+    if vm_index is not None:
+        root = (cfg.get("mumu_root") or "").strip()
+        mgr = mumu_manager(root)
+        ok = False
+        if os.path.isfile(mgr):
+            try:
+                ok, out = manager_launch(mgr, vm_index)
+                if not ok and log:
+                    log("  MuMuManager IPC 没成：%s" % (out or "").strip()[:120])
+            except Exception as e:
+                if log:
+                    log("  MuMuManager 调用异常：%s" % e)
+        if not ok:
+            main = mumu_main(root)
+            if os.path.isfile(main):
+                try:
+                    spawn(main, os.path.dirname(main), ["-v", str(vm_index)])
+                    ok = True
+                except Exception as e:
+                    if log:
+                        log("✗ 拉起 MuMu 实例失败：%s" % e)
+        if ok:
+            n += 1
+            if log:
+                log("已拉起 MuMu 实例 %d（只启动模拟器，不打开应用、不等就绪）"
+                    % vm_index)
+    return n, err
 
 
 def list_processes():
@@ -3274,7 +3390,6 @@ class Runner:
         self.monitor_on = False   # 后台完成监视是否已启动
         self.skip = set()         # 自检认为"这次跑不了"的项（vm0/maa/maafgo/maaend/okww）
         self.only = None          # 本次只跑这些项（开机点「是」时由 App 设置）
-        self.single = False       # 双击单项启动：绕过分轮，直接一趟跑完 only
         # 任务侧判定为失败（不是用户取消）。失败和取消必须分开：
         # 取消是"我不想跑了"，失败是"跑了但没成"—— 后者要停下并叫人来看，
         # 而不是默默开下一轮把别的游戏也拉起来。
@@ -3767,12 +3882,6 @@ class Runner:
             self.emit("busy", True)
             # 先收桌宠再启动任何东西：它盖住的右下角按钮，后面的每一步都要点
             hide_deskpets(self.cfg, self.log)
-            # 双击单项启动：only 只有一个 key，编排在这里没有意义 ——
-            # 照常分轮的话会先空跑前几轮，再让 _wait_round_done 去等一个
-            # 根本没启动的项目的完成标记，白等到超时。直接一趟跑完。
-            if self.single:
-                self._one_pass(None)
-                return
             rounds = self.planned_rounds()
             if rounds is None:
                 self._one_pass(None)
@@ -5187,8 +5296,6 @@ class App(VisualShell):
         self.prompt = None
         # 本次只跑这些 key（点「是」时设；只影响这一轮，不改勾选、不写 config.json）
         self.run_only = None
-        # 双击某张卡片 = 这一趟只启动它，绕过分轮编排（见 Runner.single）
-        self.single_run = False
         # 双击的第一下会先被当成单击切一次勾选，记下来好在双击到达时还原
         self._last_toggle = None
         # 自动更新状态机：
@@ -7279,7 +7386,7 @@ class App(VisualShell):
             if not r:
                 continue
             # 小小 tips：紧贴「全选」左边，不另占一行、不遮住轮次说明
-            self.text(hdc, "双击图标 · 只跑这一项",
+            self.text(hdc, "双击图标 · 只打开程序",
                       (r[0] - S(146), r[1], r[0] - S(10), r[3]),
                       C["muted"], self.font(9),
                       DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX)
@@ -7607,25 +7714,26 @@ class App(VisualShell):
         return None
 
     def sole_start(self, key):
-        """双击卡片图标：这一趟只启动这一个项目，其余都不动。
+        """双击卡片图标 = 只把那个程序打开，不跑任务、不和启动器联动。
 
-        和夜间启动一样用 only 白名单（不改勾选、不写 config 的 enabled），
-        但额外把 single 打开 —— 单项启动不该走分轮编排。
+        和「多选 + 一键启动」的分工要分清：后者才走启动器的完整任务链
+        （自检、分轮编排、等完成、关模拟器/游戏、后台监视）。双击要的只是
+        省得自己翻到目录里找 exe，所以这里只 spawn 一次，什么状态都不改：
+        不设 busy、不写 run_only、不碰勾选和 config.json、不开后台监视。
         """
-        if self.busy:
-            self.status = "正在跑任务，等这趟结束再单独启动"
-            self.ui_log("「单独启动」跳过：当前正在执行任务")
-            user32.InvalidateRect(self.hwnd, None, False)
-            return
         item = next((it for it in self.main_rows() if it["key"] == key), None)
         if not item:
             return
         title = item.get("title") or key
-        self.run_only = {key}
-        self.single_run = True
-        self.do("start")
-        self.status = "单独启动：%s" % title
-        self.ui_log("双击单独启动：只跑「%s」；其余项本次跳过（勾选未改动）" % title)
+        n, err = plain_launch(self.cfg, key, self.ui_log)
+        if n:
+            self.status = "已打开程序：%s（未启动任务）" % title
+            self.ui_log("双击：仅打开「%s」的程序，没启动任务、没改勾选和配置"
+                        % title)
+        else:
+            self.status = "没能打开：%s" % title
+            self.ui_log("双击「%s」没有打开任何程序%s"
+                        % (title, ("：%s" % err) if err else "（可能已在运行）"))
         user32.InvalidateRect(self.hwnd, None, False)
 
     def night_start(self):
@@ -8366,9 +8474,7 @@ class App(VisualShell):
                 self.status = "启动中…"
                 # 点过「是」就只跑手游那套；其余情况 None = 按勾选跑
                 self.runner.only = self.run_only
-                self.runner.single = self.single_run
                 self.run_only = None
-                self.single_run = False
                 threading.Thread(target=self.runner.run, daemon=True).start()
         elif key == "cancel":
             if self.busy:
@@ -8461,12 +8567,13 @@ class App(VisualShell):
             if msg == WM_LBUTTONDBLCLK:
                 x = ctypes.c_short(lp & 0xFFFF).value
                 y = ctypes.c_short((lp >> 16) & 0xFFFF).value
-                # 双击卡片图标 = 只启动这一项。
+                # 双击卡片图标 = 只打开那个程序，不跑任务、不和任务链联动。
                 # 消息序列是 DOWN / UP / DBLCLK / UP，第一次 UP 已经被当成
                 # 单击切了一次勾选并写进 config —— 先还原它，否则用户只是
-                # 想单独跑一下，下次「一键启动」的勾选却被悄悄改了。
+                # 想把程序开出来，下次「一键启动」的勾选却被悄悄改了。
+                # 这里特意不看 busy：双击只是打开程序，和正在跑的任务无关。
                 if (self.page == "main" and not self.prompt
-                        and not self.exepick and not self.busy):
+                        and not self.exepick):
                     k = self.hit_task_icon(x, y)
                     if k:
                         lt = self._last_toggle
