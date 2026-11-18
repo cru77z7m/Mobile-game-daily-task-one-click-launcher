@@ -39,7 +39,7 @@ _TMARK = {}                         # --timing 用的分阶段时间戳
 # 基础
 # ----------------------------------------------------------------------------
 APP_NAME = "一键日常启动器"
-APP_VERSION = "v2.20.3"
+APP_VERSION = "v2.20.4"
 APP_TITLE = APP_NAME
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
@@ -3397,6 +3397,10 @@ class Runner:
         self.fail_reason = ""
         self._ports = None        # 最近一次启动用的 adb 端口表，MaaFgo 重跑要用
         self._left = None         # 最近一次没起来的实例集合
+        # 分轮模式下"这一趟真正拉起过的实例"和"已经关掉的实例"。
+        # 前者用来决定每轮结束时能关谁，后者防止后台监视重复关同一台。
+        self._booted_vms = set()
+        self._closed_vms = set()
 
     def cancel(self):
         if not self.stop_flag:
@@ -3879,6 +3883,7 @@ class Runner:
             self.stop_flag = False
             self.failed = False
             self.fail_reason = ""
+            self._booted_vms, self._closed_vms = set(), set()
             self.emit("busy", True)
             # 先收桌宠再启动任何东西：它盖住的右下角按钮，后面的每一步都要点
             hide_deskpets(self.cfg, self.log)
@@ -3901,8 +3906,15 @@ class Runner:
                 self._one_pass(set(keys), monitor=False)
                 if self.stop_flag or self.failed:
                     break
-                if i < total and not self._wait_round_done(set(keys), i, total):
-                    break
+                if i < total:
+                    if not self._wait_round_done(set(keys), i, total):
+                        break
+                    # 这一轮用过的模拟器如果后面几轮不再需要，立刻关掉。
+                    # 以前只在整个编排结束后交给后台监视关，结果 MaaEnd 在最后
+                    # 一轮独占跑一两个小时的时候，前面用完的两个实例还开着，
+                    # 跟终末地抢 CPU/内存（2026-11-18 实测：09:36 进第 3 轮，
+                    # 11:28 才关实例）。
+                    self.release_round_instances(rounds, i)
             if self.failed:
                 # 失败时绝不静默往下走：把原因摊在状态栏和日志里，等人处理
                 self.log("✗ 已暂停：%s" % (self.fail_reason or "任务失败"))
@@ -4024,6 +4036,60 @@ class Runner:
         self.log("⚠ 第 %d 轮等了 %.0f 小时还没等到全部完成标记，先开下一轮"
                  % (i, limit / 3600))
         return True
+
+    def release_round_instances(self, rounds, done_round):
+        """第 done_round 轮跑完后，关掉后面几轮不再需要的 MuMu 实例。
+
+        为什么不能等后台监视：分轮模式下 MaaEnd 往往排在最后一轮，而它会在
+        `_one_pass` 里同步跑一两个小时（Win32 抓屏 + 真实点击，跟模拟器抢
+        CPU/GPU）。后台监视要等所有轮次启动完才开始，于是前面轮次用完的实例
+        会一直开着陪跑 —— 2026-11-18 实测：09:36 已经进第 3 轮 MaaEnd，
+        11:28 才在监视里关掉实例，中间终末地一直很卡。
+
+        判据只看"后续轮次还需要哪几台"：
+          - 后续有 ``vmN``     → 需要 N
+          - 后续有 ``maa``     → 需要 ``maa.instance_index``（默认 0）
+          - 后续有 ``maafgo``  → 需要 ``maafgo.emulator_index``（默认 1）
+        ok-ww 和自定义项跑在 PC 上，不占模拟器，不影响判定。
+        关掉的实例记进 ``_closed_vms``，后台监视后面看到会跳过、不重复关。
+        """
+        cfg = self.cfg
+        if not bool(cfg.get("shutdown_emulator_when_done", True)):
+            return 0
+        later = set()
+        for keys in rounds[done_round:]:     # done_round 是 1-based，这里正好是后续轮
+            later |= set(keys)
+        need = set()
+        for k in later:
+            if k.startswith("vm") and k[2:].isdigit():
+                need.add(int(k[2:]))
+            elif k == "maa":
+                need.add(int((cfg.get("maa") or {}).get("instance_index", 0)))
+            elif k == "maafgo":
+                need.add(int((cfg.get("maafgo") or {}).get("emulator_index", 1)))
+        todo = sorted(self._booted_vms - need - self._closed_vms)
+        if not todo:
+            return 0
+        self.log("第 %d 轮用完，先关掉实例 %s：后面几轮用不到模拟器，"
+                 "把 CPU / 内存让给后面的任务"
+                 % (done_round, "、".join(str(x) for x in todo)))
+        n = 0
+        for idx in todo:
+            if not instance_running(cfg, idx):
+                self._closed_vms.add(idx)
+                self.step("vm%d" % idx, "idle", "已关闭")
+                self.log("  实例 %d 已经不在跑了，跳过" % idx)
+                continue
+            self.emit("status", "第 %d 轮完成，关闭实例 %d…" % (done_round, idx))
+            if shutdown_instance(cfg, idx, self.log):
+                n += 1
+                self._closed_vms.add(idx)
+                self.step("vm%d" % idx, "idle", "已关闭")
+                self.log("✓ 实例 %d 已关闭（第 %d 轮用完，后续轮次不需要）"
+                         % (idx, done_round))
+            else:
+                self.step("vm%d" % idx, "err", "关闭失败")
+        return n
 
     def _one_pass(self, scope=None, monitor=True):
         """跑一趟：把 scope 里的项目按固定顺序启动（None = 按勾选全跑）
@@ -4166,6 +4232,8 @@ class Runner:
             ports, left, info = {}, {}, {}
             insts = ([i for i in cfg.get("instances", []) if vm_on(i)]
                      if mumu_ok else [])
+            # 记下这一趟真正拉起过的实例：分轮模式每轮结束时要按它判断能关谁
+            self._booted_vms |= {int(i["index"]) for i in insts}
             self._spawned = None
             if insts:
                 info = list_vm_info(mgr)
@@ -4622,6 +4690,10 @@ class Runner:
     def release_instance(self, key, idx, label):
         """某个程序跑完了，就把它用的那个实例关掉；其他实例、四个程序都不动"""
         if idx is None:
+            return
+        if idx in self._closed_vms:
+            self.log("  实例 %d 在前面某一轮结束时已经关了，这里跳过（%s）"
+                     % (idx, label))
             return
         started = [int(i["index"]) for i in self.cfg.get("instances", [])]
         if idx not in started:
